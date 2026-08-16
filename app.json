@@ -1,11 +1,11 @@
 {
   "expo": {
-    "name": "expo-scaffold-tmp",
-    "slug": "expo-scaffold-tmp",
+    "name": "My App",
+    "slug": "my-app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "exposcaffoldtmp",
+    "scheme": "myapp",
     "userInterfaceStyle": "automatic",
     "ios": {
       "icon": "./assets/expo.icon"
