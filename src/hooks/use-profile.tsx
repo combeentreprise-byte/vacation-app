@@ -12,10 +12,12 @@ import { supabase } from "@/lib/supabase";
 
 export type Profile = {
   name: string;
+  avatarUrl: string | null;
 };
 
 const DEFAULT_PROFILE: Profile = {
   name: "Your Name",
+  avatarUrl: null,
 };
 
 type ProfileContextValue = {
@@ -44,9 +46,13 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      const { data } = await supabase.from("profiles").select("name").eq("id", userId).single();
+      const { data } = await supabase
+        .from("profiles")
+        .select("name, avatar_url")
+        .eq("id", userId)
+        .single();
       if (cancelled) return;
-      if (data) setProfile({ name: data.name });
+      if (data) setProfile({ name: data.name, avatarUrl: data.avatar_url });
       setIsLoaded(true);
     }
 
@@ -62,9 +68,12 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
       if (!userId) return;
       setProfile((current) => {
         const next = { ...current, ...updates };
+        const dbUpdates: { name?: string; avatar_url?: string | null } = {};
+        if (updates.name !== undefined) dbUpdates.name = updates.name;
+        if (updates.avatarUrl !== undefined) dbUpdates.avatar_url = updates.avatarUrl;
         supabase
           .from("profiles")
-          .update(updates)
+          .update(dbUpdates)
           .eq("id", userId)
           .then(({ error }) => {
             if (error) console.warn("Failed to update profile", error);

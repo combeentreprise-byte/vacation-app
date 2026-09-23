@@ -30,6 +30,10 @@ function RootNavigator() {
           name="add-entry"
           options={{ presentation: "modal", animation: "slide_from_bottom" }}
         />
+        <Stack.Screen
+          name="scan-pick-group"
+          options={{ presentation: "modal", animation: "slide_from_bottom" }}
+        />
         <Stack.Screen name="join/[id]" />
       </Stack.Protected>
 

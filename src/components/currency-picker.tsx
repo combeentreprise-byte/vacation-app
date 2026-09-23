@@ -89,7 +89,7 @@ export function CurrencyPickerModal({
   };
 
   return (
-    <Modal transparent visible={visible} animationType="fade" onRequestClose={handleClose}>
+    <Modal transparent visible={visible} animationType="slide" onRequestClose={handleClose}>
       <View style={styles.backdrop}>
         <View
           style={[styles.sheet, { paddingTop: insets.top + 16, paddingBottom: insets.bottom + 12 }]}

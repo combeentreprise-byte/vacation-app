@@ -1,9 +1,11 @@
 import { Ionicons } from "@expo/vector-icons";
 import type { ComponentProps } from "react";
-import { Dimensions, Pressable, StyleSheet, Text, View } from "react-native";
+import { useState } from "react";
+import { Animated, Dimensions, Modal, Pressable, StyleSheet, Text, View } from "react-native";
 
-import type { MenuAnchor } from "@/components/create-or-join-menu";
+import type { MenuAnchor } from "@/components/menu-anchor";
 import { Colors } from "@/constants/colors";
+import { popupScaleStyle, usePopupAnimation } from "@/hooks/use-popup-animation";
 
 const BOX_WIDTH = 200;
 
@@ -15,6 +17,9 @@ type GroupActionsMenuProps = {
   onEdit: () => void;
   onInvite: () => void;
   onLeave: () => void;
+  // Editing name/description/currency is admin-only; non-admins don't get
+  // the option at all rather than seeing it fail after tapping it.
+  canEdit: boolean;
 };
 
 export function GroupActionsMenu({
@@ -23,40 +28,58 @@ export function GroupActionsMenu({
   onEdit,
   onInvite,
   onLeave,
+  canEdit,
 }: GroupActionsMenuProps) {
-  if (!anchor) {
-    return null;
+  const { isMounted, progress } = usePopupAnimation(!!anchor);
+  // Kept in sync only while anchor is set, so the box doesn't jump to the
+  // top-left corner while it animates closed (the Modal stays mounted for
+  // that whole animation — see usePopupAnimation). Set directly during
+  // render (not an effect) per React's documented pattern for adjusting
+  // state in response to a prop change.
+  const [displayAnchor, setDisplayAnchor] = useState(anchor);
+  if (anchor && anchor !== displayAnchor) {
+    setDisplayAnchor(anchor);
   }
 
   const screenWidth = Dimensions.get("window").width;
-  const left = Math.min(Math.max(12, anchor.x - BOX_WIDTH + 16), screenWidth - BOX_WIDTH - 12);
+  const left = displayAnchor
+    ? Math.min(Math.max(12, displayAnchor.x - BOX_WIDTH + 16), screenWidth - BOX_WIDTH - 12)
+    : 0;
 
   const items: { key: string; icon: IoniconName; label: string; danger?: boolean; onPress: () => void }[] = [
-    { key: "edit", icon: "create-outline", label: "Edit group", onPress: onEdit },
+    ...(canEdit
+      ? [{ key: "edit", icon: "create-outline" as IoniconName, label: "Edit group", onPress: onEdit }]
+      : []),
     { key: "invite", icon: "person-add-outline", label: "Invite member", onPress: onInvite },
     { key: "leave", icon: "log-out-outline", label: "Leave group", danger: true, onPress: onLeave },
   ];
 
   return (
-    <Pressable style={StyleSheet.absoluteFill} onPress={onClose}>
-      <View style={[styles.box, { top: anchor.y + 8, left }]}>
-        {items.map((item, index) => (
-          <View key={item.key}>
-            {index > 0 ? <View style={styles.divider} /> : null}
-            <Pressable style={styles.item} onPress={item.onPress}>
-              <Ionicons
-                name={item.icon}
-                size={18}
-                color={item.danger ? Colors.danger : Colors.text}
-              />
-              <Text style={[styles.itemText, item.danger && styles.itemTextDanger]}>
-                {item.label}
-              </Text>
-            </Pressable>
-          </View>
-        ))}
-      </View>
-    </Pressable>
+    <Modal transparent visible={isMounted} animationType="none" onRequestClose={onClose}>
+      <Pressable style={StyleSheet.absoluteFill} onPress={onClose}>
+        {displayAnchor ? (
+          <Animated.View
+            style={[styles.box, { top: displayAnchor.y + 8, left }, popupScaleStyle(progress)]}
+          >
+            {items.map((item, index) => (
+              <View key={item.key}>
+                {index > 0 ? <View style={styles.divider} /> : null}
+                <Pressable style={styles.item} onPress={item.onPress}>
+                  <Ionicons
+                    name={item.icon}
+                    size={18}
+                    color={item.danger ? Colors.danger : Colors.text}
+                  />
+                  <Text style={[styles.itemText, item.danger && styles.itemTextDanger]}>
+                    {item.label}
+                  </Text>
+                </Pressable>
+              </View>
+            ))}
+          </Animated.View>
+        ) : null}
+      </Pressable>
+    </Modal>
   );
 }
 

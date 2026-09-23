@@ -16,5 +16,12 @@
     "**/*.tsx",
     ".expo/types/**/*.ts",
     "expo-env.d.ts"
+  ],
+  // Edge Functions run on Deno, not Node/RN — a separate runtime with its own
+  // globals (Deno.*) and its own type-checking (via the Supabase CLI/Deno
+  // itself at deploy time), so this project's RN-flavored tsconfig shouldn't
+  // try to typecheck it.
+  "exclude": [
+    "supabase/functions"
   ]
 }

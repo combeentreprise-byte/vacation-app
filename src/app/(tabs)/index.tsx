@@ -1,42 +1,37 @@
-import { Ionicons } from "@expo/vector-icons";
+import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import { useState } from "react";
 import {
   Alert,
   Animated,
   FlatList,
-  type GestureResponderEvent,
   Pressable,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from "react-native";
 
-import { CreateOrJoinMenu, type MenuAnchor } from "@/components/create-or-join-menu";
 import { Colors } from "@/constants/colors";
 import { type Group, useGroups } from "@/hooks/use-groups";
 import { supabase } from "@/lib/supabase";
 
 const LEAVE_SLOT_WIDTH = 44;
+// Every group card is a fixed slice of the screen rather than sized to its
+// own content, so the list reads as evenly spaced rows regardless of how
+// long a name/description runs — useWindowDimensions (not Dimensions.get)
+// so it re-measures on rotation/resize instead of freezing at mount.
+const CARD_HEIGHT_RATIO = 0.2;
 
 export default function GroupScreen() {
   const { groups, isLoaded, removeGroup } = useGroups();
   const [isManaging, setIsManaging] = useState(false);
-  const [menuAnchor, setMenuAnchor] = useState<MenuAnchor | null>(null);
   const [slideAnim] = useState(() => new Animated.Value(0));
-
-  const openMenu = (event: GestureResponderEvent) => {
-    const { pageX, pageY } = event.nativeEvent;
-    setMenuAnchor({ x: pageX, y: pageY });
-  };
+  const { height: windowHeight } = useWindowDimensions();
+  const cardHeight = windowHeight * CARD_HEIGHT_RATIO;
 
   const handleCreate = () => {
-    setMenuAnchor(null);
     router.push("/new-group");
-  };
-
-  const handleJoin = () => {
-    setMenuAnchor(null);
   };
 
   const toggleManaging = () => {
@@ -90,79 +85,69 @@ export default function GroupScreen() {
   if (groups.length === 0) {
     return (
       <View style={styles.container}>
-        <Pressable onPress={openMenu} hitSlop={12}>
+        <Pressable onPress={handleCreate} hitSlop={12}>
           <Ionicons name="add" size={28} color={Colors.muted} />
         </Pressable>
-        <Pressable onPress={openMenu}>
+        <Pressable onPress={handleCreate}>
           <Text style={styles.createText}>Be part of a group</Text>
         </Pressable>
-        <CreateOrJoinMenu
-          anchor={menuAnchor}
-          onClose={() => setMenuAnchor(null)}
-          onCreate={handleCreate}
-          onJoin={handleJoin}
-        />
       </View>
     );
   }
 
   return (
-    <>
-      <FlatList<Group>
-        data={groups}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.list}
-        extraData={isManaging}
-        ListHeaderComponent={
-          <View style={styles.listHeader}>
-            <Pressable onPress={toggleManaging} hitSlop={8}>
-              <Text style={styles.manageText}>{isManaging ? "Done" : "Manage groups"}</Text>
+    <FlatList<Group>
+      data={groups}
+      keyExtractor={(item) => item.id}
+      contentContainerStyle={styles.list}
+      extraData={isManaging}
+      ListHeaderComponent={
+        <View style={styles.listHeader}>
+          <Pressable onPress={toggleManaging} hitSlop={8}>
+            <Text style={styles.manageText}>{isManaging ? "Done" : "Manage groups"}</Text>
+          </Pressable>
+          <Pressable onPress={handleCreate} hitSlop={12}>
+            <Ionicons name="add" size={24} color={Colors.accent} />
+          </Pressable>
+        </View>
+      }
+      renderItem={({ item }) => (
+        <View style={styles.row}>
+          <Animated.View
+            style={[
+              styles.leaveSlot,
+              {
+                width: slideAnim.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [0, LEAVE_SLOT_WIDTH],
+                }),
+                opacity: slideAnim,
+              },
+            ]}
+            pointerEvents={isManaging ? "auto" : "none"}
+          >
+            <Pressable onPress={() => handleLeave(item)} hitSlop={8}>
+              <Ionicons name="log-out-outline" size={22} color={Colors.danger} />
             </Pressable>
-            <Pressable onPress={openMenu} hitSlop={12}>
-              <Ionicons name="add" size={24} color={Colors.accent} />
-            </Pressable>
-          </View>
-        }
-        renderItem={({ item }) => (
-          <View style={styles.row}>
-            <Animated.View
-              style={[
-                styles.leaveSlot,
-                {
-                  width: slideAnim.interpolate({
-                    inputRange: [0, 1],
-                    outputRange: [0, LEAVE_SLOT_WIDTH],
-                  }),
-                  opacity: slideAnim,
-                },
-              ]}
-              pointerEvents={isManaging ? "auto" : "none"}
-            >
-              <Pressable onPress={() => handleLeave(item)} hitSlop={8}>
-                <Ionicons name="log-out-outline" size={22} color={Colors.danger} />
-              </Pressable>
-            </Animated.View>
-            <Pressable
-              style={styles.card}
-              onPress={() =>
-                router.push({ pathname: "/group/[id]", params: { id: item.id } })
-              }
-            >
-              <Text style={styles.cardTitle}>{item.name}</Text>
-              {item.description ? (
-                <Text style={styles.cardDescription}>{item.description}</Text>
-              ) : null}
-            </Pressable>
-          </View>
-        )}
-      />
-      <CreateOrJoinMenu
-        anchor={menuAnchor}
-        onClose={() => setMenuAnchor(null)}
-        onCreate={handleCreate}
-        onJoin={handleJoin}
-      />
-    </>
+          </Animated.View>
+          <Pressable
+            style={[styles.card, { height: cardHeight }]}
+            onPress={() => router.push({ pathname: "/group/[id]", params: { id: item.id } })}
+          >
+            {/* The card body itself stands in for a future decorative photo
+                (see cardPhotoArea) — the ribbon just sits on top of it. */}
+            <View style={styles.cardPhotoArea}>
+              <MaterialCommunityIcons name="city-variant-outline" size={40} color={Colors.muted} />
+            </View>
+            <View style={styles.cardRibbon}>
+              <Text style={styles.cardTitle} numberOfLines={1}>
+                {item.name}
+              </Text>
+            </View>
+          </Pressable>
+        </View>
+      )}
+    />
   );
 }
 
@@ -203,20 +188,35 @@ const styles = StyleSheet.create({
   },
   card: {
     flex: 1,
-    backgroundColor: Colors.background,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: Colors.border,
-    padding: 16,
-    gap: 4,
+    overflow: "hidden",
+  },
+  // Stands in for a future decorative photo — an <Image> can drop in here
+  // later without touching the ribbon that sits on top of it.
+  cardPhotoArea: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: Colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  cardRibbon: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: Colors.background,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
   },
   cardTitle: {
     fontSize: 16,
     fontWeight: "600",
     color: Colors.text,
-  },
-  cardDescription: {
-    fontSize: 14,
-    color: Colors.muted,
   },
 });

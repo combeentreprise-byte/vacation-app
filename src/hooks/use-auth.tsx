@@ -13,11 +13,18 @@ import { supabase } from "@/lib/supabase";
 type AuthContextValue = {
   session: Session | null;
   isLoading: boolean;
-  signUp: (email: string, password: string) => Promise<{ error: string | null }>;
-  signIn: (email: string, password: string) => Promise<{ error: string | null }>;
+  signUp: (
+    email: string,
+    password: string
+  ) => Promise<{ error: string | null; isEmailTaken?: boolean }>;
+  signIn: (
+    email: string,
+    password: string
+  ) => Promise<{ error: string | null; isInvalidCredentials?: boolean }>;
   signOut: () => Promise<void>;
   resetPasswordForEmail: (email: string) => Promise<{ error: string | null }>;
   updatePassword: (newPassword: string) => Promise<{ error: string | null }>;
+  deleteAccount: () => Promise<{ error: string | null }>;
 };
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -41,12 +48,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signUp = async (email: string, password: string) => {
     const { error } = await supabase.auth.signUp({ email, password });
-    return { error: error?.message ?? null };
+    // Stable error code (not the message string) for the UI to branch on —
+    // only reliable because email confirmation is disabled on this project,
+    // so signUp fails immediately for a known email instead of the generic
+    // "check your email" response Supabase gives when confirmation is on
+    // (which deliberately avoids revealing whether the account exists).
+    return {
+      error: error?.message ?? null,
+      isEmailTaken: error?.code === "user_already_exists",
+    };
   };
 
   const signIn = async (email: string, password: string) => {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
-    return { error: error?.message ?? null };
+    // Supabase deliberately returns this same generic error whether the
+    // email doesn't exist or the password is wrong (anti-enumeration), so
+    // the UI can only flag "one of these two is wrong," never which one.
+    return {
+      error: error?.message ?? null,
+      isInvalidCredentials: error?.code === "invalid_credentials",
+    };
   };
 
   const signOut = async () => {
@@ -68,6 +89,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return { error: error?.message ?? null };
   };
 
+  // Runs delete_account (schema.sql), which leaves every group the user is
+  // still in and then deletes their auth.users row outright — real erasure,
+  // not a soft flag, which cascades to their profiles row too. That RPC call
+  // alone doesn't invalidate this client's already-issued session token, so
+  // signOut() here is what actually drops them back to signed-out state
+  // rather than leaving a session pointing at a user that no longer exists.
+  const deleteAccount = async () => {
+    const { error } = await supabase.rpc("delete_account");
+    if (error) return { error: error.message };
+    await supabase.auth.signOut();
+    return { error: null };
+  };
+
   return (
     <AuthContext.Provider
       value={{
@@ -78,6 +112,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         signOut,
         resetPasswordForEmail,
         updatePassword,
+        deleteAccount,
       }}
     >
       {children}

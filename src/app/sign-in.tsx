@@ -24,23 +24,70 @@ export default function SignInScreen() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // The ring around each field is tracked separately from the message: the
+  // sign-in "invalid credentials" case rings both fields but only says why
+  // once (see errorMessage below), while sign-up's "email already exists"
+  // only ever rings the email field.
+  const [emailHasError, setEmailHasError] = useState(false);
+  const [passwordHasError, setPasswordHasError] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const canSubmit = email.trim().length > 0 && password.length > 0 && !isSubmitting;
+
+  const clearErrors = () => {
+    setEmailHasError(false);
+    setPasswordHasError(false);
+    setErrorMessage(null);
+  };
+
+  const handleEmailChange = (value: string) => {
+    setEmail(value);
+    if (errorMessage) clearErrors();
+  };
+
+  const handlePasswordChange = (value: string) => {
+    setPassword(value);
+    if (errorMessage) clearErrors();
+  };
+
+  const handleModeToggle = () => {
+    setMode((current) => (current === "sign-in" ? "sign-up" : "sign-in"));
+    clearErrors();
+  };
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
     setIsSubmitting(true);
-    const action = mode === "sign-in" ? signIn : signUp;
-    const { error } = await action(email.trim(), password);
-    setIsSubmitting(false);
 
-    if (error) {
-      Alert.alert(mode === "sign-in" ? "Couldn't sign in" : "Couldn't create account", error);
+    if (mode === "sign-in") {
+      const { error, isInvalidCredentials } = await signIn(email.trim(), password);
+      setIsSubmitting(false);
+
+      if (isInvalidCredentials) {
+        // Supabase's own error is deliberately generic here (see use-auth.tsx)
+        // so this can only mark both fields as suspect, not say which one —
+        // that's a genuine can't-know, not a UI shortcut.
+        setEmailHasError(true);
+        setPasswordHasError(true);
+        setErrorMessage("Invalid email or password");
+        return;
+      }
+
+      if (error) Alert.alert("Couldn't sign in", error);
       return;
     }
 
-    if (mode === "sign-up") {
-      Alert.alert("Check your email", "Confirm your address to finish creating your account.");
+    const { error, isEmailTaken } = await signUp(email.trim(), password);
+    setIsSubmitting(false);
+
+    if (isEmailTaken) {
+      setEmailHasError(true);
+      setErrorMessage("Email address already exists");
+      return;
+    }
+
+    if (error) {
+      Alert.alert("Couldn't create account", error);
     }
   };
 
@@ -62,29 +109,35 @@ export default function SignInScreen() {
         <View style={styles.form}>
           <View style={styles.field}>
             <Text style={styles.label}>Email</Text>
-            <TextInput
-              value={email}
-              onChangeText={setEmail}
-              placeholder="you@example.com"
-              placeholderTextColor={Colors.muted}
-              autoCapitalize="none"
-              autoCorrect={false}
-              keyboardType="email-address"
-              style={styles.input}
-            />
+            <View style={[styles.inputRing, emailHasError && styles.inputRingError]}>
+              <TextInput
+                value={email}
+                onChangeText={handleEmailChange}
+                placeholder="you@example.com"
+                placeholderTextColor={Colors.muted}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="email-address"
+                style={styles.input}
+              />
+            </View>
           </View>
 
           <View style={styles.field}>
             <Text style={styles.label}>Password</Text>
-            <TextInput
-              value={password}
-              onChangeText={setPassword}
-              placeholder="••••••••"
-              placeholderTextColor={Colors.muted}
-              secureTextEntry
-              style={styles.input}
-            />
+            <View style={[styles.inputRing, passwordHasError && styles.inputRingError]}>
+              <TextInput
+                value={password}
+                onChangeText={handlePasswordChange}
+                placeholder="••••••••"
+                placeholderTextColor={Colors.muted}
+                secureTextEntry
+                style={styles.input}
+              />
+            </View>
           </View>
+
+          {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
 
           <Pressable
             style={[styles.submitButton, !canSubmit && styles.submitButtonDisabled]}
@@ -102,10 +155,7 @@ export default function SignInScreen() {
             </Pressable>
           ) : null}
 
-          <Pressable
-            onPress={() => setMode((current) => (current === "sign-in" ? "sign-up" : "sign-in"))}
-            hitSlop={8}
-          >
+          <Pressable onPress={handleModeToggle} hitSlop={8}>
             <Text style={styles.toggleText}>
               {mode === "sign-in"
                 ? "Don't have an account? Sign up"
@@ -149,6 +199,20 @@ const styles = StyleSheet.create({
     fontWeight: "500",
     color: Colors.text,
   },
+  // A ring drawn around the input rather than a color change on the input's
+  // own border, so the input itself always looks the same and the error
+  // state reads as "something's wrong here" framing it, not a restyled
+  // field. Always at full thickness (just transparent when there's no
+  // error) so the ring appearing/disappearing never shifts layout.
+  inputRing: {
+    borderWidth: 3,
+    borderColor: "transparent",
+    borderRadius: 14,
+    padding: 2,
+  },
+  inputRingError: {
+    borderColor: Colors.danger,
+  },
   input: {
     borderWidth: 1,
     borderColor: Colors.border,
@@ -157,6 +221,11 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     fontSize: 16,
     color: Colors.text,
+  },
+  errorText: {
+    fontSize: 13,
+    color: Colors.danger,
+    marginTop: -12,
   },
   submitButton: {
     backgroundColor: Colors.accent,

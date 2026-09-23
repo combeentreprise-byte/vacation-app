@@ -21,8 +21,13 @@ export type LogEntry = {
   convertedAmount: number;
   currency: string;
   details: string;
-  memberIds: string[];
-  paidBy: string;
+  // Either can be null if the person who was part of the split (or who
+  // paid) has since deleted their account (see delete_account in
+  // schema.sql) — the row is kept, just with the reference nulled out, so
+  // shareCount here never silently shrinks and changes everyone else's
+  // historical balance. The client renders these as "Deleted user".
+  memberIds: (string | null)[];
+  paidBy: string | null;
   payerIncluded: boolean;
   isSettlement: boolean;
   createdAt: number;
@@ -35,11 +40,11 @@ type LogRow = {
   converted_amount: number;
   currency: string;
   details: string;
-  paid_by: string;
+  paid_by: string | null;
   payer_included: boolean;
   is_settlement: boolean;
   created_at: string;
-  log_members: { user_id: string }[];
+  log_members: { user_id: string | null }[];
 };
 
 function mapLog(row: LogRow): LogEntry {

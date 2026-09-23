@@ -1,5 +1,15 @@
 import type { LogEntry } from "@/hooks/use-logs";
 
+// Sentinel key a deleted account's balance is filed under. A log's paidBy/
+// memberId comes back null once that person's account is gone (see
+// delete_account in schema.sql), but the debt itself is still real — it
+// doesn't get to silently vanish from the total just because the identity
+// behind it did. If more than one deleted account has an outstanding debt in
+// the same group, their amounts merge into this one bucket: once an identity
+// is truly erased there's no remaining way to tell two of them apart, so
+// this is the best a "who owes whom" total can do, not a bug.
+export const DELETED_USER_ID = "deleted";
+
 /**
  * Net balance per other member, from the given viewer's perspective, derived
  * from the group's log entries rather than stored, so it can never drift
@@ -35,10 +45,16 @@ export function calculateMemberBalances(
       if (log.paidBy === viewerId) {
         log.memberIds.forEach((memberId) => {
           if (memberId === viewerId) return;
-          balances[memberId] = (balances[memberId] ?? 0) + share;
+          // A null memberId means that person has since deleted their
+          // account — still counted (under DELETED_USER_ID) rather than
+          // dropped, since they still owe this share; it's just filed
+          // under a shared "deleted" bucket instead of their own id.
+          const key = memberId ?? DELETED_USER_ID;
+          balances[key] = (balances[key] ?? 0) + share;
         });
       } else if (log.memberIds.includes(viewerId)) {
-        balances[log.paidBy] = (balances[log.paidBy] ?? 0) - share;
+        const key = log.paidBy ?? DELETED_USER_ID;
+        balances[key] = (balances[key] ?? 0) - share;
       }
     });
 

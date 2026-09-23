@@ -15,8 +15,11 @@ create extension if not exists pgcrypto;
 create table if not exists public.profiles (
   id uuid primary key references auth.users (id) on delete cascade,
   name text not null default 'Your Name',
+  avatar_url text,
   created_at timestamptz not null default now()
 );
+
+alter table public.profiles add column if not exists avatar_url text;
 
 -- Note: these reference public.profiles (not auth.users directly) so
 -- PostgREST can embed profile data (e.g. `group_members(profiles(name))`)
@@ -34,18 +37,38 @@ create table if not exists public.groups (
 );
 
 create table if not exists public.group_members (
+  -- Surrogate key (rather than primary key (group_id, user_id)) specifically
+  -- so user_id can be nullable — see the migration further down for why a
+  -- deleted member's row has to survive their profile being gone. Uniqueness
+  -- is still enforced below, just not as the PK.
+  id uuid primary key default gen_random_uuid(),
   group_id uuid not null references public.groups (id) on delete cascade,
-  user_id uuid not null references public.profiles (id) on delete cascade,
+  user_id uuid references public.profiles (id) on delete set null,
   joined_at timestamptz not null default now(),
   -- Null while an active member. Leaving sets this instead of deleting the
   -- row, so historical logs/balances involving this person stay intact and
   -- rejoining later reactivates the same row (see join_group below) rather
   -- than starting a fresh membership.
   left_at timestamptz,
-  primary key (group_id, user_id)
+  -- Whether this member can edit the group (name/description/currency) and
+  -- promote others. Set true for the creator at group_creation (create_group
+  -- below); mutable afterward via promote_to_admin.
+  is_admin boolean not null default false,
+  unique (group_id, user_id)
 );
 
 alter table public.group_members add column if not exists left_at timestamptz;
+alter table public.group_members add column if not exists is_admin boolean not null default false;
+
+-- Backfill for groups that already existed before is_admin was added: make
+-- each group's original creator an admin of their own group, so existing
+-- groups don't suddenly become uneditable by everyone.
+update public.group_members gm
+set is_admin = true
+from public.groups g
+where gm.group_id = g.id
+  and gm.user_id = g.created_by
+  and gm.is_admin = false;
 
 create table if not exists public.logs (
   id uuid primary key default gen_random_uuid(),
@@ -77,9 +100,14 @@ update public.logs set converted_amount = amount where converted_amount is null;
 alter table public.logs alter column converted_amount set not null;
 
 create table if not exists public.log_members (
+  -- Surrogate key (rather than primary key (log_id, user_id)) specifically
+  -- so user_id can be nullable — see the migration further down for why a
+  -- deleted member's slot in a log's split has to survive their profile
+  -- being gone. Uniqueness is still enforced below, just not as the PK.
+  id uuid primary key default gen_random_uuid(),
   log_id uuid not null references public.logs (id) on delete cascade,
-  user_id uuid not null references public.profiles (id) on delete cascade,
-  primary key (log_id, user_id)
+  user_id uuid references public.profiles (id) on delete set null,
+  unique (log_id, user_id)
 );
 
 -- Shared cache of exchange rates: one row per base currency, refreshed by
@@ -121,6 +149,59 @@ begin
   end if;
 end $$;
 
+-- Lets groups.created_by / logs.paid_by / log_members.user_id /
+-- group_members.user_id survive their referenced profile being deleted (see
+-- delete_account below) instead of either blocking the deletion outright or
+-- cascading the row away. For logs/log_members specifically, cascading would
+-- silently shrink a log's shareCount and retroactively change every other
+-- member's historical balance (see calculateMemberBalances in balances.ts,
+-- which treats a null paid_by/member as a shared "deleted" bucket rather
+-- than dropping their slot in the split and letting the debt just vanish).
+-- For group_members, cascading would make a deleted member disappear from
+-- the Members tab entirely instead of showing up as "Deleted user" the same
+-- way a merely-departed member shows up as "Left group" (see
+-- use-group-members.tsx's mapMembers).
+alter table public.groups alter column created_by drop not null;
+alter table public.groups drop constraint if exists groups_created_by_fkey;
+alter table public.groups add constraint groups_created_by_fkey
+  foreign key (created_by) references public.profiles (id) on delete set null;
+
+alter table public.logs alter column paid_by drop not null;
+alter table public.logs drop constraint if exists logs_paid_by_fkey;
+alter table public.logs add constraint logs_paid_by_fkey
+  foreign key (paid_by) references public.profiles (id) on delete set null;
+
+-- log_members previously had primary key (log_id, user_id), which blocks
+-- making user_id nullable directly (a PK column can't be null) — so this
+-- swaps in a surrogate id as the PK first, keeping the old pairing unique
+-- via a separate constraint instead of relying on it being the PK.
+alter table public.log_members add column if not exists id uuid not null default gen_random_uuid();
+alter table public.log_members drop constraint if exists log_members_pkey;
+alter table public.log_members add constraint log_members_pkey primary key (id);
+alter table public.log_members drop constraint if exists log_members_log_id_user_id_key;
+alter table public.log_members add constraint log_members_log_id_user_id_key
+  unique (log_id, user_id);
+
+alter table public.log_members alter column user_id drop not null;
+alter table public.log_members drop constraint if exists log_members_user_id_fkey;
+alter table public.log_members add constraint log_members_user_id_fkey
+  foreign key (user_id) references public.profiles (id) on delete set null;
+
+-- group_members previously had primary key (group_id, user_id) — same
+-- surrogate-key swap as log_members above, and for the same reason (a PK
+-- column can't be null).
+alter table public.group_members add column if not exists id uuid not null default gen_random_uuid();
+alter table public.group_members drop constraint if exists group_members_pkey;
+alter table public.group_members add constraint group_members_pkey primary key (id);
+alter table public.group_members drop constraint if exists group_members_group_id_user_id_key;
+alter table public.group_members add constraint group_members_group_id_user_id_key
+  unique (group_id, user_id);
+
+alter table public.group_members alter column user_id drop not null;
+alter table public.group_members drop constraint if exists group_members_user_id_fkey;
+alter table public.group_members add constraint group_members_user_id_fkey
+  foreign key (user_id) references public.profiles (id) on delete set null;
+
 -- ---------------------------------------------------------------------------
 -- Helper functions (security definer so they can check membership without
 -- re-triggering RLS on the tables they read, which would otherwise recurse)
@@ -143,6 +224,22 @@ as $$
     where group_id = target_group_id
       and user_id = auth.uid()
       and left_at is null
+  );
+$$;
+
+create or replace function public.is_group_admin(target_group_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from public.group_members
+    where group_id = target_group_id
+      and user_id = auth.uid()
+      and left_at is null
+      and is_admin = true
   );
 $$;
 
@@ -211,8 +308,8 @@ begin
   values (group_name, group_description, group_currency, auth.uid())
   returning * into new_group;
 
-  insert into public.group_members (group_id, user_id)
-  values (new_group.id, auth.uid());
+  insert into public.group_members (group_id, user_id, is_admin)
+  values (new_group.id, auth.uid(), true);
 
   return new_group;
 end;
@@ -344,8 +441,8 @@ declare
   rate numeric;
   updated_group public.groups;
 begin
-  if not public.is_group_member(p_group_id) then
-    raise exception 'Not a member of this group';
+  if not public.is_group_admin(p_group_id) then
+    raise exception 'Only an admin can change this group''s currency';
   end if;
 
   select currency into old_currency from public.groups where id = p_group_id;
@@ -435,6 +532,14 @@ grant execute on function public.get_group_preview(uuid) to authenticated;
 -- The client independently checks the same "am I the last one" condition
 -- before showing the confirmation dialog, so the person leaving is warned
 -- first — but this server-side check is what's actually authoritative.
+--
+-- Separately: if the person leaving was the group's only active admin (and
+-- other active members remain), the longest-standing remaining member is
+-- auto-promoted — otherwise the group would be permanently stuck with no one
+-- able to edit it or promote anyone else. The leaver's own is_admin is also
+-- cleared here, so join_group's reactivation on a later rejoin always starts
+-- them back out as a plain member rather than silently restoring admin
+-- rights from a stale flag on the old row.
 create or replace function public.leave_group(p_group_id uuid)
 returns void
 language plpgsql
@@ -443,9 +548,10 @@ set search_path = public
 as $$
 declare
   remaining_active_count integer;
+  next_admin_id uuid;
 begin
   update public.group_members
-  set left_at = now()
+  set left_at = now(), is_admin = false
   where group_id = p_group_id
     and user_id = auth.uid();
 
@@ -456,11 +562,96 @@ begin
 
   if remaining_active_count = 0 then
     delete from public.groups where id = p_group_id;
+    return;
+  end if;
+
+  if not exists (
+    select 1 from public.group_members
+    where group_id = p_group_id and left_at is null and is_admin = true
+  ) then
+    select user_id into next_admin_id
+    from public.group_members
+    where group_id = p_group_id and left_at is null
+    order by joined_at asc
+    limit 1;
+
+    update public.group_members
+    set is_admin = true
+    where group_id = p_group_id and user_id = next_admin_id;
   end if;
 end;
 $$;
 
 grant execute on function public.leave_group(uuid) to authenticated;
+
+-- Promotes another active member to admin. Callable only by an existing
+-- admin of the same group — not is_group_member, since only admins may
+-- grant admin.
+create or replace function public.promote_to_admin(p_group_id uuid, p_user_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_group_admin(p_group_id) then
+    raise exception 'Only an admin can promote a member';
+  end if;
+
+  if not exists (
+    select 1 from public.group_members
+    where group_id = p_group_id and user_id = p_user_id and left_at is null
+  ) then
+    raise exception 'That person is not an active member of this group';
+  end if;
+
+  update public.group_members
+  set is_admin = true
+  where group_id = p_group_id and user_id = p_user_id;
+end;
+$$;
+
+grant execute on function public.promote_to_admin(uuid, uuid) to authenticated;
+
+-- Removes another active member from the group, admin-only. This is just
+-- leave_group's same soft-delete (left_at = now(), is_admin = false) applied
+-- to someone else's row instead of your own, so a kicked member's historical
+-- logs/balances stay intact and they can rejoin later via an invite link
+-- exactly like someone who left on their own — as a plain member, not
+-- silently still an admin from a stale flag. Doesn't need leave_group's
+-- zero-active-members/auto-promote handling: the caller is themselves an
+-- active admin and isn't the target (self-kick is rejected below — use
+-- leave_group for that), so at least one active member and admin always
+-- remains after this runs.
+create or replace function public.kick_member(p_group_id uuid, p_user_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_group_admin(p_group_id) then
+    raise exception 'Only an admin can remove a member';
+  end if;
+
+  if p_user_id = auth.uid() then
+    raise exception 'Use leave_group to remove yourself';
+  end if;
+
+  if not exists (
+    select 1 from public.group_members
+    where group_id = p_group_id and user_id = p_user_id and left_at is null
+  ) then
+    raise exception 'That person is not an active member of this group';
+  end if;
+
+  update public.group_members
+  set left_at = now(), is_admin = false
+  where group_id = p_group_id and user_id = p_user_id;
+end;
+$$;
+
+grant execute on function public.kick_member(uuid, uuid) to authenticated;
 
 -- Joins a group, or reactivates a membership you'd previously left (same
 -- row, same history) instead of erroring on the primary-key conflict a plain
@@ -478,6 +669,38 @@ $$;
 
 grant execute on function public.join_group(uuid) to authenticated;
 
+-- Permanently deletes the caller's own account: leaves every group they're
+-- still active in first (reusing leave_group's own admin hand-off /
+-- auto-delete-when-empty logic rather than duplicating it here), then
+-- deletes their auth.users row outright. That cascades to their profiles
+-- row (profiles.id references auth.users on delete cascade) — the actual
+-- identity erasure. groups.created_by, logs.paid_by, and
+-- log_members.user_id are all "on delete set null" (see migration above)
+-- specifically so this can never retroactively change another member's
+-- historical balance; the client renders a null paid_by/member as
+-- "Deleted user" instead.
+create or replace function public.delete_account()
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_group_id uuid;
+begin
+  for target_group_id in
+    select group_id from public.group_members
+    where user_id = auth.uid() and left_at is null
+  loop
+    perform public.leave_group(target_group_id);
+  end loop;
+
+  delete from auth.users where id = auth.uid();
+end;
+$$;
+
+grant execute on function public.delete_account() to authenticated;
+
 -- ---------------------------------------------------------------------------
 -- Grants
 -- ---------------------------------------------------------------------------
@@ -490,7 +713,7 @@ grant usage on schema public to authenticated;
 
 grant select, insert, update on public.profiles to authenticated;
 grant select, insert, update, delete on public.groups to authenticated;
-grant select, insert, delete on public.group_members to authenticated;
+grant select, insert, update, delete on public.group_members to authenticated;
 grant select, insert, delete on public.logs to authenticated;
 grant select, insert on public.log_members to authenticated;
 grant select, insert, update on public.exchange_rates to authenticated;
@@ -528,9 +751,11 @@ drop policy if exists "groups_insert" on public.groups;
 create policy "groups_insert" on public.groups
   for insert with check (created_by = auth.uid());
 
+-- Only admins can edit name/description/currency (currency changes also go
+-- through change_group_currency, which enforces the same check itself).
 drop policy if exists "groups_update" on public.groups;
 create policy "groups_update" on public.groups
-  for update using (public.is_group_member(id));
+  for update using (public.is_group_admin(id));
 
 -- group_members: see membership rows (active and departed) for your own
 -- groups. The insert/delete policies below are no longer exercised by the
@@ -548,6 +773,13 @@ create policy "group_members_insert" on public.group_members
 drop policy if exists "group_members_delete" on public.group_members;
 create policy "group_members_delete" on public.group_members
   for delete using (user_id = auth.uid());
+
+-- Not exercised by the app (promote_to_admin/leave_group's auto-promote go
+-- through security definer RPCs), kept for the same defense-in-depth
+-- reasoning as the other unused policies in this file.
+drop policy if exists "group_members_update" on public.group_members;
+create policy "group_members_update" on public.group_members
+  for update using (public.is_group_admin(group_id));
 
 -- logs: any member of the group can read and add entries.
 drop policy if exists "logs_select" on public.logs;
@@ -599,3 +831,41 @@ create policy "exchange_rates_upsert" on public.exchange_rates
 drop policy if exists "exchange_rates_update" on public.exchange_rates;
 create policy "exchange_rates_update" on public.exchange_rates
   for update using (true);
+
+-- ---------------------------------------------------------------------------
+-- Storage (profile pictures)
+-- ---------------------------------------------------------------------------
+-- Public bucket: avatars aren't sensitive (roughly as exposed as a name
+-- already is via profiles_select), and a public URL means the client can
+-- render one directly without a signed-URL round trip. Each user gets a
+-- single object at "{user_id}/avatar.jpg", overwritten on every re-upload
+-- (upsert: true from the client) rather than accumulating old versions.
+
+insert into storage.buckets (id, name, public)
+values ('avatars', 'avatars', true)
+on conflict (id) do nothing;
+
+drop policy if exists "avatars_public_select" on storage.objects;
+create policy "avatars_public_select" on storage.objects
+  for select using (bucket_id = 'avatars');
+
+-- storage.foldername(name) splits the object path on "/"; requiring its
+-- first segment to equal the caller's own uid is what confines every write
+-- to "{own_user_id}/..." and stops one user overwriting another's avatar.
+drop policy if exists "avatars_insert_own" on storage.objects;
+create policy "avatars_insert_own" on storage.objects
+  for insert with check (
+    bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "avatars_update_own" on storage.objects;
+create policy "avatars_update_own" on storage.objects
+  for update using (
+    bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "avatars_delete_own" on storage.objects;
+create policy "avatars_delete_own" on storage.objects
+  for delete using (
+    bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text
+  );

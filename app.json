@@ -33,7 +33,19 @@
           "imageWidth": 76
         }
       ],
-      "expo-localization"
+      "expo-localization",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow $(PRODUCT_NAME) to access your photos to set a profile picture."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow $(PRODUCT_NAME) to access your camera to scan receipts."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

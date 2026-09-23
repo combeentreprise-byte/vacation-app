@@ -51,6 +51,8 @@ type GroupsContextValue = {
   changeGroupCurrency: (id: string, currentCurrency: string, newCurrency: string) => Promise<{ error?: string }>;
   removeGroup: (id: string) => Promise<void>;
   joinGroup: (groupId: string) => Promise<{ error?: string }>;
+  promoteToAdmin: (groupId: string, userId: string) => Promise<{ error?: string }>;
+  kickMember: (groupId: string, userId: string) => Promise<{ error?: string }>;
 };
 
 const GroupsContext = createContext<GroupsContextValue | undefined>(undefined);
@@ -189,9 +191,47 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [userId, refresh]
   );
 
+  const promoteToAdmin = useCallback(async (groupId: string, userId: string) => {
+    const { error } = await supabase.rpc("promote_to_admin", {
+      p_group_id: groupId,
+      p_user_id: userId,
+    });
+
+    if (error) {
+      console.warn("Failed to promote member", error);
+      return { error: error.message };
+    }
+
+    return {};
+  }, []);
+
+  const kickMember = useCallback(async (groupId: string, userId: string) => {
+    const { error } = await supabase.rpc("kick_member", {
+      p_group_id: groupId,
+      p_user_id: userId,
+    });
+
+    if (error) {
+      console.warn("Failed to kick member", error);
+      return { error: error.message };
+    }
+
+    return {};
+  }, []);
+
   return (
     <GroupsContext.Provider
-      value={{ groups, isLoaded, addGroup, updateGroup, changeGroupCurrency, removeGroup, joinGroup }}
+      value={{
+        groups,
+        isLoaded,
+        addGroup,
+        updateGroup,
+        changeGroupCurrency,
+        removeGroup,
+        joinGroup,
+        promoteToAdmin,
+        kickMember,
+      }}
     >
       {children}
     </GroupsContext.Provider>

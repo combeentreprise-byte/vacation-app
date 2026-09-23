@@ -16,6 +16,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { CurrencyPickerModal } from "@/components/currency-picker";
 import { Colors } from "@/constants/colors";
+import { CURRENCIES } from "@/constants/currencies";
 import { useAuth } from "@/hooks/use-auth";
 import { useGroupMembers } from "@/hooks/use-group-members";
 import { useGroups } from "@/hooks/use-groups";
@@ -43,7 +44,14 @@ function CheckboxRow({
 
 export default function AddEntryScreen() {
   const insets = useSafeAreaInsets();
-  const { groupId } = useLocalSearchParams<{ groupId: string }>();
+  const { groupId, prefillAmount, prefillCurrency } = useLocalSearchParams<{
+    groupId: string;
+    // Set when arriving from the Scan tab's receipt flow (see
+    // scan-pick-group.tsx) — the amount/currency extracted from the photo,
+    // still just a starting point the user can edit before submitting.
+    prefillAmount?: string;
+    prefillCurrency?: string;
+  }>();
   const { session } = useAuth();
   const { groups } = useGroups();
   const { addLog } = useLogs();
@@ -57,8 +65,19 @@ export default function AddEntryScreen() {
     (member) => member.id !== session?.user.id && member.isActive
   );
 
-  const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState(group?.currency ?? "");
+  // A scanned amount of 0/negative/NaN isn't usable, and a scanned currency
+  // that isn't one of ours (e.g. the model misread it, or it's a currency
+  // exchange-rates.ts can't convert) shouldn't silently override the
+  // group's own currency — so both are validated before ever reaching state.
+  const scannedAmount = Number(prefillAmount);
+  const isPrefilled = !!prefillAmount && Number.isFinite(scannedAmount) && scannedAmount > 0;
+  const validPrefillCurrency =
+    prefillCurrency && CURRENCIES.some((c) => c.code === prefillCurrency)
+      ? prefillCurrency
+      : undefined;
+
+  const [amount, setAmount] = useState(isPrefilled ? prefillAmount! : "");
+  const [currency, setCurrency] = useState(validPrefillCurrency ?? group?.currency ?? "");
   const [isCurrencyPickerVisible, setIsCurrencyPickerVisible] = useState(false);
   const [details, setDetails] = useState("");
   const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
@@ -164,6 +183,9 @@ export default function AddEntryScreen() {
               </Text>
             </Pressable>
           </View>
+          {isPrefilled ? (
+            <Text style={styles.prefillHint}>Filled in from your scanned receipt — double-check it.</Text>
+          ) : null}
         </View>
 
         <View style={styles.field}>
@@ -267,6 +289,11 @@ const styles = StyleSheet.create({
   amountRow: {
     flexDirection: "row",
     gap: 10,
+  },
+  prefillHint: {
+    marginTop: 6,
+    fontSize: 13,
+    color: Colors.muted,
   },
   amountInput: {
     flex: 1,
