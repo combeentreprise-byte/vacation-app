@@ -361,6 +361,61 @@ $$;
 
 grant execute on function public.create_log(uuid, numeric, numeric, text, text, boolean, uuid[]) to authenticated;
 
+-- Edits a log entry the caller themselves logged (paid_by = auth.uid(), same
+-- ownership scope as delete_log) — group_id and paid_by are deliberately not
+-- editable (there's no "reassign this expense" concept), and settlements are
+-- excluded outright since they're not created through this same form/shape
+-- and editing one doesn't have well-defined semantics here. p_member_ids
+-- replaces the entire split, same as create_log's insert loop — the client
+-- is responsible for preserving any null (deleted-account) slots from the
+-- original split rather than dropping them, exactly like create_log's own
+-- caller does for a fresh entry; this function itself doesn't special-case
+-- that, it just re-inserts whatever it's given.
+create or replace function public.update_log(
+  p_log_id uuid,
+  p_amount numeric,
+  p_converted_amount numeric,
+  p_currency text,
+  p_details text,
+  p_payer_included boolean,
+  p_member_ids uuid[]
+)
+returns public.logs
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  updated_log public.logs;
+  member_id uuid;
+begin
+  if not exists (
+    select 1 from public.logs
+    where id = p_log_id and paid_by = auth.uid() and is_settlement = false
+  ) then
+    raise exception 'You can only edit a log you created';
+  end if;
+
+  update public.logs
+  set amount = p_amount,
+      converted_amount = p_converted_amount,
+      currency = p_currency,
+      details = p_details,
+      payer_included = p_payer_included
+  where id = p_log_id
+  returning * into updated_log;
+
+  delete from public.log_members where log_id = p_log_id;
+  foreach member_id in array p_member_ids loop
+    insert into public.log_members (log_id, user_id) values (p_log_id, member_id);
+  end loop;
+
+  return updated_log;
+end;
+$$;
+
+grant execute on function public.update_log(uuid, numeric, numeric, text, text, boolean, uuid[]) to authenticated;
+
 -- Records that a debt between two group members was settled outside the
 -- app, as a special log entry (is_settlement = true, never split further)
 -- rather than a regular expense. Unlike create_log, paid_by here is

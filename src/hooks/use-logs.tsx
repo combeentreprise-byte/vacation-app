@@ -77,6 +77,7 @@ type LogsContextValue = {
   logs: LogEntry[];
   isLoaded: boolean;
   addLog: (entry: NewLogEntry) => Promise<void>;
+  updateLog: (logId: string, entry: NewLogEntry) => Promise<{ error?: string }>;
   settleDebt: (params: SettleDebtParams) => Promise<{ error?: string }>;
   deleteLog: (logId: string) => Promise<{ error?: string }>;
   refresh: () => Promise<void>;
@@ -147,6 +148,32 @@ export function LogsProvider({ children }: { children: ReactNode }) {
     [refresh]
   );
 
+  const updateLog = useCallback(
+    async (logId: string, entry: NewLogEntry) => {
+      // paid_by = auth.uid() (and is_settlement = false) is enforced
+      // server-side too (update_log in schema.sql) — same early-friendlier-
+      // error reasoning as deleteLog below.
+      const { error } = await supabase.rpc("update_log", {
+        p_log_id: logId,
+        p_amount: entry.amount,
+        p_converted_amount: entry.convertedAmount,
+        p_currency: entry.currency,
+        p_details: entry.details,
+        p_payer_included: entry.payerIncluded,
+        p_member_ids: entry.memberIds,
+      });
+
+      if (error) {
+        console.warn("Failed to update log", error);
+        return { error: error.message };
+      }
+
+      await refresh();
+      return {};
+    },
+    [refresh]
+  );
+
   const settleDebt = useCallback(
     async (params: SettleDebtParams) => {
       const { error } = await supabase.rpc("settle_debt", {
@@ -187,7 +214,9 @@ export function LogsProvider({ children }: { children: ReactNode }) {
   );
 
   return (
-    <LogsContext.Provider value={{ logs, isLoaded, addLog, settleDebt, deleteLog, refresh }}>
+    <LogsContext.Provider
+      value={{ logs, isLoaded, addLog, updateLog, settleDebt, deleteLog, refresh }}
+    >
       {children}
     </LogsContext.Provider>
   );

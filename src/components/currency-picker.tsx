@@ -1,15 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useMemo, useState } from "react";
-import {
-  Image,
-  Modal,
-  Pressable,
-  SectionList,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-} from "react-native";
+import { Image, Modal, Pressable, SectionList, StyleSheet, Text, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Colors } from "@/constants/colors";
@@ -52,15 +43,31 @@ function groupByFirstLetter(currencies: Currency[]): CurrencySection[] {
   return sections;
 }
 
-function FlagIcon({ countryCode }: { countryCode?: string }) {
+// Exported so other screens (e.g. the group detail header) can show the same
+// flag next to a currency code without re-implementing the CDN lookup. Only
+// a size override is ever needed, so this takes plain dimensions rather than
+// a full style (View and Image disagree on the type of a couple of other
+// style props, which isn't worth reconciling for this).
+export function FlagIcon({
+  countryCode,
+  width = 28,
+  height = 20,
+}: {
+  countryCode?: string;
+  width?: number;
+  height?: number;
+}) {
   if (!countryCode) {
-    return <View style={styles.flag} />;
+    return <View style={[styles.flag, { width, height }]} />;
   }
   // flagcdn.com is the same public flag CDN the react-native-country-flag
   // package defaults to; using it directly avoids bundling ~150 flag assets
   // (or a large flag-icon dependency) into the app.
   return (
-    <Image source={{ uri: `https://flagcdn.com/w80/${countryCode}.png` }} style={styles.flag} />
+    <Image
+      source={{ uri: `https://flagcdn.com/w80/${countryCode}.png` }}
+      style={[styles.flag, { width, height }]}
+    />
   );
 }
 

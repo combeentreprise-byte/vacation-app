@@ -7,6 +7,7 @@ import {
   Animated,
   type GestureResponderEvent,
   Image,
+  type LayoutChangeEvent,
   Modal,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
@@ -15,8 +16,8 @@ import {
   type StyleProp,
   StyleSheet,
   Text,
-  type TextStyle,
   TextInput,
+  type TextStyle,
   useWindowDimensions,
   View,
   type ViewStyle,
@@ -28,11 +29,12 @@ import {
   TabView,
 } from "react-native-tab-view";
 
-import type { MenuAnchor } from "@/components/menu-anchor";
-import { CurrencyPickerModal } from "@/components/currency-picker";
+import { CurrencyPickerModal, FlagIcon } from "@/components/currency-picker";
 import { GroupActionsMenu } from "@/components/group-actions-menu";
+import type { MenuAnchor } from "@/components/menu-anchor";
 import { PageHeader } from "@/components/page-header";
 import { Colors } from "@/constants/colors";
+import { CURRENCIES } from "@/constants/currencies";
 import { useAuth } from "@/hooks/use-auth";
 import { type GroupMember, useGroupMembers } from "@/hooks/use-group-members";
 import { useGroups } from "@/hooks/use-groups";
@@ -53,11 +55,49 @@ const TAB_ROUTES: TabRoute[] = [
 // rather than a small list row).
 const HERO_HEIGHT_RATIO = 0.28;
 
+// The summary bar's own height above insets.bottom (paddingTop 14 +
+// ~22 of text + paddingBottom 14) — used to lift the FAB clear of it,
+// since the bar itself has no ListFooter/layout the FAB could measure.
+const SUMMARY_BAR_HEIGHT = 50;
+
+// The FAB sits floating above the summary bar (see styles.fab's own bottom
+// offset, which stacks this margin + its diameter on top of
+// SUMMARY_BAR_HEIGHT), so anything a list needs to clear at the bottom of
+// the screen has to clear the FAB too, not just the bar underneath it.
+const FAB_BOTTOM_MARGIN = 20;
+const FAB_DIAMETER = 56;
+// Total obstructed height at the very bottom of the screen, insets.bottom
+// aside (that part varies per-device and gets added at each call site) —
+// the real geometry only (summary bar + the FAB floating above it), with no
+// extra padding baked in. A flat safety margin on top of this used to be
+// applied unconditionally (48, then 148px), which is what actually caused
+// the "half the phone is whitespace" complaint once scrolled to the true
+// bottom of a collapsible list — a fixed pixel value that was way oversized
+// relative to a shorter device's screen. The visible gap below the last row
+// is now added at the call site as a fraction of the actual device height
+// instead, so it scales down on smaller screens instead of dominating them.
+const BOTTOM_OBSTRUCTION_HEIGHT = SUMMARY_BAR_HEIGHT + FAB_BOTTOM_MARGIN + FAB_DIAMETER;
+// The extra breathing room below the last row, past what's strictly needed
+// to clear the summary bar/FAB — expressed as a fraction of device height
+// per the user's explicit ask ("almost no whitespace, maybe just 10% of
+// device height"), not a flat pixel count.
+const BOTTOM_CLEARANCE_GAP_RATIO = 0.1;
+
+// Below this many rows, a pane's content is too short to ever scroll for
+// real — tying the hero's collapse to that pane's scroll position just
+// means reacting to rubber-band/bounce noise instead of an actual scroll
+// gesture, which is what caused the flicker this constant exists to avoid.
+const MIN_ITEMS_TO_COLLAPSE_HERO = 7;
+
 function getInitials(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0) return "?";
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+function currencyCountryCode(code: string) {
+  return CURRENCIES.find((currency) => currency.code === code)?.countryCode;
 }
 
 function AdminBadge({ size }: { size: number }) {
@@ -193,12 +233,12 @@ function resolvePurchasedFor(
       }
       return id === currentUserId
         ? {
-            id,
-            name: viewerName,
-            avatarUrl: viewerAvatarUrl,
-            isActive: true,
-            isAdmin: viewerIsAdmin,
-          }
+          id,
+          name: viewerName,
+          avatarUrl: viewerAvatarUrl,
+          isActive: true,
+          isAdmin: viewerIsAdmin,
+        }
         : members.find((member) => member.id === id);
     })
     .filter((member): member is GroupMember => !!member);
@@ -424,99 +464,99 @@ function MemberDetailOverlay({
             },
           ]}
         >
-          <Pressable onPress={() => {}}>
-          {displayMember ? (
-            <>
-              <View style={styles.memberDetailCloseRow}>
-                <Pressable onPress={onClose} hitSlop={12}>
-                  <Ionicons name="close" size={22} color={Colors.text} />
-                </Pressable>
-              </View>
-
-              <View style={styles.memberDetailHeader}>
-                <View style={[styles.avatarBadgeWrapper, styles.avatarLargeBadgeWrapper]}>
-                  <Avatar
-                    name={displayMember.name}
-                    avatarUrl={displayMember.avatarUrl}
-                    style={[styles.avatarLarge, !displayMember.isActive && styles.avatarInactive]}
-                    textStyle={styles.avatarLargeText}
-                  />
-                  {displayMember.isAdmin ? <AdminBadge size={28} /> : null}
+          <Pressable onPress={() => { }}>
+            {displayMember ? (
+              <>
+                <View style={styles.memberDetailCloseRow}>
+                  <Pressable onPress={onClose} hitSlop={12}>
+                    <Ionicons name="close" size={22} color={Colors.text} />
+                  </Pressable>
                 </View>
-                <Text style={styles.memberDetailName}>{displayMember.name}</Text>
-                {isSettled ? (
-                  <Text style={styles.debtSettled}>Settled up</Text>
-                ) : (
-                  <Text
-                    style={[
-                      styles.memberDetailDebt,
-                      isOwed ? styles.debtPositive : styles.debtNegative,
-                    ]}
-                  >
-                    {isOwed ? "Owes you " : "You owe "}
-                    {amountLabel}
-                  </Text>
-                )}
-              </View>
 
-              <View style={styles.memberDetailRowsList}>
-                <Pressable
-                  style={[styles.actionRow, !canPromote && styles.actionRowDisabled]}
-                  onLayout={(event) => setPromoteRowWidth(event.nativeEvent.layout.width)}
-                  onPress={() => {}}
-                  onPressIn={handlePromotePressIn}
-                  onPressOut={handlePromotePressOut}
-                  disabled={!canPromote}
-                >
-                  <Animated.View
-                    pointerEvents="none"
-                    style={[styles.promoteFill, { width: promoteFillWidth }]}
-                  />
-                  <View style={styles.actionRowContent} pointerEvents="none">
-                    <Ionicons name="arrow-up" size={20} color={Colors.text} />
-                    <Text style={styles.rowLabel}>{promoteLabel}</Text>
+                <View style={styles.memberDetailHeader}>
+                  <View style={[styles.avatarBadgeWrapper, styles.avatarLargeBadgeWrapper]}>
+                    <Avatar
+                      name={displayMember.name}
+                      avatarUrl={displayMember.avatarUrl}
+                      style={[styles.avatarLarge, !displayMember.isActive && styles.avatarInactive]}
+                      textStyle={styles.avatarLargeText}
+                    />
+                    {displayMember.isAdmin ? <AdminBadge size={28} /> : null}
                   </View>
-                  {/* White copy of the same content, revealed only where the
+                  <Text style={styles.memberDetailName}>{displayMember.name}</Text>
+                  {isSettled ? (
+                    <Text style={styles.debtSettled}>Settled up</Text>
+                  ) : (
+                    <Text
+                      style={[
+                        styles.memberDetailDebt,
+                        isOwed ? styles.debtPositive : styles.debtNegative,
+                      ]}
+                    >
+                      {isOwed ? "Owes you " : "You owe "}
+                      {amountLabel}
+                    </Text>
+                  )}
+                </View>
+
+                <View style={styles.memberDetailRowsList}>
+                  <Pressable
+                    style={[styles.actionRow, !canPromote && styles.actionRowDisabled]}
+                    onLayout={(event) => setPromoteRowWidth(event.nativeEvent.layout.width)}
+                    onPress={() => { }}
+                    onPressIn={handlePromotePressIn}
+                    onPressOut={handlePromotePressOut}
+                    disabled={!canPromote}
+                  >
+                    <Animated.View
+                      pointerEvents="none"
+                      style={[styles.promoteFill, { width: promoteFillWidth }]}
+                    />
+                    <View style={styles.actionRowContent} pointerEvents="none">
+                      <Ionicons name="arrow-up" size={20} color={Colors.text} />
+                      <Text style={styles.rowLabel}>{promoteLabel}</Text>
+                    </View>
+                    {/* White copy of the same content, revealed only where the
                       black fill has swept past, so the text appears to
                       invert to white as the wipe passes under it. */}
-                  <Animated.View
-                    pointerEvents="none"
-                    style={[styles.promoteRevealClip, { width: promoteFillWidth }]}
+                    <Animated.View
+                      pointerEvents="none"
+                      style={[styles.promoteRevealClip, { width: promoteFillWidth }]}
+                    >
+                      <View style={[styles.actionRowContent, { width: promoteRowWidth }]}>
+                        <Ionicons name="arrow-up" size={20} color="#FFFFFF" />
+                        <Text style={[styles.rowLabel, styles.rowLabelWhite]}>{promoteLabel}</Text>
+                      </View>
+                    </Animated.View>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.actionRow, !canKick && styles.actionRowDisabled]}
+                    onPress={onKick}
+                    disabled={!canKick}
                   >
-                    <View style={[styles.actionRowContent, { width: promoteRowWidth }]}>
-                      <Ionicons name="arrow-up" size={20} color="#FFFFFF" />
-                      <Text style={[styles.rowLabel, styles.rowLabelWhite]}>{promoteLabel}</Text>
+                    <View style={styles.actionRowContent}>
+                      <Ionicons name="person-remove-outline" size={20} color={Colors.danger} />
+                      <Text style={[styles.rowLabel, styles.rowLabelDanger]}>
+                        Kick group member
+                      </Text>
                     </View>
-                  </Animated.View>
-                </Pressable>
-                <Pressable
-                  style={[styles.actionRow, !canKick && styles.actionRowDisabled]}
-                  onPress={onKick}
-                  disabled={!canKick}
-                >
-                  <View style={styles.actionRowContent}>
-                    <Ionicons name="person-remove-outline" size={20} color={Colors.danger} />
-                    <Text style={[styles.rowLabel, styles.rowLabelDanger]}>
-                      Kick group member
-                    </Text>
-                  </View>
-                </Pressable>
-                <Pressable
-                  style={[
-                    styles.actionRow,
-                    (isSettled || targetIsDeleted) && styles.actionRowDisabled,
-                  ]}
-                  onPress={onSettle}
-                  disabled={isSettled || targetIsDeleted}
-                >
-                  <View style={styles.actionRowContent}>
-                    <MaterialCommunityIcons name="handshake-outline" size={20} color={Colors.text} />
-                    <Text style={styles.rowLabel}>Debt was settled</Text>
-                  </View>
-                </Pressable>
-              </View>
-            </>
-          ) : null}
+                  </Pressable>
+                  <Pressable
+                    style={[
+                      styles.actionRow,
+                      (isSettled || targetIsDeleted) && styles.actionRowDisabled,
+                    ]}
+                    onPress={onSettle}
+                    disabled={isSettled || targetIsDeleted}
+                  >
+                    <View style={styles.actionRowContent}>
+                      <MaterialCommunityIcons name="handshake-outline" size={20} color={Colors.text} />
+                      <Text style={styles.rowLabel}>Debt was settled</Text>
+                    </View>
+                  </Pressable>
+                </View>
+              </>
+            ) : null}
           </Pressable>
         </Animated.View>
       </Animated.View>
@@ -530,12 +570,18 @@ function MembersPane({
   balances,
   onSelectMember,
   onScroll,
+  minListHeight,
+  footerHeight,
 }: {
   currency: string;
   members: GroupMember[];
   balances: Record<string, number>;
   onSelectMember: (member: GroupMember) => void;
-  onScroll: (event: NativeSyntheticEvent<NativeScrollEvent>) => void;
+  // Left undefined below the row threshold — see isMembersCollapsible in
+  // GroupDetailScreen for why.
+  onScroll?: (event: NativeSyntheticEvent<NativeScrollEvent>) => void;
+  minListHeight: number;
+  footerHeight: number;
 }) {
   // Active members first; members who've left sink to the bottom rather than
   // interrupting the active list.
@@ -556,9 +602,10 @@ function MembersPane({
     <Animated.FlatList<GroupMember>
       data={sortedMembers}
       keyExtractor={(item) => item.id}
-      contentContainerStyle={styles.membersList}
+      contentContainerStyle={[styles.membersList, { minHeight: minListHeight }]}
       onScroll={onScroll}
       scrollEventThrottle={16}
+      ListFooterComponent={<View style={{ height: footerHeight }} />}
       renderItem={({ item }) => (
         <MemberRow
           member={item}
@@ -634,6 +681,7 @@ function LogDetailOverlay({
   groupCurrency,
   onClose,
   onDelete,
+  onEdit,
   onSelectMember,
   onFullyClosed,
 }: {
@@ -646,6 +694,7 @@ function LogDetailOverlay({
   groupCurrency: string;
   onClose: () => void;
   onDelete: (log: LogEntry) => void;
+  onEdit: (log: LogEntry) => void;
   onSelectMember: (member: GroupMember) => void;
   onFullyClosed: () => void;
 }) {
@@ -661,13 +710,13 @@ function LogDetailOverlay({
 
   const purchasedFor = displayLog
     ? resolvePurchasedFor(
-        displayLog,
-        members,
-        currentUserId,
-        viewerName,
-        viewerAvatarUrl,
-        viewerIsAdmin
-      )
+      displayLog,
+      members,
+      currentUserId,
+      viewerName,
+      viewerAvatarUrl,
+      viewerIsAdmin
+    )
     : [];
   const payerName = displayLog ? resolvePayerName(displayLog.paidBy, members, currentUserId) : "";
   // A settlement's own `details` is always '' (settle_debt never sets it),
@@ -697,83 +746,109 @@ function LogDetailOverlay({
             },
           ]}
         >
-          <Pressable onPress={() => {}}>
-          {displayLog ? (
-            <>
-              <View style={styles.detailHeader}>
-                <Text style={[styles.logDetailTitle, styles.detailHeaderText]}>
-                  {formatLogHeadline(displayLog, payerName, groupCurrency)}
-                </Text>
-                <Pressable onPress={onClose} hitSlop={12}>
-                  <Ionicons name="close" size={22} color={Colors.text} />
-                </Pressable>
-              </View>
+          <Pressable onPress={() => { }}>
+            {displayLog ? (
+              <>
+                <View style={styles.detailHeader}>
+                  <Text style={[styles.logDetailTitle, styles.detailHeaderText]}>
+                    {formatLogHeadline(displayLog, payerName, groupCurrency)}
+                  </Text>
+                  <Pressable onPress={onClose} hitSlop={12}>
+                    <Ionicons name="close" size={22} color={Colors.text} />
+                  </Pressable>
+                </View>
 
-              {detailsText ? (
-                <Text style={styles.logDetailDescription}>{detailsText}</Text>
-              ) : null}
+                {detailsText ? (
+                  <Text style={styles.logDetailDescription}>{detailsText}</Text>
+                ) : null}
 
-              {formatOriginalCurrencyNote(displayLog, groupCurrency) ? (
-                <Text style={styles.originalCurrencyNote}>
-                  {formatOriginalCurrencyNote(displayLog, groupCurrency)}
-                </Text>
-              ) : null}
+                {formatOriginalCurrencyNote(displayLog, groupCurrency) ? (
+                  <Text style={styles.originalCurrencyNote}>
+                    {formatOriginalCurrencyNote(displayLog, groupCurrency)}
+                  </Text>
+                ) : null}
 
-              <View style={styles.detailMembersList}>
-                {purchasedFor.map((member) => {
-                  const content = (
-                    <>
-                      <View style={styles.avatarBadgeWrapper}>
-                        <Avatar
-                          name={member.name}
-                          avatarUrl={member.avatarUrl}
-                          style={[styles.avatar, !member.isActive && styles.avatarInactive]}
-                          textStyle={styles.avatarText}
-                        />
-                        {member.isAdmin ? <AdminBadge size={18} /> : null}
-                      </View>
-                      <Text style={styles.memberName}>{member.name}</Text>
-                    </>
-                  );
-
-                  // Tapping yourself doesn't lead anywhere — the member detail
-                  // popup's settle/promote/kick actions all assume a target
-                  // other than the viewer. Same for a "Deleted user"
-                  // placeholder (see resolvePurchasedFor) — there's no real
-                  // account behind it to open a popup for.
-                  if (member.id === currentUserId || member.id.startsWith("deleted-")) {
-                    return (
-                      <View key={member.id} style={styles.detailMemberRow}>
-                        {content}
-                      </View>
+                <View style={styles.detailMembersList}>
+                  {purchasedFor.map((member) => {
+                    const content = (
+                      <>
+                        <View style={styles.avatarBadgeWrapper}>
+                          <Avatar
+                            name={member.name}
+                            avatarUrl={member.avatarUrl}
+                            style={[styles.avatar, !member.isActive && styles.avatarInactive]}
+                            textStyle={styles.avatarText}
+                          />
+                          {member.isAdmin ? <AdminBadge size={18} /> : null}
+                        </View>
+                        <Text style={styles.memberName}>{member.name}</Text>
+                      </>
                     );
-                  }
 
-                  return (
+                    // Tapping yourself doesn't lead anywhere — the member detail
+                    // popup's settle/promote/kick actions all assume a target
+                    // other than the viewer. Same for a "Deleted user"
+                    // placeholder (see resolvePurchasedFor) — there's no real
+                    // account behind it to open a popup for.
+                    if (member.id === currentUserId || member.id.startsWith("deleted-")) {
+                      return (
+                        <View key={member.id} style={styles.detailMemberRow}>
+                          {content}
+                        </View>
+                      );
+                    }
+
+                    return (
+                      <Pressable
+                        key={member.id}
+                        style={styles.detailMemberRow}
+                        onPress={() => onSelectMember(member)}
+                      >
+                        {content}
+                      </Pressable>
+                    );
+                  })}
+                </View>
+
+                {displayLog.paidBy === currentUserId ? (
+                  displayLog.isSettlement ? (
+                    // Settlements don't go through the regular expense edit
+                    // form (update_log excludes them — see schema.sql), so
+                    // only delete makes sense here.
                     <Pressable
-                      key={member.id}
-                      style={styles.detailMemberRow}
-                      onPress={() => onSelectMember(member)}
+                      style={[styles.actionRow, styles.logDeleteRow]}
+                      onPress={() => onDelete(displayLog)}
                     >
-                      {content}
+                      <View style={styles.actionRowContent}>
+                        <Ionicons name="trash-outline" size={20} color={Colors.danger} />
+                        <Text style={[styles.rowLabel, styles.rowLabelDanger]}>Delete entry</Text>
+                      </View>
                     </Pressable>
-                  );
-                })}
-              </View>
-
-              {displayLog.paidBy === currentUserId ? (
-                <Pressable
-                  style={[styles.actionRow, styles.logDeleteRow]}
-                  onPress={() => onDelete(displayLog)}
-                >
-                  <View style={styles.actionRowContent}>
-                    <Ionicons name="trash-outline" size={20} color={Colors.danger} />
-                    <Text style={[styles.rowLabel, styles.rowLabelDanger]}>Delete entry</Text>
-                  </View>
-                </Pressable>
-              ) : null}
-            </>
-          ) : null}
+                  ) : (
+                    <View style={[styles.logActionRowGroup, styles.logDeleteRow]}>
+                      <Pressable
+                        style={[styles.actionRow, styles.logActionHalf]}
+                        onPress={() => onEdit(displayLog)}
+                      >
+                        <View style={styles.actionRowContent}>
+                          <Ionicons name="create-outline" size={20} color={Colors.text} />
+                          <Text style={styles.rowLabel}>Edit entry</Text>
+                        </View>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.actionRow, styles.logActionHalf]}
+                        onPress={() => onDelete(displayLog)}
+                      >
+                        <View style={styles.actionRowContent}>
+                          <Ionicons name="trash-outline" size={20} color={Colors.danger} />
+                          <Text style={[styles.rowLabel, styles.rowLabelDanger]}>Delete entry</Text>
+                        </View>
+                      </Pressable>
+                    </View>
+                  )
+                ) : null}
+              </>
+            ) : null}
           </Pressable>
         </Animated.View>
       </Animated.View>
@@ -791,6 +866,8 @@ function LogsPane({
   groupCurrency,
   onSelectMember,
   onScroll,
+  minListHeight,
+  footerHeight,
 }: {
   groupId: string;
   members: GroupMember[];
@@ -800,7 +877,11 @@ function LogsPane({
   viewerIsAdmin: boolean;
   groupCurrency: string;
   onSelectMember: (member: GroupMember) => void;
-  onScroll: (event: NativeSyntheticEvent<NativeScrollEvent>) => void;
+  // Left undefined below the row threshold — see isLogsCollapsible in
+  // GroupDetailScreen for why.
+  onScroll?: (event: NativeSyntheticEvent<NativeScrollEvent>) => void;
+  minListHeight: number;
+  footerHeight: number;
 }) {
   const { logs, deleteLog } = useLogs();
   const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
@@ -829,6 +910,11 @@ function LogsPane({
     if (!member) return;
     pendingMemberRef.current = null;
     onSelectMember(member);
+  };
+
+  const handleEdit = (log: LogEntry) => {
+    setSelectedLog(null);
+    router.push({ pathname: "/add-entry", params: { groupId, logId: log.id } });
   };
 
   const handleDelete = (log: LogEntry) => {
@@ -864,9 +950,10 @@ function LogsPane({
       <Animated.FlatList<LogEntry>
         data={groupLogs}
         keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.membersList}
+        contentContainerStyle={[styles.membersList, { minHeight: minListHeight }]}
         onScroll={onScroll}
         scrollEventThrottle={16}
+        ListFooterComponent={<View style={{ height: footerHeight }} />}
         renderItem={({ item }) => (
           <LogRow
             log={item}
@@ -890,6 +977,7 @@ function LogsPane({
         groupCurrency={groupCurrency}
         onClose={() => setSelectedLog(null)}
         onDelete={handleDelete}
+        onEdit={handleEdit}
         onSelectMember={handleSelectMemberFromLog}
         onFullyClosed={handleLogPopupFullyClosed}
       />
@@ -907,26 +995,131 @@ export default function GroupDetailScreen() {
   const insets = useSafeAreaInsets();
   const { height: windowHeight, width: windowWidth } = useWindowDimensions();
   const heroHeight = windowHeight * HERO_HEIGHT_RATIO;
+  // A short list (few members/logs) can end up with less content height
+  // than its own visible viewport, which makes it not genuinely scrollable
+  // — on a real device that shows up as janky, flickery rubber-band/bounce
+  // scroll deltas feeding straight into the hero/title transform above,
+  // since those are driven directly off raw scroll position. Forcing the
+  // content container to be at least as tall as its own real viewport plus
+  // a bit extra fixes that — measured via onLayout rather than guessed,
+  // since the viewport itself already varies with insets/hero size in ways
+  // not worth re-deriving here. Falls back to the full window height until
+  // the first layout pass lands, so there's no flash of the old
+  // (too-short-to-scroll) behavior before that.
+  //
+  // That "bit extra" has two parts, both required: heroHeight, since
+  // scrollY needs to actually reach heroHeight for the collapse animation
+  // above to reach its fully-collapsed end (any less and the hero can
+  // never fully disappear, no matter how far the list scrolls) — plus the
+  // summary bar's own height, so the last row can still clear it once
+  // fully scrolled.
+  const [tabViewHeight, setTabViewHeight] = useState(0);
+  const handleTabViewLayout = (event: LayoutChangeEvent) => {
+    setTabViewHeight(event.nativeEvent.layout.height);
+  };
+  // Just the "genuinely scrollable at all" guarantee (see the flicker this
+  // was built to prevent) — a floor on total content height, nothing more.
+  // Deliberately NOT where the bottom-bar/FAB clearance lives anymore: a
+  // floor has no effect once real content already exceeds it (which a
+  // normal-length list does easily), silently dropping whatever margin was
+  // baked into the floor's formula. Clearance instead comes from
+  // listFooterHeight below, an actual spacer appended after the last row,
+  // which stays in effect unconditionally regardless of content length.
+  //
+  // Only meaningful for a non-collapsible pane (see nonCollapsibleMinHeight
+  // usage below) — applying this same viewport-sized floor to a collapsible
+  // (>= MIN_ITEMS_TO_COLLAPSE_HERO row) pane too was actively harmful: if
+  // that pane's real content + footer happened to add up to less than a
+  // full viewport, the floor padded out the *entire remaining difference*
+  // as literal blank space below the last row — which is how "half the
+  // screen" of dead space happened. A collapsible-by-count list is already
+  // long enough that it doesn't need this floor for genuine scrollability.
+  const nonCollapsibleMinHeight = tabViewHeight || windowHeight;
+  // One footer height for both collapsible and non-collapsible panes — the
+  // real bottom-bar/FAB clearance (BOTTOM_OBSTRUCTION_HEIGHT) plus a small
+  // gap sized off the actual device height (BOTTOM_CLEARANCE_GAP_RATIO),
+  // not a flat pixel value — a flat value either undershoots on a tall
+  // device or, as a large one did here, dominates a short one. A
+  // collapsible (>= MIN_ITEMS_TO_COLLAPSE_HERO row) pane used to also bake
+  // heroHeight's worth of extra into this same trailing footer, on the
+  // theory that it needed that much guaranteed scroll *distance* to ever
+  // reach fully-collapsed. But that distance is needed early in the
+  // scroll, to let the collapse animation finish — a real multi-row list's
+  // own natural content is already comfortably taller than a viewport
+  // (that's what makes it collapsible in the first place), so it doesn't
+  // need extra reserved *at the very end* too; baking it into the
+  // permanent trailing footer just left dead space sitting below the last
+  // row forever, long after the collapse had already finished.
+  const listFooterHeight =
+    BOTTOM_OBSTRUCTION_HEIGHT + insets.bottom + windowHeight * BOTTOM_CLEARANCE_GAP_RATIO;
   // Shared by both tabs' lists (see MembersPane/LogsPane's onScroll) so
   // scrolling either one collapses the same hero — only one tab is ever
   // actually being scrolled by the user at a time, so this doesn't need
   // per-tab bookkeeping. useNativeDriver keeps the hero/title transform
   // animation on the UI thread, independent of JS frame drops.
   const [scrollY] = useState(() => new Animated.Value(0));
-  const handlePaneScroll = Animated.event(
-    [{ nativeEvent: { contentOffset: { y: scrollY } } }],
-    { useNativeDriver: true }
-  );
-  const heroTranslateY = scrollY.interpolate({
+  // Not wiring onScroll for a below-threshold pane (see isMembersCollapsible/
+  // isLogsCollapsible below) is meant to be the whole story, but in practice
+  // a determined repeated max-distance scroll on a short list can still let
+  // some real offset reach scrollY (native rubber-band/overscroll behavior
+  // isn't fully suppressed just by leaving a JS prop undefined). Rather than
+  // trust that scrollY itself always stays exactly 0 for a non-collapsible
+  // pane, the hero's transforms are driven off scrollY multiplied by this
+  // 0/1 gate instead — multiplying by 0 forces the output to 0 no matter
+  // what scrollY actually holds, which is a real guarantee, not a hope.
+  const [scrollGate] = useState(() => new Animated.Value(1));
+  // Stable across renders (like scrollY/scrollGate above) so the listener
+  // effect below isn't tearing down and re-adding its listener every render.
+  const [gatedScrollY] = useState(() => Animated.multiply(scrollY, scrollGate));
+  const heroTranslateY = gatedScrollY.interpolate({
     inputRange: [0, heroHeight],
     outputRange: [0, -heroHeight],
     extrapolate: "clamp",
   });
-  const contentTranslateY = scrollY.interpolate({
+  const contentTranslateY = gatedScrollY.interpolate({
     inputRange: [0, heroHeight],
     outputRange: [heroHeight, 0],
     extrapolate: "clamp",
   });
+  // The title row needs real insets.top clearance so its text doesn't land
+  // under the status bar/notch once fully collapsed and pinned — but that
+  // same clearance is dead space at rest, when the title is sitting well
+  // below the hero already (see the previous white-gap fix). paddingTop
+  // can't ride the native-driven transform above (padding isn't
+  // transform/opacity, so it can't be natively animated), hence this
+  // JS-side value deriving a plain 0..insets.top value from the same
+  // scroll offset instead — a small, deliberately rounded-to-the-pixel
+  // re-render cost during scroll, not a 60fps-critical animation.
+  //
+  // This used to be a gatedScrollY.addListener() effect, but a JS listener
+  // attached to a *derived* native-driven node (gatedScrollY is an
+  // Animated.multiply -> interpolate chain fed by a useNativeDriver: true
+  // event) is not reliable — on-device it never fired at all, even though
+  // the native-driven transforms elsewhere read the exact same node and
+  // animated correctly. Animated.event's own `listener` option is the
+  // documented way to get a JS-thread callback alongside a native-driven
+  // event: it runs off the same onScroll dispatch (rate-limited by
+  // scrollEventThrottle) rather than depending on the native bridge to
+  // sync a composed node's value back down, so it doesn't share that
+  // failure mode.
+  // handleTitleClearanceScroll doesn't need the scrollGate multiply that
+  // gatedScrollY (above) uses to guard the native-driven transforms: it
+  // only ever runs off a pane's own onScroll, which itself is left
+  // undefined below the collapsible threshold (see isMembersCollapsible/
+  // isLogsCollapsible usage further down), so a non-collapsible pane can't
+  // drive it at all.
+  const [titleClearance, setTitleClearance] = useState(0);
+  const handleTitleClearanceScroll = (event: {
+    nativeEvent: { contentOffset: { y: number } };
+  }) => {
+    const progress = Math.min(1, Math.max(0, event.nativeEvent.contentOffset.y / heroHeight));
+    const next = Math.round(progress * insets.top);
+    setTitleClearance((current) => (current === next ? current : next));
+  };
+  const handlePaneScroll = Animated.event(
+    [{ nativeEvent: { contentOffset: { y: scrollY } } }],
+    { useNativeDriver: true, listener: handleTitleClearanceScroll }
+  );
   const [tabIndex, setTabIndex] = useState(0);
   const [menuAnchor, setMenuAnchor] = useState<MenuAnchor | null>(null);
   const [isEditing, setIsEditing] = useState(false);
@@ -941,6 +1134,40 @@ export default function GroupDetailScreen() {
   // seeing your own name in your own balance list would be meaningless.
   const members = allMembers.filter((member) => member.id !== session?.user.id);
   const viewerIsAdmin = allMembers.find((member) => member.id === session?.user.id)?.isAdmin ?? false;
+  // Each pane only drives the hero's collapse once it has enough rows to
+  // genuinely scroll (see MIN_ITEMS_TO_COLLAPSE_HERO) — group?.id guards
+  // this running before the not-found check below, same as useGroupMembers
+  // above.
+  const groupLogsCount = logs.filter((log) => log.groupId === group?.id).length;
+  const isMembersCollapsible = members.length >= MIN_ITEMS_TO_COLLAPSE_HERO;
+  const isLogsCollapsible = groupLogsCount >= MIN_ITEMS_TO_COLLAPSE_HERO;
+  // Whichever tab is active, if it's not (or no longer) collapsible, the
+  // hero should sit fully expanded rather than showing whatever state the
+  // other tab's scrolling last left it in — scrollY is shared between both
+  // panes (see handlePaneScroll below), so switching into a short tab
+  // doesn't otherwise reset it on its own. Closing scrollGate (see
+  // gatedScrollY above) is what actually guarantees the hero can't move
+  // while inactive; zeroing scrollY itself is just so that if the pane
+  // later becomes collapsible again, the gate reopens onto a clean 0
+  // instead of snapping to whatever scrollY drifted to while gated off.
+  useEffect(() => {
+    const activeIsCollapsible =
+      TAB_ROUTES[tabIndex]?.key === "members" ? isMembersCollapsible : isLogsCollapsible;
+    scrollGate.setValue(activeIsCollapsible ? 1 : 0);
+    if (!activeIsCollapsible) {
+      scrollY.setValue(0);
+    }
+  }, [tabIndex, isMembersCollapsible, isLogsCollapsible, scrollY, scrollGate]);
+  // No onScroll fires for a non-collapsible pane, so
+  // handleTitleClearanceScroll never runs to bring titleClearance back down
+  // on its own when switching into one — it could otherwise keep whatever
+  // value it last had from a previous (collapsible) tab. Derived at use
+  // rather than reset via setState-in-an-effect, which both avoids an extra
+  // render and can't ever be one render stale the way the effect version
+  // briefly was.
+  const activeTabIsCollapsible =
+    TAB_ROUTES[tabIndex]?.key === "members" ? isMembersCollapsible : isLogsCollapsible;
+  const effectiveTitleClearance = activeTabIsCollapsible ? titleClearance : 0;
 
   // Shared across both tabs: the Members list needs it for row debts, the
   // member detail popup (opened from either tab) needs it for its own
@@ -1145,7 +1372,9 @@ export default function GroupDetailScreen() {
             members={members}
             balances={balances}
             onSelectMember={setSelectedMember}
-            onScroll={handlePaneScroll}
+            onScroll={isMembersCollapsible ? handlePaneScroll : undefined}
+            minListHeight={isMembersCollapsible ? 0 : nonCollapsibleMinHeight}
+            footerHeight={listFooterHeight}
           />
         );
       case "logs":
@@ -1159,7 +1388,9 @@ export default function GroupDetailScreen() {
             viewerIsAdmin={viewerIsAdmin}
             groupCurrency={group.currency}
             onSelectMember={handleSelectMemberFromLogs}
-            onScroll={handlePaneScroll}
+            onScroll={isLogsCollapsible ? handlePaneScroll : undefined}
+            minListHeight={isLogsCollapsible ? 0 : nonCollapsibleMinHeight}
+            footerHeight={listFooterHeight}
           />
         );
     }
@@ -1168,36 +1399,21 @@ export default function GroupDetailScreen() {
   const renderTabBar = (
     props: SceneRendererProps & { navigationState: NavigationState<TabRoute> }
   ) => (
-    <View>
-      <View style={styles.segmentRow}>
-        {props.navigationState.routes.map((route, i) => {
-          const isActive = i === props.navigationState.index;
-          return (
-            <Pressable
-              key={route.key}
-              onPress={() => setTabIndex(i)}
-              style={[styles.segmentItem, isActive && styles.segmentItemActive]}
-            >
-              <Text style={[styles.segmentText, isActive && styles.segmentTextActive]}>
-                {route.title}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </View>
-
-      <View style={styles.summaryBar}>
-        {totalIsSettled ? (
-          <Text style={styles.summarySettled}>Settled up</Text>
-        ) : (
-          <Text
-            style={[styles.summaryText, totalIsOwed ? styles.debtPositive : styles.debtNegative]}
+    <View style={styles.segmentRow}>
+      {props.navigationState.routes.map((route, i) => {
+        const isActive = i === props.navigationState.index;
+        return (
+          <Pressable
+            key={route.key}
+            onPress={() => setTabIndex(i)}
+            style={[styles.segmentItem, isActive && styles.segmentItemActive]}
           >
-            {totalIsOwed ? "You're owed " : "You owe "}
-            {totalAmountLabel} in total
-          </Text>
-        )}
-      </View>
+            <Text style={[styles.segmentText, isActive && styles.segmentTextActive]}>
+              {route.title}
+            </Text>
+          </Pressable>
+        );
+      })}
     </View>
   );
 
@@ -1207,20 +1423,34 @@ export default function GroupDetailScreen() {
           idea as the group list's cards), somewhere a real photo drops in
           later. Its translateY is driven by scrollY from whichever tab's
           list is being scrolled, so it slides up and out of view together
-          with the title-and-below block below — see contentTranslateY. */}
+          with the title-and-below block below — see contentTranslateY.
+          Extended upward by insets.top (and re-padded back down inside via
+          heroContent) so its own gray fill reaches the true top of the
+          screen, behind the status bar — otherwise that strip shows
+          contentLayer's white through the gap instead, before there's any
+          collapsed header there to justify it. */}
       <Animated.View
-        style={[styles.hero, { height: heroHeight, transform: [{ translateY: heroTranslateY }] }]}
+        style={[
+          styles.hero,
+          {
+            height: heroHeight + insets.top,
+            top: -insets.top,
+            transform: [{ translateY: heroTranslateY }],
+          },
+        ]}
       >
-        <View style={styles.heroPhotoArea}>
-          <MaterialCommunityIcons name="city-variant-outline" size={64} color={Colors.muted} />
+        <View style={[styles.heroContent, { marginTop: insets.top }]}>
+          <View style={styles.heroPhotoArea}>
+            <MaterialCommunityIcons name="city-variant-outline" size={64} color={Colors.muted} />
+          </View>
+          <Pressable
+            style={[styles.heroBackButton, { top: insets.top + 8 }]}
+            onPress={goBackOrToGroups}
+            hitSlop={12}
+          >
+            <Ionicons name="chevron-back" size={22} color={Colors.text} />
+          </Pressable>
         </View>
-        <Pressable
-          style={[styles.heroBackButton, { top: insets.top + 8 }]}
-          onPress={goBackOrToGroups}
-          hitSlop={12}
-        >
-          <Ionicons name="chevron-back" size={22} color={Colors.text} />
-        </Pressable>
       </Animated.View>
 
       {/* Everything from the title down: rigidly tracks the hero while
@@ -1233,7 +1463,7 @@ export default function GroupDetailScreen() {
       <Animated.View
         style={[styles.contentLayer, { transform: [{ translateY: contentTranslateY }] }]}
       >
-        <View style={[styles.titleRow, { paddingTop: insets.top + 12 }]}>
+        <View style={[styles.titleRow, { paddingTop: 12 + effectiveTitleClearance }]}>
           {isEditing ? (
             <TextInput
               value={editName}
@@ -1269,22 +1499,37 @@ export default function GroupDetailScreen() {
           ) : null}
 
           {isEditing ? (
-            <Pressable style={styles.editableInput} onPress={() => setIsCurrencyPickerVisible(true)}>
-              <Text style={styles.currency}>{editCurrency || "Select a currency"}</Text>
+            <Pressable
+              style={[styles.editableInput, styles.currencyRow]}
+              onPress={() => setIsCurrencyPickerVisible(true)}
+            >
+              {editCurrency ? (
+                <>
+                  <FlagIcon countryCode={currencyCountryCode(editCurrency)} width={20} height={14} />
+                  <Text style={styles.currencyCode}>{editCurrency}</Text>
+                </>
+              ) : (
+                <Text style={styles.currency}>Select a currency</Text>
+              )}
             </Pressable>
           ) : (
-            <Text style={styles.currency}>Currency: {group.currency || "Not set"}</Text>
+            <View style={styles.currencyRow}>
+              <FlagIcon countryCode={currencyCountryCode(group.currency)} width={20} height={14} />
+              <Text style={styles.currencyCode}>{group.currency || "Not set"}</Text>
+            </View>
           )}
         </View>
 
-        <TabView<TabRoute>
-          navigationState={{ index: tabIndex, routes: TAB_ROUTES }}
-          onIndexChange={setTabIndex}
-          renderScene={renderScene}
-          renderTabBar={renderTabBar}
-          initialLayout={{ width: windowWidth }}
-          style={styles.tabView}
-        />
+        <View style={styles.tabViewWrapper} onLayout={handleTabViewLayout}>
+          <TabView<TabRoute>
+            navigationState={{ index: tabIndex, routes: TAB_ROUTES }}
+            onIndexChange={setTabIndex}
+            renderScene={renderScene}
+            renderTabBar={renderTabBar}
+            initialLayout={{ width: windowWidth }}
+            style={styles.tabView}
+          />
+        </View>
       </Animated.View>
 
       <CurrencyPickerModal
@@ -1297,8 +1542,23 @@ export default function GroupDetailScreen() {
         onClose={() => setIsCurrencyPickerVisible(false)}
       />
 
+      {/* Moved down here from the tab bar so it reads as a totals footer for
+          the whole screen rather than being tied to just one tab. */}
+      <View style={[styles.summaryBar, { paddingBottom: 14 + insets.bottom }]}>
+        {totalIsSettled ? (
+          <Text style={styles.summarySettled}>Settled up</Text>
+        ) : (
+          <Text
+            style={[styles.summaryText, totalIsOwed ? styles.debtPositive : styles.debtNegative]}
+          >
+            {totalIsOwed ? "You're owed " : "You owe "}
+            {totalAmountLabel} in total
+          </Text>
+        )}
+      </View>
+
       <Pressable
-        style={[styles.fab, { bottom: 20 + insets.bottom }]}
+        style={[styles.fab, { bottom: 20 + insets.bottom + SUMMARY_BAR_HEIGHT }]}
         onPress={handleAddEntry}
         hitSlop={4}
       >
@@ -1346,14 +1606,20 @@ const styles = StyleSheet.create({
   },
   hero: {
     position: "absolute",
-    top: 0,
     left: 0,
     right: 0,
     zIndex: 1,
+    backgroundColor: Colors.border,
+    overflow: "hidden",
+  },
+  // Reclaims the insets.top the outer hero was stretched upward by (see the
+  // comment at its call site), so the photo/back-button still land exactly
+  // where they'd have been without that stretch.
+  heroContent: {
+    flex: 1,
   },
   heroPhotoArea: {
     flex: 1,
-    backgroundColor: Colors.border,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1396,7 +1662,13 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.border,
   },
   detailBody: {
-    padding: 20,
+    // paddingTop matches the gap below (both 8) so the description sits
+    // evenly between the separator above and the currency row below —
+    // it previously had 20 above (from a uniform `padding: 20`) vs. 8
+    // below (from `gap`), which read as lopsided.
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 20,
     gap: 8,
   },
   groupName: {
@@ -1417,6 +1689,17 @@ const styles = StyleSheet.create({
   currency: {
     fontSize: 14,
     color: Colors.muted,
+  },
+  currencyRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    alignSelf: "flex-start",
+  },
+  currencyCode: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: Colors.text,
   },
   editableInput: {
     borderWidth: 1,
@@ -1449,15 +1732,27 @@ const styles = StyleSheet.create({
     color: Colors.text,
     fontWeight: "600",
   },
+  tabViewWrapper: {
+    flex: 1,
+  },
   tabView: {
     flex: 1,
   },
   summaryBar: {
-    paddingBottom: 14,
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    // Above contentLayer's zIndex:2 (which is full-screen), or that opaque
+    // white layer paints over this and the FAB below entirely — same fix
+    // applied to styles.fab, which turns out to have been missing it too.
+    zIndex: 3,
+    paddingTop: 14,
     paddingHorizontal: 20,
     alignItems: "center",
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: Colors.border,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: Colors.border,
+    backgroundColor: Colors.background,
   },
   summaryText: {
     fontSize: 16,
@@ -1478,7 +1773,14 @@ const styles = StyleSheet.create({
     color: Colors.muted,
   },
   membersList: {
-    padding: 20,
+    paddingHorizontal: 20,
+    paddingTop: 20,
+    // Just normal bottom breathing room — the real, guaranteed clearance
+    // past the fixed summary bar/FAB comes from each FlatList's own
+    // ListFooterComponent spacer (see footerHeight in GroupDetailScreen),
+    // which — unlike padding baked in here — can't be silently neutralized
+    // by natural content already being taller than some assumed floor.
+    paddingBottom: 20,
     gap: 12,
   },
   memberRow: {
@@ -1717,6 +2019,13 @@ const styles = StyleSheet.create({
   logDeleteRow: {
     marginTop: 20,
   },
+  logActionRowGroup: {
+    flexDirection: "row",
+    gap: 12,
+  },
+  logActionHalf: {
+    flex: 1,
+  },
   actionRowDisabled: {
     opacity: 0.5,
   },
@@ -1753,6 +2062,7 @@ const styles = StyleSheet.create({
   fab: {
     position: "absolute",
     right: 20,
+    zIndex: 3,
     width: 56,
     height: 56,
     borderRadius: 28,

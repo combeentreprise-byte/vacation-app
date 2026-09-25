@@ -11,6 +11,14 @@ type TabBarProps = MaterialTopTabBarProps & {
   onActiveChange: (routeName: string) => void;
 };
 
+// Height of the tappable icon/label row, not counting the safe-area inset
+// below it — the container centers this row within row height + inset so
+// icons stay visually centered regardless of how tall that inset is.
+const TAB_ROW_HEIGHT = 56;
+
+const ACTIVE_COLOR = Colors.accent;
+const INACTIVE_COLOR = "rgba(32, 138, 239, 0.45)";
+
 export function TabBar({ state, navigation, onActiveChange }: TabBarProps) {
   const insets = useSafeAreaInsets();
   const activeRouteName = state.routes[state.index].name;
@@ -20,7 +28,7 @@ export function TabBar({ state, navigation, onActiveChange }: TabBarProps) {
   }, [activeRouteName, onActiveChange]);
 
   return (
-    <View style={[styles.container, { paddingBottom: insets.bottom }]}>
+    <View style={[styles.container, { height: TAB_ROW_HEIGHT + insets.bottom }]}>
       {TABS.map((tab) => {
         const isActive = tab.name === activeRouteName;
         return (
@@ -32,14 +40,9 @@ export function TabBar({ state, navigation, onActiveChange }: TabBarProps) {
             <Ionicons
               name={isActive ? tab.iconActive : tab.icon}
               size={24}
-              color={isActive ? Colors.accentText : Colors.accentTextMuted}
+              color={isActive ? ACTIVE_COLOR : INACTIVE_COLOR}
             />
-            <Text
-              style={[
-                styles.label,
-                { color: isActive ? Colors.accentText : Colors.accentTextMuted },
-              ]}
-            >
+            <Text style={[styles.label, { color: isActive ? ACTIVE_COLOR : INACTIVE_COLOR }]}>
               {tab.label}
             </Text>
           </Pressable>
@@ -52,16 +55,16 @@ export function TabBar({ state, navigation, onActiveChange }: TabBarProps) {
 const styles = StyleSheet.create({
   container: {
     flexDirection: "row",
-    backgroundColor: Colors.accent,
+    alignItems: "center",
+    backgroundColor: Colors.background,
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "rgba(255,255,255,0.2)",
+    borderTopColor: Colors.border,
   },
   tab: {
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
     gap: 2,
-    paddingVertical: 8,
   },
   label: {
     fontSize: 12,

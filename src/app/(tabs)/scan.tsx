@@ -103,9 +103,17 @@ export default function ScanScreen() {
           child-rendering behavior inside the camera preview. */}
       <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
 
+      {/* Bottom-bounded at the shutter's top edge (controls: bottom 36 + shutter
+          height 72). The lower spacer centers the hint text within itself, so
+          its gap to the frame above and to the shutter below always match —
+          it's given less flex than the upper spacer just to keep both gaps
+          tight rather than spreading the text across all the leftover space. */}
       <View style={styles.overlay} pointerEvents="none">
+        <View style={styles.overlayTopSpacer} />
         <View style={styles.frame} />
-        <Text style={styles.overlayHint}>Fit the receipt inside the frame</Text>
+        <View style={styles.overlayBottomSpacer}>
+          <Text style={styles.overlayHint}>Fit the receipt inside the frame</Text>
+        </View>
       </View>
 
       <View style={styles.controls}>
@@ -152,10 +160,19 @@ const styles = StyleSheet.create({
     top: 0,
     left: 0,
     right: 0,
-    bottom: 0,
+    // Stops at the shutter button's top edge (bottom offset 36 + its 72px
+    // height) rather than the screen bottom, so the spacers above/below the
+    // frame split the same region the hint text needs to be centered in.
+    bottom: 108,
+    alignItems: "center",
+  },
+  overlayTopSpacer: {
+    flex: 3,
+  },
+  overlayBottomSpacer: {
+    flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    gap: 16,
   },
   frame: {
     width: "72%",

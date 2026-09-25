@@ -7,6 +7,7 @@ import {
   type ComponentType,
   type ReactNode,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import {
@@ -21,6 +22,7 @@ import {
   Switch,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from "react-native";
 
@@ -39,12 +41,43 @@ const WebSwitch = Switch as unknown as ComponentType<
   ComponentProps<typeof Switch> & { activeThumbColor?: string }
 >;
 
+const AnimatedTextInput = Animated.createAnimatedComponent(TextInput);
+const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
+
 function getInitials(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0) return "?";
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
+
+// Where down the screen the identity block's center lands once slid into
+// edit position, as a fraction of the visible container's height (0.5 would
+// be dead center).
+const EDIT_SLIDE_TARGET_FRACTION = 0.3;
+// Resting (non-editing) avatar diameter — shared between the style below and
+// the grow-on-edit math, which scales up to half the device width.
+const AVATAR_SIZE = 96;
+// How much bigger the username gets at full grow, relative to its resting
+// size — modest, unlike the avatar's much larger target.
+const NAME_GROW_SCALE = 1.2;
+// Fallback used for exactly one frame before the username's real resting
+// height is measured via onLayout.
+const NAME_BOX_FALLBACK_HEIGHT = 30;
+// Fixed height for the Edit/checkmark button — stays constant across the
+// label ⇄ checkmark swap, only the width animates.
+const EDIT_BUTTON_HEIGHT = 36;
+// Fallbacks for the button's two natural widths, used for exactly one frame
+// before the invisible measuring probes (see the JSX) report the real
+// values via onLayout.
+const EDIT_LABEL_WIDTH_FALLBACK = 58;
+const EDIT_CHECK_WIDTH_FALLBACK = 46;
+// Shared by the avatar/username slide+grow AND the edit button's morph, so
+// the button always finishes its flip at exactly the moment the profile
+// finishes growing/shrinking, in both directions, by construction rather
+// than by keeping two separate numbers in sync by hand.
+const IDENTITY_MORPH_DURATION_MS = 280;
+const EDIT_BUTTON_TRANSITION_MS = IDENTITY_MORPH_DURATION_MS;
 
 type NotificationPrefs = {
   allMuted: boolean;
@@ -343,6 +376,119 @@ export default function AccountSettingsScreen() {
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [dangerZoneOpen, setDangerZoneOpen] = useState(false);
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
+  const scrollViewRef = useRef<ScrollView>(null);
+  const containerRef = useRef<View>(null);
+  const topSectionRef = useRef<View>(null);
+  const { width: windowWidth } = useWindowDimensions();
+  // Real (unscaled) resting height of the username text, measured via
+  // onLayout — needed to compute how far its top edge rises as it grows
+  // (see the grow-math block below), since transforms don't report their
+  // own delta the way a layout change would.
+  const [nameBoxHeight, setNameBoxHeight] = useState(NAME_BOX_FALLBACK_HEIGHT);
+  // Pushes the whole avatar/name/email container down to the vertical
+  // center of the screen before the editing affordances (input border,
+  // avatar overlay) appear, then reverses on the way out — see
+  // handleEditToggle. It's a real top-margin push rather than a transform,
+  // so it also shoves the settings rows below it down as it grows/shrinks
+  // (hence useNativeDriver: false — margin isn't a transform property).
+  const [identityPush] = useState(() => new Animated.Value(0));
+  // 0 → 1 grow progress, driving the avatar/name scale-up below. Kept
+  // separate from identityPush so the push and the grow can use different
+  // (dynamically computed) output ranges off the same timeline.
+  const [identityGrow] = useState(() => new Animated.Value(0));
+  // Fades the username border and the avatar's tinted camera overlay in
+  // once the slide/grow settles, and back out before it reverses — see
+  // handleEditToggle.
+  const [editEffectsOpacity] = useState(() => new Animated.Value(0));
+  // Real natural widths for the "Edit" label and the checkmark, measured
+  // off the invisible probes in the JSX below rather than guessed, so the
+  // button lands on the actual rendered size instead of an approximation.
+  const [editLabelWidth, setEditLabelWidth] = useState(EDIT_LABEL_WIDTH_FALLBACK);
+  const [editCheckWidth, setEditCheckWidth] = useState(EDIT_CHECK_WIDTH_FALLBACK);
+  // 0 = settled on "Edit", 0.5 = fully closed (mid-morph), 1 = settled on
+  // the checkmark — see handleEditToggle, which always drives this to 0.5
+  // first, swaps the glyph, then continues to the far end, rather than
+  // cross-fading the two states directly against each other. The 3-point
+  // ranges below are symmetric and direction-agnostic (don't need to know
+  // which end we started from), which sidesteps a real bug an earlier,
+  // width-based version of this had: with RN's border-box sizing, ramping
+  // width down to 0 while padding/border stayed fixed just floors the
+  // rendered box at paddingHorizontal*2 + borderWidth*2 (~30px) instead of
+  // actually closing — padding and border need to collapse in step with
+  // width, all the way, not just style the resting states.
+  const [editButtonAnim] = useState(() => new Animated.Value(0));
+  // Which glyph the (now separately-timed) button shows — flips at the
+  // moment the button is fully closed, not when isEditing itself flips.
+  const [buttonShowsCheck, setButtonShowsCheck] = useState(false);
+  const editButtonWidth = editButtonAnim.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: [editLabelWidth, 0, editCheckWidth],
+  });
+  const editButtonPadding = editButtonAnim.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: [14, 0, 14],
+  });
+  const editButtonBorderWidth = editButtonAnim.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: [1, 0, 1],
+  });
+  // Keeps the box's visual center pinned to the "Edit" label's own resting
+  // center throughout — both the close and the reopen shrink/grow
+  // symmetrically toward/from that same fixed point, rather than one edge
+  // staying put while the other moves.
+  const editButtonShift = editButtonAnim.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: [0, -editLabelWidth / 2, -(editLabelWidth - editCheckWidth) / 2],
+  });
+
+  // The avatar's bottom edge is meant to stay put relative to the
+  // username's top edge, and the username's bottom edge relative to the
+  // email below it — i.e. both grow upward from a fixed bottom, and the
+  // avatar's growth stacks on top of however far the username's top has
+  // already risen. A plain `transform: scale` grows equally in both
+  // directions from the center, so each one needs a compensating
+  // translateY: half its own height delta to cancel the downward half of
+  // its own scale (pinning its bottom), and — for the avatar only — the
+  // username's full height delta on top of that, so its bottom tracks the
+  // username's rising top instead of a fixed point.
+  const avatarTargetSize = windowWidth * 0.5;
+  const avatarScaleTarget = avatarTargetSize / AVATAR_SIZE;
+  const avatarSelfDelta = AVATAR_SIZE * (avatarScaleTarget - 1);
+  const nameDelta = nameBoxHeight * (NAME_GROW_SCALE - 1);
+  const avatarShiftTarget = -(nameDelta + avatarSelfDelta / 2);
+  const nameShiftTarget = -(nameDelta / 2);
+
+  // transform arrays compose like CSS: the LAST entry is applied to the
+  // point first, so translateY must come before scale here — otherwise the
+  // translate itself gets multiplied by the (growing) scale factor instead
+  // of landing as a plain absolute-pixel offset.
+  const avatarGrowStyle = {
+    transform: [
+      {
+        translateY: identityGrow.interpolate({ inputRange: [0, 1], outputRange: [0, avatarShiftTarget] }),
+      },
+      { scale: identityGrow.interpolate({ inputRange: [0, 1], outputRange: [1, avatarScaleTarget] }) },
+    ],
+  };
+  const nameGrowStyle = {
+    transform: [
+      {
+        translateY: identityGrow.interpolate({ inputRange: [0, 1], outputRange: [0, nameShiftTarget] }),
+      },
+      {
+        scale: identityGrow.interpolate({ inputRange: [0, 1], outputRange: [1, NAME_GROW_SCALE] }),
+      },
+    ],
+  };
+  // Fades just the border color in/out (rather than the whole input's
+  // opacity), so the name text itself doesn't flicker during the Text ⇄
+  // TextInput swap.
+  const nameBorderStyle = {
+    borderColor: editEffectsOpacity.interpolate({
+      inputRange: [0, 1],
+      outputRange: ["rgba(32, 138, 239, 0)", "rgba(32, 138, 239, 1)"],
+    }),
+  };
 
   const handlePickAvatar = async () => {
     const userId = session?.user.id;
@@ -405,14 +551,94 @@ export default function AccountSettingsScreen() {
     }
   };
 
+  // Always closes the button fully (progress → 0.5, width → 0) before
+  // swapping its glyph and continuing on to targetValue (0 or 1) — never
+  // cross-fades directly between the two settled states.
+  const morphEditButton = (targetValue: 0 | 1, showCheck: boolean) => {
+    const half = EDIT_BUTTON_TRANSITION_MS / 2;
+    Animated.timing(editButtonAnim, {
+      toValue: 0.5,
+      duration: half,
+      useNativeDriver: false,
+    }).start(({ finished }) => {
+      if (!finished) return;
+      setButtonShowsCheck(showCheck);
+      Animated.timing(editButtonAnim, {
+        toValue: targetValue,
+        duration: half,
+        useNativeDriver: false,
+      }).start();
+    });
+  };
+
   const handleEditToggle = () => {
     if (isEditing) {
+      // Fade the editing affordances out first, then hide them and push
+      // back up / shrink back down to rest, together.
       updateProfile({ name: editName.trim() || profile.name });
-      setIsEditing(false);
-    } else {
-      setEditName(profile.name);
-      setIsEditing(true);
+      Animated.timing(editEffectsOpacity, {
+        toValue: 0,
+        duration: 160,
+        // editEffectsOpacity also drives nameBorderStyle's borderColor
+        // interpolation below, which the native driver can't run — mixing
+        // that with useNativeDriver: true on the same Animated.Value throws
+        // at runtime on native platforms.
+        useNativeDriver: false,
+      }).start(({ finished }) => {
+        if (!finished) return;
+        setIsEditing(false);
+        Animated.parallel([
+          Animated.timing(identityPush, {
+            toValue: 0,
+            duration: IDENTITY_MORPH_DURATION_MS,
+            useNativeDriver: false,
+          }),
+          Animated.timing(identityGrow, {
+            toValue: 0,
+            duration: IDENTITY_MORPH_DURATION_MS,
+            useNativeDriver: false,
+          }),
+        ]).start();
+        morphEditButton(0, false);
+      });
+      return;
     }
+
+    setEditName(profile.name);
+    scrollViewRef.current?.scrollTo({ y: 0, animated: false });
+    // Fires in parallel with the push+grow below (started separately since
+    // it doesn't need the measured target) so the button finishes its flip
+    // at exactly the moment the profile finishes growing, instead of only
+    // starting once the profile is already done.
+    morphEditButton(1, true);
+    requestAnimationFrame(() => {
+      containerRef.current?.measureInWindow((_x, containerY, _w, containerHeight) => {
+        topSectionRef.current?.measureInWindow((_bx, blockY, _bw, blockHeight) => {
+          const targetPush =
+            containerY + containerHeight * EDIT_SLIDE_TARGET_FRACTION - (blockY + blockHeight / 2);
+          Animated.parallel([
+            Animated.timing(identityPush, {
+              toValue: Math.max(targetPush, 0),
+              duration: IDENTITY_MORPH_DURATION_MS,
+              useNativeDriver: false,
+            }),
+            Animated.timing(identityGrow, {
+              toValue: 1,
+              duration: IDENTITY_MORPH_DURATION_MS,
+              useNativeDriver: false,
+            }),
+          ]).start(({ finished }) => {
+            if (!finished) return;
+            setIsEditing(true);
+            Animated.timing(editEffectsOpacity, {
+              toValue: 1,
+              duration: 200,
+              useNativeDriver: false,
+            }).start();
+          });
+        });
+      });
+    });
   };
 
   const handleLogOut = () => {
@@ -423,85 +649,127 @@ export default function AccountSettingsScreen() {
   };
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
-      <View style={styles.topSection}>
-        <Pressable style={styles.editButton} onPress={handleEditToggle} hitSlop={8}>
-          <Ionicons
-            name={isEditing ? "checkmark" : "create-outline"}
-            size={22}
-            color={Colors.text}
-          />
-        </Pressable>
-
-        <View style={styles.avatarWrap}>
-          <View style={styles.avatarLarge}>
-            {profile.avatarUrl ? (
-              <Image source={{ uri: profile.avatarUrl }} style={styles.avatarImage} />
-            ) : (
-              <Text style={styles.avatarLargeText}>{getInitials(profile.name)}</Text>
-            )}
-          </View>
-          {isEditing ? (
-            <Pressable
-              style={styles.avatarEditBadge}
-              onPress={handlePickAvatar}
-              disabled={isUploadingAvatar}
-              hitSlop={4}
-            >
-              {isUploadingAvatar ? (
-                <ActivityIndicator size="small" color={Colors.accentText} />
+    <View ref={containerRef} style={styles.container}>
+      <ScrollView ref={scrollViewRef} contentContainerStyle={styles.scrollContent}>
+        <Animated.View
+          ref={topSectionRef}
+          style={[styles.topSection, { marginTop: identityPush }]}
+        >
+          <Animated.View style={[styles.avatarWrap, avatarGrowStyle]}>
+            <View style={styles.avatarLarge}>
+              {profile.avatarUrl ? (
+                <Image source={{ uri: profile.avatarUrl }} style={styles.avatarImage} />
               ) : (
-                <Ionicons name="camera" size={14} color={Colors.accentText} />
+                <Text style={styles.avatarLargeText}>{getInitials(profile.name)}</Text>
               )}
-            </Pressable>
-          ) : null}
+              {isEditing ? (
+                <AnimatedPressable
+                  style={[styles.avatarEditOverlay, { opacity: editEffectsOpacity }]}
+                  onPress={handlePickAvatar}
+                  disabled={isUploadingAvatar}
+                >
+                  {isUploadingAvatar ? (
+                    <ActivityIndicator size="small" color={Colors.accentText} />
+                  ) : (
+                    <Ionicons name="camera" size={26} color={Colors.accentText} />
+                  )}
+                </AnimatedPressable>
+              ) : null}
+            </View>
+          </Animated.View>
+
+          {isEditing ? (
+            <AnimatedTextInput
+              value={editName}
+              onChangeText={setEditName}
+              style={[styles.nameText, styles.nameInput, nameGrowStyle, nameBorderStyle]}
+            />
+          ) : (
+            <Animated.Text
+              style={[styles.nameText, nameGrowStyle]}
+              onLayout={(e) => setNameBoxHeight(e.nativeEvent.layout.height)}
+            >
+              {profile.name}
+            </Animated.Text>
+          )}
+
+          <Text style={styles.emailText}>{session?.user.email ?? ""}</Text>
+        </Animated.View>
+
+        <View style={styles.rowsList}>
+          <SettingsAccordionRow
+            icon="notifications-outline"
+            label="Notifications"
+            subtitle="Choose what you get notified about"
+            expanded={notificationsOpen}
+            onToggle={() => setNotificationsOpen((current) => !current)}
+          >
+            <NotificationsDropdown />
+          </SettingsAccordionRow>
+          <SettingsAccordionRow
+            icon="lock-closed-outline"
+            label="Password"
+            subtitle="Change your account password"
+            expanded={passwordOpen}
+            onToggle={() => setPasswordOpen((current) => !current)}
+          >
+            <PasswordDropdown onDone={() => setPasswordOpen(false)} />
+          </SettingsAccordionRow>
+          <SettingsActionRow icon="log-out-outline" label="Sign out" onPress={handleLogOut} />
+          <SettingsAccordionRow
+            icon="warning-outline"
+            label="Danger Zone"
+            subtitle="Permanently delete your account"
+            expanded={dangerZoneOpen}
+            onToggle={() => setDangerZoneOpen((current) => !current)}
+            tone="danger"
+          >
+            <DangerZoneDropdown />
+          </SettingsAccordionRow>
         </View>
+      </ScrollView>
 
-        {isEditing ? (
-          <TextInput
-            value={editName}
-            onChangeText={setEditName}
-            style={[styles.nameText, styles.nameInput]}
-          />
+      <AnimatedPressable
+        style={[
+          styles.editButton,
+          {
+            width: editButtonWidth,
+            paddingHorizontal: editButtonPadding,
+            borderWidth: editButtonBorderWidth,
+            transform: [{ translateX: editButtonShift }],
+          },
+        ]}
+        onPress={handleEditToggle}
+        hitSlop={8}
+      >
+        {buttonShowsCheck ? (
+          <Ionicons name="checkmark" size={18} color={Colors.accent} />
         ) : (
-          <Text style={styles.nameText}>{profile.name}</Text>
+          <Text style={styles.editButtonText} numberOfLines={1}>
+            Edit
+          </Text>
         )}
+      </AnimatedPressable>
 
-        <Text style={styles.emailText}>{session?.user.email ?? ""}</Text>
+      {/* Invisible, unmounted-from-interaction probes purely to measure each
+          state's natural width via onLayout — see editLabelWidth/editCheckWidth
+          above. Kept out of flow (absolute + zero opacity) so they don't
+          affect layout or ever intercept a touch. */}
+      <View
+        style={[styles.editButton, styles.editButtonProbe]}
+        onLayout={(e) => setEditLabelWidth(e.nativeEvent.layout.width)}
+        pointerEvents="none"
+      >
+        <Text style={styles.editButtonText}>Edit</Text>
       </View>
-
-      <View style={styles.rowsList}>
-        <SettingsAccordionRow
-          icon="notifications-outline"
-          label="Notifications"
-          subtitle="Choose what you get notified about"
-          expanded={notificationsOpen}
-          onToggle={() => setNotificationsOpen((current) => !current)}
-        >
-          <NotificationsDropdown />
-        </SettingsAccordionRow>
-        <SettingsAccordionRow
-          icon="lock-closed-outline"
-          label="Password"
-          subtitle="Change your account password"
-          expanded={passwordOpen}
-          onToggle={() => setPasswordOpen((current) => !current)}
-        >
-          <PasswordDropdown onDone={() => setPasswordOpen(false)} />
-        </SettingsAccordionRow>
-        <SettingsActionRow icon="log-out-outline" label="Sign out" onPress={handleLogOut} />
-        <SettingsAccordionRow
-          icon="warning-outline"
-          label="Danger Zone"
-          subtitle="Permanently delete your account"
-          expanded={dangerZoneOpen}
-          onToggle={() => setDangerZoneOpen((current) => !current)}
-          tone="danger"
-        >
-          <DangerZoneDropdown />
-        </SettingsAccordionRow>
+      <View
+        style={[styles.editButton, styles.editButtonProbe]}
+        onLayout={(e) => setEditCheckWidth(e.nativeEvent.layout.width)}
+        pointerEvents="none"
+      >
+        <Ionicons name="checkmark" size={18} color={Colors.accent} />
       </View>
-    </ScrollView>
+    </View>
   );
 }
 
@@ -523,42 +791,59 @@ const styles = StyleSheet.create({
     position: "absolute",
     top: 0,
     right: 20,
+    zIndex: 10,
+    elevation: 10,
+    height: EDIT_BUTTON_HEIGHT,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: Colors.accent,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  // Invisible measuring copies of the button — see the JSX comment above
+  // where they're rendered.
+  editButtonProbe: {
+    opacity: 0,
+  },
+  editButtonText: {
+    color: Colors.accent,
+    fontSize: 14,
+    fontWeight: "600",
   },
   avatarWrap: {
-    width: 96,
-    height: 96,
+    width: AVATAR_SIZE,
+    height: AVATAR_SIZE,
     marginBottom: 8,
   },
   avatarLarge: {
-    width: 96,
-    height: 96,
-    borderRadius: 48,
+    width: AVATAR_SIZE,
+    height: AVATAR_SIZE,
+    borderRadius: AVATAR_SIZE / 2,
     backgroundColor: Colors.accent,
     alignItems: "center",
     justifyContent: "center",
     overflow: "hidden",
   },
   avatarImage: {
-    width: 96,
-    height: 96,
+    width: AVATAR_SIZE,
+    height: AVATAR_SIZE,
   },
   avatarLargeText: {
     color: Colors.accentText,
     fontSize: 32,
     fontWeight: "700",
   },
-  avatarEditBadge: {
+  avatarEditOverlay: {
     position: "absolute",
-    bottom: -2,
-    right: -2,
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: Colors.accent,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: AVATAR_SIZE / 2,
+    backgroundColor: "rgba(0, 0, 0, 0.4)",
     alignItems: "center",
     justifyContent: "center",
-    borderWidth: 2,
-    borderColor: Colors.background,
   },
   nameText: {
     fontSize: 22,
@@ -566,8 +851,7 @@ const styles = StyleSheet.create({
     color: Colors.text,
   },
   nameInput: {
-    borderWidth: 1,
-    borderColor: Colors.border,
+    borderWidth: 1.5,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 4,

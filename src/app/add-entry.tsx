@@ -1,6 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Alert,
   KeyboardAvoidingView,
@@ -44,19 +44,24 @@ function CheckboxRow({
 
 export default function AddEntryScreen() {
   const insets = useSafeAreaInsets();
-  const { groupId, prefillAmount, prefillCurrency } = useLocalSearchParams<{
+  const { groupId, prefillAmount, prefillCurrency, logId } = useLocalSearchParams<{
     groupId: string;
     // Set when arriving from the Scan tab's receipt flow (see
     // scan-pick-group.tsx) — the amount/currency extracted from the photo,
     // still just a starting point the user can edit before submitting.
     prefillAmount?: string;
     prefillCurrency?: string;
+    // Set when arriving from a log's detail popup's "Edit entry" button —
+    // switches this same form into edit-and-save-in-place mode.
+    logId?: string;
   }>();
+  const isEditMode = !!logId;
   const { session } = useAuth();
   const { groups } = useGroups();
-  const { addLog } = useLogs();
+  const { logs, addLog, updateLog } = useLogs();
   const { members: allMembers } = useGroupMembers(groupId);
   const group = groups.find((item) => item.id === groupId);
+  const existingLog = isEditMode ? logs.find((log) => log.id === logId) : undefined;
   // The checklist is for splitting with other people; your own share is
   // handled separately via "Myself included". Members who've left the group
   // can't be picked for a new split, though they remain visible on past
@@ -64,6 +69,17 @@ export default function AddEntryScreen() {
   const members = allMembers.filter(
     (member) => member.id !== session?.user.id && member.isActive
   );
+  // Editing an entry that was split with someone who's since left or deleted
+  // their account can't offer them back as a checkbox — but silently
+  // dropping them from the split on save would shrink shareCount and
+  // retroactively change everyone else's historical balance (the same thing
+  // create_log's null-member handling exists to prevent). So their slot is
+  // preserved untouched and only re-appended on submit; the checklist below
+  // only ever lets the user change the *other*, still-editable slots.
+  const preservedMemberIds =
+    existingLog?.memberIds.filter(
+      (id) => id === null || !members.some((member) => member.id === id)
+    ) ?? [];
 
   // A scanned amount of 0/negative/NaN isn't usable, and a scanned currency
   // that isn't one of ours (e.g. the model misread it, or it's a currency
@@ -76,12 +92,32 @@ export default function AddEntryScreen() {
       ? prefillCurrency
       : undefined;
 
-  const [amount, setAmount] = useState(isPrefilled ? prefillAmount! : "");
-  const [currency, setCurrency] = useState(validPrefillCurrency ?? group?.currency ?? "");
+  const [amount, setAmount] = useState(() =>
+    existingLog ? String(existingLog.amount) : isPrefilled ? prefillAmount! : ""
+  );
+  const [currency, setCurrency] = useState(
+    () => existingLog?.currency ?? validPrefillCurrency ?? group?.currency ?? ""
+  );
   const [isCurrencyPickerVisible, setIsCurrencyPickerVisible] = useState(false);
-  const [details, setDetails] = useState("");
+  const [details, setDetails] = useState(() => existingLog?.details ?? "");
+  // Can't be seeded synchronously like the fields above — useGroupMembers
+  // fetches on its own per-screen mount, so `members` is still empty on
+  // this component's first render even though `existingLog` (from the
+  // already-loaded, app-wide LogsProvider) is available immediately. Seeded
+  // once via the effect below instead, as soon as the member list actually
+  // has something to match against.
   const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
-  const [includeMyself, setIncludeMyself] = useState(true);
+  const hasSeededSelection = useRef(false);
+  useEffect(() => {
+    if (!existingLog || hasSeededSelection.current || allMembers.length === 0) return;
+    hasSeededSelection.current = true;
+    const seeded: Record<string, boolean> = {};
+    existingLog.memberIds.forEach((id) => {
+      if (id && members.some((member) => member.id === id)) seeded[id] = true;
+    });
+    setSelectedIds(seeded);
+  }, [existingLog, allMembers, members]);
+  const [includeMyself, setIncludeMyself] = useState(existingLog?.payerIncluded ?? true);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const allSelected = members.length > 0 && members.every((member) => selectedIds[member.id]);
@@ -99,8 +135,14 @@ export default function AddEntryScreen() {
     setSelectedIds(updated);
   };
 
-  const amountValue = Number(amount);
-  const hasSelection = Object.values(selectedIds).some(Boolean);
+  // decimal-pad shows a comma instead of a period as the decimal separator on
+  // many European locales, but `Number()` treats "12,50" as NaN — normalize
+  // before parsing so a comma-entered amount isn't silently rejected.
+  const amountValue = Number(amount.trim().replace(",", "."));
+  // A preserved (deleted/departed-member) slot already guarantees a
+  // non-empty split even if nothing in the editable checklist is checked,
+  // so it counts toward "there's a valid split" the same as a real checkbox.
+  const hasSelection = Object.values(selectedIds).some(Boolean) || preservedMemberIds.length > 0;
   const canSubmit =
     amount.trim().length > 0 &&
     !Number.isNaN(amountValue) &&
@@ -110,6 +152,7 @@ export default function AddEntryScreen() {
 
   const handleSubmit = async () => {
     if (!canSubmit || !groupId || !session || !group) return;
+    if (isEditMode && !existingLog) return;
     const effectiveCurrency = currency.trim() || group.currency || "";
     if (effectiveCurrency !== currency) {
       setCurrency(effectiveCurrency);
@@ -132,13 +175,38 @@ export default function AddEntryScreen() {
       }
     }
 
+    const memberIds = [
+      ...preservedMemberIds,
+      ...Object.keys(selectedIds).filter((id) => selectedIds[id]),
+    ];
+
+    if (isEditMode && existingLog) {
+      const { error } = await updateLog(existingLog.id, {
+        groupId,
+        amount: amountValue,
+        convertedAmount,
+        currency: effectiveCurrency,
+        details: details.trim(),
+        memberIds,
+        paidBy: existingLog.paidBy,
+        payerIncluded: includeMyself,
+      });
+      setIsSubmitting(false);
+      if (error) {
+        Alert.alert("Couldn't save changes", error);
+        return;
+      }
+      router.back();
+      return;
+    }
+
     await addLog({
       groupId,
       amount: amountValue,
       convertedAmount,
       currency: effectiveCurrency,
       details: details.trim(),
-      memberIds: Object.keys(selectedIds).filter((id) => selectedIds[id]),
+      memberIds,
       paidBy: session.user.id,
       payerIncluded: includeMyself,
     });
@@ -152,7 +220,7 @@ export default function AddEntryScreen() {
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
       <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
-        <Text style={styles.headerTitle}>Add entry</Text>
+        <Text style={styles.headerTitle}>{isEditMode ? "Edit entry" : "Add entry"}</Text>
         <Pressable onPress={() => router.back()} hitSlop={12}>
           <Ionicons name="close" size={24} color={Colors.text} />
         </Pressable>
@@ -230,7 +298,13 @@ export default function AddEntryScreen() {
           disabled={!canSubmit}
         >
           <Text style={styles.submitButtonText}>
-            {isSubmitting ? "Submitting..." : "Submit entry"}
+            {isSubmitting
+              ? isEditMode
+                ? "Saving..."
+                : "Submitting..."
+              : isEditMode
+                ? "Save changes"
+                : "Submit entry"}
           </Text>
         </Pressable>
       </ScrollView>
