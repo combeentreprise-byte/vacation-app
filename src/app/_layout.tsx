@@ -1,5 +1,6 @@
 import { Stack } from "expo-router";
 import { View } from "react-native";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
 
 import { AuthProvider, useAuth } from "@/hooks/use-auth";
 import { GroupsProvider } from "@/hooks/use-groups";
@@ -37,24 +38,27 @@ function RootNavigator() {
         <Stack.Screen name="join/[id]" />
       </Stack.Protected>
 
-      {/* Ungated: reached via a Supabase recovery email link, which can land
-          before or after this client establishes its own session from the
-          link's tokens, so it can't be gated on session state either way. */}
+      {/* Ungated: reached via a Supabase recovery email link or an OAuth
+          redirect, both of which can land before this client has a session
+          of its own yet, so neither can be gated on session state. */}
       <Stack.Screen name="reset-password" />
+      <Stack.Screen name="auth-callback" />
     </Stack>
   );
 }
 
 export default function RootLayout() {
   return (
-    <AuthProvider>
-      <ProfileProvider>
-        <GroupsProvider>
-          <LogsProvider>
-            <RootNavigator />
-          </LogsProvider>
-        </GroupsProvider>
-      </ProfileProvider>
-    </AuthProvider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <AuthProvider>
+        <ProfileProvider>
+          <GroupsProvider>
+            <LogsProvider>
+              <RootNavigator />
+            </LogsProvider>
+          </GroupsProvider>
+        </ProfileProvider>
+      </AuthProvider>
+    </GestureHandlerRootView>
   );
 }

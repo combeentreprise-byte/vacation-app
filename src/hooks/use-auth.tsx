@@ -9,6 +9,7 @@ import {
 } from "react";
 
 import { supabase } from "@/lib/supabase";
+import { signInWithOAuthProvider, type OAuthProvider } from "@/utils/oauth";
 
 type AuthContextValue = {
   session: Session | null;
@@ -21,6 +22,7 @@ type AuthContextValue = {
     email: string,
     password: string
   ) => Promise<{ error: string | null; isInvalidCredentials?: boolean }>;
+  signInWithOAuth: (provider: OAuthProvider) => Promise<{ error: string | null }>;
   signOut: () => Promise<void>;
   resetPasswordForEmail: (email: string) => Promise<{ error: string | null }>;
   updatePassword: (newPassword: string) => Promise<{ error: string | null }>;
@@ -70,6 +72,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   };
 
+  const signInWithOAuth = async (provider: OAuthProvider) => {
+    return signInWithOAuthProvider(provider);
+  };
+
   const signOut = async () => {
     await supabase.auth.signOut();
   };
@@ -109,6 +115,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isLoading,
         signUp,
         signIn,
+        signInWithOAuth,
         signOut,
         resetPasswordForEmail,
         updatePassword,

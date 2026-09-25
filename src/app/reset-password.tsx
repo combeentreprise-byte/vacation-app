@@ -17,24 +17,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Colors } from "@/constants/colors";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/lib/supabase";
-
-// Supabase's recovery link redirects here with the session tokens attached
-// as a URL fragment (`#access_token=...&refresh_token=...&type=recovery`),
-// not query params — this client uses the default "implicit" auth flow, and
-// detectSessionInUrl is deliberately off (see lib/supabase.ts, needed for
-// SSR safety), so nothing parses that fragment automatically. This screen
-// has to do it by hand and exchange it for a real session itself.
-function extractTokensFromUrl(url: string) {
-  const fragment = url.split("#")[1] ?? url.split("?")[1];
-  if (!fragment) return null;
-
-  const params = new URLSearchParams(fragment);
-  const accessToken = params.get("access_token");
-  const refreshToken = params.get("refresh_token");
-  if (!accessToken || !refreshToken) return null;
-
-  return { accessToken, refreshToken };
-}
+import { extractSessionTokensFromUrl } from "@/utils/oauth";
 
 export default function ResetPasswordScreen() {
   const insets = useSafeAreaInsets();
@@ -53,7 +36,7 @@ export default function ResetPasswordScreen() {
     let cancelled = false;
 
     async function establishSession() {
-      const tokens = extractTokensFromUrl(currentUrl);
+      const tokens = extractSessionTokensFromUrl(currentUrl);
       if (!tokens) {
         if (!cancelled) setStatus("invalid");
         return;

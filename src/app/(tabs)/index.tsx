@@ -1,4 +1,4 @@
-import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
+import { Ionicons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import { useState } from "react";
 import {
@@ -12,6 +12,7 @@ import {
   View,
 } from "react-native";
 
+import { GroupHero } from "@/components/hero-motive";
 import { Colors } from "@/constants/colors";
 import { type Group, useGroups } from "@/hooks/use-groups";
 import { supabase } from "@/lib/supabase";
@@ -136,9 +137,13 @@ export default function GroupScreen() {
           >
             {/* The card body itself stands in for a future decorative photo
                 (see cardPhotoArea) — the ribbon just sits on top of it. */}
-            <View style={styles.cardPhotoArea}>
-              <MaterialCommunityIcons name="city-variant-outline" size={40} color={Colors.muted} />
-            </View>
+            <GroupHero
+              photoUrl={item.photoUrl}
+              motive={item.heroMotive}
+              hue={item.heroHue}
+              verticalAlign="top"
+              style={styles.cardPhotoArea}
+            />
             <View style={styles.cardRibbon}>
               <Text style={styles.cardTitle} numberOfLines={1}>
                 {item.name}
@@ -201,9 +206,6 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     bottom: 0,
-    backgroundColor: Colors.border,
-    alignItems: "center",
-    justifyContent: "center",
   },
   cardRibbon: {
     position: "absolute",

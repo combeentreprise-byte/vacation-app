@@ -16,6 +16,9 @@ export type Group = {
   name: string;
   description: string;
   currency: string;
+  heroMotive: string;
+  heroHue: number;
+  photoUrl: string | null;
   createdAt: number;
 };
 
@@ -24,6 +27,9 @@ type GroupRow = {
   name: string;
   description: string;
   currency: string;
+  motive: string;
+  hue: number;
+  photo_url: string | null;
   created_at: string;
 };
 
@@ -33,6 +39,9 @@ function mapGroup(row: GroupRow): Group {
     name: row.name,
     description: row.description,
     currency: row.currency,
+    heroMotive: row.motive,
+    heroHue: row.hue,
+    photoUrl: row.photo_url,
     createdAt: new Date(row.created_at).getTime(),
   };
 }
@@ -41,12 +50,19 @@ function mapGroup(row: GroupRow): Group {
 // converted_amount (see change_group_currency in schema.sql), which a plain
 // column update would silently skip. changeGroupCurrency below is the only
 // path allowed to change it.
-type GroupUpdates = Partial<Pick<Group, "name" | "description">>;
+type GroupUpdates = Partial<Pick<Group, "name" | "description" | "heroMotive" | "heroHue" | "photoUrl">>;
 
 type GroupsContextValue = {
   groups: Group[];
   isLoaded: boolean;
-  addGroup: (name: string, description: string, currency: string) => Promise<void>;
+  addGroup: (
+    name: string,
+    description: string,
+    currency: string,
+    motive: string,
+    hue: number,
+    photoUrl: string | null
+  ) => Promise<void>;
   updateGroup: (id: string, updates: GroupUpdates) => Promise<void>;
   changeGroupCurrency: (id: string, currentCurrency: string, newCurrency: string) => Promise<{ error?: string }>;
   removeGroup: (id: string) => Promise<void>;
@@ -99,7 +115,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   }, [refresh]);
 
   const addGroup = useCallback(
-    async (name: string, description: string, currency: string) => {
+    async (
+      name: string,
+      description: string,
+      currency: string,
+      motive: string,
+      hue: number,
+      photoUrl: string | null
+    ) => {
       if (!userId) return;
 
       // Creating the group and joining it as its first member happen
@@ -110,6 +133,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         group_name: name,
         group_description: description,
         group_currency: currency,
+        group_motive: motive,
+        group_hue: hue,
+        group_photo_url: photoUrl,
       });
 
       if (error) console.warn("Failed to create group", error);
@@ -121,7 +147,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
   const updateGroup = useCallback(
     async (id: string, updates: GroupUpdates) => {
-      const { error } = await supabase.from("groups").update(updates).eq("id", id);
+      const { name, description, heroMotive, heroHue, photoUrl } = updates;
+      const row: Partial<GroupRow> = {
+        ...(name !== undefined ? { name } : {}),
+        ...(description !== undefined ? { description } : {}),
+        ...(heroMotive !== undefined ? { motive: heroMotive } : {}),
+        ...(heroHue !== undefined ? { hue: heroHue } : {}),
+        ...(photoUrl !== undefined ? { photo_url: photoUrl } : {}),
+      };
+      const { error } = await supabase.from("groups").update(row).eq("id", id);
       if (error) console.warn("Failed to update group", error);
       await refresh();
     },

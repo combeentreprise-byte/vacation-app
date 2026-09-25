@@ -1,6 +1,8 @@
+import { Ionicons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import { useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
   Platform,
@@ -15,15 +17,18 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Colors } from "@/constants/colors";
 import { useAuth } from "@/hooks/use-auth";
+import { showComingSoon } from "@/utils/coming-soon";
+import type { OAuthProvider } from "@/utils/oauth";
 
 export default function SignInScreen() {
   const insets = useSafeAreaInsets();
-  const { signIn, signUp } = useAuth();
+  const { signIn, signUp, signInWithOAuth } = useAuth();
 
   const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-in");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [oauthPending, setOauthPending] = useState<OAuthProvider | null>(null);
   // The ring around each field is tracked separately from the message: the
   // sign-in "invalid credentials" case rings both fields but only says why
   // once (see errorMessage below), while sign-up's "email already exists"
@@ -91,6 +96,27 @@ export default function SignInScreen() {
     }
   };
 
+  const handleOAuthPress = async (provider: OAuthProvider) => {
+    if (oauthPending) return;
+
+    // Apple sign-in isn't wired up on the Supabase side yet (see use-auth.tsx
+    // signInWithOAuth) — route it through the same "not built yet" pattern
+    // every other unfinished feature uses instead of hitting the API and
+    // showing a raw Supabase validation error.
+    if (provider === "apple") {
+      showComingSoon("Sign in with Apple");
+      return;
+    }
+
+    setOauthPending(provider);
+    const { error } = await signInWithOAuth(provider);
+    setOauthPending(null);
+
+    if (error) {
+      Alert.alert("Couldn't sign in with Google", error);
+    }
+  };
+
   return (
     <KeyboardAvoidingView
       style={styles.flex}
@@ -105,6 +131,44 @@ export default function SignInScreen() {
         <Text style={styles.subtitle}>
           {mode === "sign-in" ? "Sign in to your account" : "Create an account"}
         </Text>
+
+        <View style={styles.oauthGroup}>
+          <Pressable
+            style={[styles.oauthButton, styles.appleButton]}
+            onPress={() => handleOAuthPress("apple")}
+            disabled={oauthPending !== null}
+          >
+            {oauthPending === "apple" ? (
+              <ActivityIndicator color="#FFFFFF" />
+            ) : (
+              <>
+                <Ionicons name="logo-apple" size={20} color="#FFFFFF" />
+                <Text style={styles.appleButtonText}>Continue with Apple</Text>
+              </>
+            )}
+          </Pressable>
+
+          <Pressable
+            style={[styles.oauthButton, styles.googleButton]}
+            onPress={() => handleOAuthPress("google")}
+            disabled={oauthPending !== null}
+          >
+            {oauthPending === "google" ? (
+              <ActivityIndicator color={Colors.text} />
+            ) : (
+              <>
+                <Ionicons name="logo-google" size={20} color={Colors.text} />
+                <Text style={styles.googleButtonText}>Continue with Google</Text>
+              </>
+            )}
+          </Pressable>
+        </View>
+
+        <View style={styles.dividerRow}>
+          <View style={styles.dividerLine} />
+          <Text style={styles.dividerText}>or</Text>
+          <View style={styles.dividerLine} />
+        </View>
 
         <View style={styles.form}>
           <View style={styles.field}>
@@ -187,6 +251,50 @@ const styles = StyleSheet.create({
     color: Colors.muted,
     textAlign: "center",
     marginTop: -12,
+  },
+  oauthGroup: {
+    gap: 12,
+  },
+  oauthButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    borderRadius: 10,
+    paddingVertical: 14,
+    borderWidth: 1,
+  },
+  appleButton: {
+    backgroundColor: "#000000",
+    borderColor: "#000000",
+  },
+  appleButtonText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  googleButton: {
+    backgroundColor: Colors.background,
+    borderColor: Colors.border,
+  },
+  googleButtonText: {
+    color: Colors.text,
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  dividerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: Colors.border,
+  },
+  dividerText: {
+    fontSize: 13,
+    color: Colors.muted,
   },
   form: {
     gap: 20,

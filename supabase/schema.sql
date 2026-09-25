@@ -36,6 +36,37 @@ create table if not exists public.groups (
   created_at timestamptz not null default now()
 );
 
+-- Trim any pre-existing overlong descriptions before adding the constraint
+-- below, since `add constraint` validates all existing rows.
+update public.groups set description = left(description, 300)
+  where char_length(description) > 300;
+alter table public.groups drop constraint if exists groups_description_length;
+alter table public.groups add constraint groups_description_length
+  check (char_length(description) <= 300);
+
+-- Which placeholder illustration + hue a group's hero shows (see HeroMotive
+-- in the client) — chosen once, randomly, at create_group time and never
+-- rerolled after, so it has to be stored rather than derived every render.
+-- `motive` is a stable key (matches a HERO_MOTIVES entry client-side), not an
+-- index, so it survives that array being reordered/extended later. No check
+-- constraint on its value set, same as `currency` above: both are free-text,
+-- validated app-side, since the allowed set grows over time.
+alter table public.groups add column if not exists motive text;
+alter table public.groups add column if not exists hue integer;
+-- Existing rows predate this column and were backfilled out-of-band with the
+-- same motive/hue their old hash-based derivation used to compute, so they
+-- keep looking the same post-migration. Only run `set not null` below once
+-- that backfill has actually landed on every row.
+alter table public.groups alter column motive set not null;
+alter table public.groups alter column hue set not null;
+
+-- A real uploaded photo, picked at create_group time (see the group-photos
+-- bucket further down). Nullable forever, unlike motive/hue above — "no
+-- photo, show the placeholder motive" is a real, permanent state rather than
+-- a migration gap, so GroupHero (src/components/hero-motive.tsx) checks this
+-- first and only falls back to motive/hue when it's null.
+alter table public.groups add column if not exists photo_url text;
+
 create table if not exists public.group_members (
   -- Surrogate key (rather than primary key (group_id, user_id)) specifically
   -- so user_id can be nullable — see the migration further down for why a
@@ -291,10 +322,19 @@ create trigger on_auth_user_created
 -- back to the client fails for the same reason the creator isn't a member
 -- yet at that instant. security definer bypasses that bootstrapping problem
 -- for this function's own inserts.
+-- Superseded by the 6-arg version below (adds group_photo_url); dropped
+-- explicitly since "create or replace" can't change a function's argument
+-- list in place and would otherwise leave this old overload lying around.
+drop function if exists public.create_group(text, text, text);
+drop function if exists public.create_group(text, text, text, text, integer);
+
 create or replace function public.create_group(
   group_name text,
   group_description text,
-  group_currency text
+  group_currency text,
+  group_motive text,
+  group_hue integer,
+  group_photo_url text default null
 )
 returns public.groups
 language plpgsql
@@ -304,8 +344,8 @@ as $$
 declare
   new_group public.groups;
 begin
-  insert into public.groups (name, description, currency, created_by)
-  values (group_name, group_description, group_currency, auth.uid())
+  insert into public.groups (name, description, currency, motive, hue, photo_url, created_by)
+  values (group_name, group_description, group_currency, group_motive, group_hue, group_photo_url, auth.uid())
   returning * into new_group;
 
   insert into public.group_members (group_id, user_id, is_admin)
@@ -315,7 +355,7 @@ begin
 end;
 $$;
 
-grant execute on function public.create_group(text, text, text) to authenticated;
+grant execute on function public.create_group(text, text, text, text, integer, text) to authenticated;
 
 -- Superseded by the 7-arg version below (adds p_converted_amount); dropped
 -- explicitly since "create or replace" can't change a function's argument
@@ -923,4 +963,27 @@ drop policy if exists "avatars_delete_own" on storage.objects;
 create policy "avatars_delete_own" on storage.objects
   for delete using (
     bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+-- ---------------------------------------------------------------------------
+-- Storage (group photos)
+-- ---------------------------------------------------------------------------
+-- Same reasoning as avatars above (public bucket, own-uid-prefixed path), but
+-- without a fixed "/photo" slot: one user creates many groups, each getting
+-- its own random object key, uploaded once at create_group time and never
+-- replaced (no editing a group's photo after creation yet) — so no
+-- update/delete policy is needed here, only select + insert.
+
+insert into storage.buckets (id, name, public)
+values ('group-photos', 'group-photos', true)
+on conflict (id) do nothing;
+
+drop policy if exists "group_photos_public_select" on storage.objects;
+create policy "group_photos_public_select" on storage.objects
+  for select using (bucket_id = 'group-photos');
+
+drop policy if exists "group_photos_insert_own" on storage.objects;
+create policy "group_photos_insert_own" on storage.objects
+  for insert with check (
+    bucket_id = 'group-photos' and (storage.foldername(name))[1] = auth.uid()::text
   );

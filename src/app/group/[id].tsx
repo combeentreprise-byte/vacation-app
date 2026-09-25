@@ -5,18 +5,19 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Animated,
+  Easing,
   type GestureResponderEvent,
   Image,
   type LayoutChangeEvent,
   Modal,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
+  Platform,
   Pressable,
   Share,
   type StyleProp,
   StyleSheet,
   Text,
-  TextInput,
   type TextStyle,
   useWindowDimensions,
   View,
@@ -29,8 +30,9 @@ import {
   TabView,
 } from "react-native-tab-view";
 
-import { CurrencyPickerModal, FlagIcon } from "@/components/currency-picker";
+import { FlagIcon } from "@/components/currency-picker";
 import { GroupActionsMenu } from "@/components/group-actions-menu";
+import { GroupHero } from "@/components/hero-motive";
 import type { MenuAnchor } from "@/components/menu-anchor";
 import { PageHeader } from "@/components/page-header";
 import { Colors } from "@/constants/colors";
@@ -60,6 +62,27 @@ const HERO_HEIGHT_RATIO = 0.28;
 // since the bar itself has no ListFooter/layout the FAB could measure.
 const SUMMARY_BAR_HEIGHT = 50;
 
+// How many lines a collapsed description shows before offering "Show more".
+const DESCRIPTION_COLLAPSED_LINES = 4;
+// Matches styles.description's lineHeight — used to compute the collapsed
+// pixel height a measured description is compared against (see
+// descriptionMeasure below). Kept as a constant rather than read back from
+// the stylesheet since RN style objects aren't guaranteed to round-trip.
+const DESCRIPTION_LINE_HEIGHT = 21;
+const DESCRIPTION_COLLAPSED_HEIGHT = DESCRIPTION_COLLAPSED_LINES * DESCRIPTION_LINE_HEIGHT;
+// react-native-web's default text wrapping (like a browser's) only breaks at
+// spaces, so a long unbroken run of characters (a URL, a typo with no
+// spaces) overflows its box instead of wrapping — and since the description
+// box above now clips with overflow:hidden for the collapse animation, that
+// overflow reads as a letter getting sliced off at the right edge rather
+// than just spilling out. `wordBreak` isn't in React Native's TextStyle
+// type (it's a web-only CSS property RNW passes through as-is), so it's
+// applied only on web via a cast rather than baked into styles.description.
+// Native's own text layout already breaks long words onto a new line
+// without this.
+const webWordBreakStyle: TextStyle =
+  Platform.OS === "web" ? ({ wordBreak: "break-word" } as unknown as TextStyle) : {};
+
 // The FAB sits floating above the summary bar (see styles.fab's own bottom
 // offset, which stacks this margin + its diameter on top of
 // SUMMARY_BAR_HEIGHT), so anything a list needs to clear at the bottom of
@@ -78,10 +101,19 @@ const FAB_DIAMETER = 56;
 // instead, so it scales down on smaller screens instead of dominating them.
 const BOTTOM_OBSTRUCTION_HEIGHT = SUMMARY_BAR_HEIGHT + FAB_BOTTOM_MARGIN + FAB_DIAMETER;
 // The extra breathing room below the last row, past what's strictly needed
-// to clear the summary bar/FAB — expressed as a fraction of device height
-// per the user's explicit ask ("almost no whitespace, maybe just 10% of
-// device height"), not a flat pixel count.
-const BOTTOM_CLEARANCE_GAP_RATIO = 0.1;
+// to clear the summary bar/FAB — expressed as a fraction of device height,
+// not a flat pixel count, so it scales down on shorter screens instead of
+// dominating them. Was 0.1 (~10% of device height): on top of
+// BOTTOM_OBSTRUCTION_HEIGHT and the list's own trailing gap/padding, that
+// added up to a visible gap of ~240-256px on a typical phone, noticeably
+// more than needed just to keep the last row clear of the FAB. Trimmed to
+// this much smaller ratio — still a real, non-zero comfort margin so the
+// last row doesn't sit flush against the FAB, but most of the clearance
+// now comes from BOTTOM_OBSTRUCTION_HEIGHT (the FAB/bar's real, immovable
+// footprint) rather than this discretionary top-up. Don't drop this to 0
+// or remove it: some margin here is still what keeps the last row from
+// touching the FAB on the smallest supported screens.
+const BOTTOM_CLEARANCE_GAP_RATIO = 0.02;
 
 // Below this many rows, a pane's content is too short to ever scroll for
 // real — tying the hero's collapse to that pane's scroll position just
@@ -598,10 +630,11 @@ function MembersPane({
     );
   }
 
-  return (
+  const list = (
     <Animated.FlatList<GroupMember>
       data={sortedMembers}
       keyExtractor={(item) => item.id}
+      style={minListHeight > 0 ? styles.flex : undefined}
       contentContainerStyle={[styles.membersList, { minHeight: minListHeight }]}
       onScroll={onScroll}
       scrollEventThrottle={16}
@@ -616,6 +649,14 @@ function MembersPane({
       )}
     />
   );
+  // Wrapped in a definite-height box only for a non-collapsible pane
+  // (minListHeight > 0) — see nonCollapsibleMinHeight in GroupDetailScreen
+  // for why this needs to cap the list's own box, not just its content's
+  // minHeight. Left completely unwrapped for a collapsible pane
+  // (minListHeight === 0), which already fills the full tab area correctly
+  // as the TabView scene's direct child — wrapping it here too would swap
+  // that for a View whose own sizing isn't guaranteed the same way.
+  return minListHeight > 0 ? <View style={{ height: minListHeight }}>{list}</View> : list;
 }
 
 function LogRow({
@@ -945,28 +986,36 @@ function LogsPane({
     );
   }
 
+  const list = (
+    <Animated.FlatList<LogEntry>
+      data={groupLogs}
+      keyExtractor={(item) => item.id}
+      style={minListHeight > 0 ? styles.flex : undefined}
+      contentContainerStyle={[styles.membersList, { minHeight: minListHeight }]}
+      onScroll={onScroll}
+      scrollEventThrottle={16}
+      ListFooterComponent={<View style={{ height: footerHeight }} />}
+      renderItem={({ item }) => (
+        <LogRow
+          log={item}
+          members={members}
+          currentUserId={currentUserId}
+          viewerName={viewerName}
+          viewerAvatarUrl={viewerAvatarUrl}
+          viewerIsAdmin={viewerIsAdmin}
+          groupCurrency={groupCurrency}
+          onPress={() => setSelectedLog(item)}
+        />
+      )}
+    />
+  );
+
   return (
     <>
-      <Animated.FlatList<LogEntry>
-        data={groupLogs}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={[styles.membersList, { minHeight: minListHeight }]}
-        onScroll={onScroll}
-        scrollEventThrottle={16}
-        ListFooterComponent={<View style={{ height: footerHeight }} />}
-        renderItem={({ item }) => (
-          <LogRow
-            log={item}
-            members={members}
-            currentUserId={currentUserId}
-            viewerName={viewerName}
-            viewerAvatarUrl={viewerAvatarUrl}
-            viewerIsAdmin={viewerIsAdmin}
-            groupCurrency={groupCurrency}
-            onPress={() => setSelectedLog(item)}
-          />
-        )}
-      />
+      {/* See the matching wrapping in MembersPane for why a non-collapsible
+          pane (minListHeight > 0) gets its list wrapped in a definite-height
+          box instead of just capping the content's minHeight. */}
+      {minListHeight > 0 ? <View style={{ height: minListHeight }}>{list}</View> : list}
       <LogDetailOverlay
         log={selectedLog}
         members={members}
@@ -989,8 +1038,7 @@ export default function GroupDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { session } = useAuth();
   const { profile } = useProfile();
-  const { groups, updateGroup, changeGroupCurrency, removeGroup, promoteToAdmin, kickMember } =
-    useGroups();
+  const { groups, removeGroup, promoteToAdmin, kickMember } = useGroups();
   const group = groups.find((item) => item.id === id);
   const insets = useSafeAreaInsets();
   const { height: windowHeight, width: windowWidth } = useWindowDimensions();
@@ -1034,7 +1082,25 @@ export default function GroupDetailScreen() {
   // as literal blank space below the last row — which is how "half the
   // screen" of dead space happened. A collapsible-by-count list is already
   // long enough that it doesn't need this floor for genuine scrollability.
-  const nonCollapsibleMinHeight = tabViewHeight || windowHeight;
+  //
+  // Subtracts heroHeight because a non-collapsible pane's hero never slides
+  // away (scrollGate stays shut for it — see below), so contentLayer sits
+  // permanently offset by heroHeight and only (tabViewHeight - heroHeight)
+  // of it is ever painted inside the actual screen — the remaining
+  // heroHeight at the bottom of tabViewHeight is real layout space that
+  // exists below the visible viewport and can never be scrolled into view.
+  // Sizing the pane off the full tabViewHeight (as before) let its FlatList
+  // believe it had that much real viewport to work with, so a pane whose
+  // rows fell just short of MIN_ITEMS_TO_COLLAPSE_HERO but still added up
+  // to close to a screenful — enough to push the trailing footerHeight
+  // spacer past the true (smaller) visible height — would stop scrolling
+  // heroHeight short of its real end, permanently hiding that spacer (and
+  // the last row's intended clearance) behind the summary bar/FAB with no
+  // way to scroll it into view. Applied below as this pane's own explicit
+  // height (see MembersPane/LogsPane's `style`), not just its content's
+  // minHeight, so the FlatList's internal scroll viewport matches what's
+  // actually on screen and its true end is always reachable.
+  const nonCollapsibleMinHeight = Math.max(0, (tabViewHeight || windowHeight) - heroHeight);
   // One footer height for both collapsible and non-collapsible panes — the
   // real bottom-bar/FAB clearance (BOTTOM_OBSTRUCTION_HEIGHT) plus a small
   // gap sized off the actual device height (BOTTOM_CLEARANCE_GAP_RATIO),
@@ -1122,13 +1188,60 @@ export default function GroupDetailScreen() {
   );
   const [tabIndex, setTabIndex] = useState(0);
   const [menuAnchor, setMenuAnchor] = useState<MenuAnchor | null>(null);
-  const [isEditing, setIsEditing] = useState(false);
-  const [editName, setEditName] = useState("");
-  const [editDescription, setEditDescription] = useState("");
-  const [editCurrency, setEditCurrency] = useState("");
-  const [isCurrencyPickerVisible, setIsCurrencyPickerVisible] = useState(false);
+  const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false);
+  // The description's natural (unclamped) rendered height in px — measured
+  // via an invisible clone rather than guessed from character/newline count,
+  // so "Show more" only appears when the collapsed cap is actually cutting
+  // something off. Null until that measurement lands. onTextLayout would be
+  // the more direct way to get a line count, but react-native-web doesn't
+  // implement it at all, so onLayout + a height comparison is what actually
+  // works on both web and native.
+  const [descriptionNaturalHeight, setDescriptionNaturalHeight] = useState<number | null>(null);
+  // Just the box's height, eased smoothly between collapsed and natural —
+  // no opacity animation at all. Layering any opacity change on top (a mid-
+  // transition dip, or a fade-out/resize/fade-in sequence) was tried and
+  // rejected: both read as a flicker of the already-settled text rather
+  // than an improvement. A slower, eased (not linear) height animation is
+  // what actually reads as one continuous grow instead of lines stepping in.
+  const [descriptionHeightAnim] = useState(() => new Animated.Value(DESCRIPTION_COLLAPSED_HEIGHT));
+  // Skips animating the very first time a description's height is measured,
+  // and again whenever the description text itself changes (edited or
+  // switched groups), so the box doesn't visibly animate open on load/edit —
+  // only an actual Show more/less press should animate (see
+  // toggleDescription).
+  const hasMeasuredDescriptionRef = useRef(false);
+  useEffect(() => {
+    hasMeasuredDescriptionRef.current = false;
+  }, [group?.description]);
+  useEffect(() => {
+    if (descriptionNaturalHeight === null || hasMeasuredDescriptionRef.current) return;
+    hasMeasuredDescriptionRef.current = true;
+    const collapsedHeight = Math.min(descriptionNaturalHeight, DESCRIPTION_COLLAPSED_HEIGHT);
+    descriptionHeightAnim.setValue(isDescriptionExpanded ? descriptionNaturalHeight : collapsedHeight);
+  }, [descriptionNaturalHeight, isDescriptionExpanded, descriptionHeightAnim]);
+  const toggleDescription = () => {
+    const nextExpanded = !isDescriptionExpanded;
+    const collapsedHeight =
+      descriptionNaturalHeight !== null
+        ? Math.min(descriptionNaturalHeight, DESCRIPTION_COLLAPSED_HEIGHT)
+        : DESCRIPTION_COLLAPSED_HEIGHT;
+    const targetHeight = nextExpanded ? descriptionNaturalHeight ?? DESCRIPTION_COLLAPSED_HEIGHT : collapsedHeight;
+    setIsDescriptionExpanded(nextExpanded);
+    // Easing.out(cubic) at 320ms front-loads almost all the motion into the
+    // first ~15% of the duration, so a single 21px line finishes revealing
+    // in well under 100ms — too quick for the eye to read as a slide, it
+    // reads as a pop/snap instead. inOut spreads the motion evenly across
+    // the whole (longer) duration, which is what actually makes the box
+    // read as smoothly sliding/uncovering rather than lines appearing.
+    Animated.timing(descriptionHeightAnim, {
+      toValue: targetHeight,
+      duration: 450,
+      easing: Easing.inOut(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+  };
   const [selectedMember, setSelectedMember] = useState<GroupMember | null>(null);
-  const { logs, refresh: refreshLogs, settleDebt } = useLogs();
+  const { logs, settleDebt } = useLogs();
   const { members: allMembers, refresh: refreshMembers } = useGroupMembers(group?.id);
   // The list of "other" members is what everything below actually wants;
   // seeing your own name in your own balance list would be meaningless.
@@ -1292,36 +1405,9 @@ export default function GroupDetailScreen() {
     );
   };
 
-  const handleEditToggle = async () => {
+  const handleEditGroup = () => {
     setMenuAnchor(null);
-    if (isEditing) {
-      await updateGroup(group.id, {
-        name: editName.trim() || group.name,
-        description: editDescription.trim(),
-      });
-
-      const newCurrency = editCurrency.trim() || group.currency;
-      if (newCurrency !== group.currency) {
-        const { error } = await changeGroupCurrency(group.id, group.currency, newCurrency);
-        if (error) {
-          Alert.alert("Couldn't change currency", error);
-          return;
-        }
-        // change_group_currency rescales every log's converted_amount
-        // server-side, but useLogs' own cached copy doesn't know that
-        // happened — without this, balances would keep showing pre-rescale
-        // numbers under the new currency label until something else
-        // happened to trigger a logs refresh.
-        await refreshLogs();
-      }
-
-      setIsEditing(false);
-    } else {
-      setEditName(group.name);
-      setEditDescription(group.description);
-      setEditCurrency(group.currency);
-      setIsEditing(true);
-    }
+    router.push({ pathname: "/new-group", params: { groupId: group.id } });
   };
 
   const handleInvite = () => {
@@ -1440,9 +1526,13 @@ export default function GroupDetailScreen() {
         ]}
       >
         <View style={[styles.heroContent, { marginTop: insets.top }]}>
-          <View style={styles.heroPhotoArea}>
-            <MaterialCommunityIcons name="city-variant-outline" size={64} color={Colors.muted} />
-          </View>
+          <GroupHero
+            photoUrl={group.photoUrl}
+            motive={group.heroMotive}
+            hue={group.heroHue}
+            fill="92%"
+            verticalAlign="bottom"
+          />
           <Pressable
             style={[styles.heroBackButton, { top: insets.top + 8 }]}
             onPress={goBackOrToGroups}
@@ -1464,60 +1554,66 @@ export default function GroupDetailScreen() {
         style={[styles.contentLayer, { transform: [{ translateY: contentTranslateY }] }]}
       >
         <View style={[styles.titleRow, { paddingTop: 12 + effectiveTitleClearance }]}>
-          {isEditing ? (
-            <TextInput
-              value={editName}
-              onChangeText={setEditName}
-              style={[styles.groupName, styles.editableInput, styles.titleRowGrow]}
-            />
-          ) : (
-            <Text style={[styles.groupName, styles.titleRowGrow]} numberOfLines={1}>
-              {group.name}
-            </Text>
-          )}
-          <Pressable onPress={isEditing ? handleEditToggle : openMenu} hitSlop={12}>
-            <Ionicons
-              name={isEditing ? "checkmark" : "ellipsis-vertical"}
-              size={22}
-              color={Colors.text}
-            />
+          <Text style={[styles.groupName, styles.titleRowGrow]} numberOfLines={1}>
+            {group.name}
+          </Text>
+          <Pressable onPress={openMenu} hitSlop={12}>
+            <Ionicons name="ellipsis-vertical" size={22} color={Colors.text} />
           </Pressable>
         </View>
 
         <View style={styles.titleSeparator} />
 
         <View style={styles.detailBody}>
-          {isEditing ? (
-            <TextInput
-              value={editDescription}
-              onChangeText={setEditDescription}
-              style={[styles.description, styles.editableInput]}
-              multiline
-            />
-          ) : group.description ? (
-            <Text style={styles.description}>{group.description}</Text>
+          {group.description ? (
+            <>
+              {/* Invisible, unclamped clone purely to measure how tall the
+                  description would really be — lets the toggle only appear
+                  when the collapsed cap is actually cutting something off,
+                  instead of guessing from character/newline count. */}
+              <Text
+                style={[styles.description, styles.descriptionMeasure, webWordBreakStyle]}
+                onLayout={(event) => setDescriptionNaturalHeight(event.nativeEvent.layout.height)}
+              >
+                {group.description}
+              </Text>
+              {/* Always renders the full text — animating the wrapper's
+                  height (rather than toggling numberOfLines) is what makes
+                  the grow/shrink smooth. DESCRIPTION_COLLAPSED_HEIGHT is an
+                  exact multiple of the line height, so the collapsed clip
+                  always lands on a line boundary rather than mid-line.
+                  width/minWidth:0 fix a web-only flexbox trap: this View is
+                  a flex child, and CSS `word-wrap/overflow-wrap: break-word`
+                  (RNW's Text default, and webWordBreakStyle below) only
+                  affects painting, not a flex item's automatic min-content
+                  width — so without an explicit width, the browser still
+                  sized this box to fit a long unbreakable word instead of
+                  wrapping it, which is what actually clipped the word. */}
+              <Animated.View
+                style={{
+                  height: descriptionHeightAnim,
+                  overflow: "hidden",
+                  width: "100%",
+                  minWidth: 0,
+                }}
+              >
+                <Text style={[styles.description, webWordBreakStyle]}>{group.description}</Text>
+              </Animated.View>
+              {descriptionNaturalHeight !== null &&
+              descriptionNaturalHeight > DESCRIPTION_COLLAPSED_HEIGHT + 1 ? (
+                <Pressable onPress={toggleDescription} hitSlop={8}>
+                  <Text style={styles.showMoreText}>
+                    {isDescriptionExpanded ? "Show less" : "Show more"}
+                  </Text>
+                </Pressable>
+              ) : null}
+            </>
           ) : null}
 
-          {isEditing ? (
-            <Pressable
-              style={[styles.editableInput, styles.currencyRow]}
-              onPress={() => setIsCurrencyPickerVisible(true)}
-            >
-              {editCurrency ? (
-                <>
-                  <FlagIcon countryCode={currencyCountryCode(editCurrency)} width={20} height={14} />
-                  <Text style={styles.currencyCode}>{editCurrency}</Text>
-                </>
-              ) : (
-                <Text style={styles.currency}>Select a currency</Text>
-              )}
-            </Pressable>
-          ) : (
-            <View style={styles.currencyRow}>
-              <FlagIcon countryCode={currencyCountryCode(group.currency)} width={20} height={14} />
-              <Text style={styles.currencyCode}>{group.currency || "Not set"}</Text>
-            </View>
-          )}
+          <View style={styles.currencyRow}>
+            <FlagIcon countryCode={currencyCountryCode(group.currency)} width={20} height={14} />
+            <Text style={styles.currencyCode}>{group.currency || "Not set"}</Text>
+          </View>
         </View>
 
         <View style={styles.tabViewWrapper} onLayout={handleTabViewLayout}>
@@ -1531,16 +1627,6 @@ export default function GroupDetailScreen() {
           />
         </View>
       </Animated.View>
-
-      <CurrencyPickerModal
-        visible={isCurrencyPickerVisible}
-        selectedCode={editCurrency}
-        onSelect={(code) => {
-          setEditCurrency(code);
-          setIsCurrencyPickerVisible(false);
-        }}
-        onClose={() => setIsCurrencyPickerVisible(false)}
-      />
 
       {/* Moved down here from the tab bar so it reads as a totals footer for
           the whole screen rather than being tied to just one tab. */}
@@ -1568,7 +1654,7 @@ export default function GroupDetailScreen() {
       <GroupActionsMenu
         anchor={menuAnchor}
         onClose={() => setMenuAnchor(null)}
-        onEdit={handleEditToggle}
+        onEdit={handleEditGroup}
         onInvite={handleInvite}
         onLeave={handleLeave}
         canEdit={viewerIsAdmin}
@@ -1618,11 +1704,6 @@ const styles = StyleSheet.create({
   heroContent: {
     flex: 1,
   },
-  heroPhotoArea: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-  },
   heroBackButton: {
     position: "absolute",
     left: 16,
@@ -1670,6 +1751,9 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     paddingBottom: 20,
     gap: 8,
+    // Scopes descriptionMeasure's absolute positioning to this container
+    // rather than the nearest positioned ancestor further up the tree.
+    position: "relative",
   },
   groupName: {
     fontSize: 26,
@@ -1681,13 +1765,27 @@ const styles = StyleSheet.create({
     lineHeight: 21,
     color: Colors.text,
   },
+  descriptionMeasure: {
+    // left/right match detailBody's paddingHorizontal (20) — an absolutely
+    // positioned child is sized against the parent's padding box, not its
+    // content box, so 0/0 here would measure against a wider line than the
+    // real (inset) description actually wraps at.
+    position: "absolute",
+    top: 0,
+    left: 20,
+    right: 20,
+    opacity: 0,
+    zIndex: -1,
+    pointerEvents: "none",
+  },
+  showMoreText: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: Colors.accent,
+  },
   originalCurrencyNote: {
     fontSize: 13,
     fontStyle: "italic",
-    color: Colors.muted,
-  },
-  currency: {
-    fontSize: 14,
     color: Colors.muted,
   },
   currencyRow: {
@@ -1700,13 +1798,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
     color: Colors.text,
-  },
-  editableInput: {
-    borderWidth: 1,
-    borderColor: Colors.border,
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
   },
   segmentRow: {
     flexDirection: "row",
