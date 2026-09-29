@@ -3,6 +3,10 @@ import type { ComponentProps } from "react";
 
 type IoniconName = ComponentProps<typeof Ionicons>["name"];
 
+// The one-shot motion an icon plays when its tab becomes active (see
+// `TabIcon` in tab-bar.tsx).
+export type TabIconAnimation = "hop" | "wiggle" | "spin";
+
 export type TabConfig = {
   name: string;
   href: "/" | "/scan" | "/account";
@@ -10,6 +14,7 @@ export type TabConfig = {
   label: string;
   icon: IoniconName;
   iconActive: IoniconName;
+  animation: TabIconAnimation;
 };
 
 export const TABS: TabConfig[] = [
@@ -20,14 +25,16 @@ export const TABS: TabConfig[] = [
     label: "Group",
     icon: "people-outline",
     iconActive: "people",
+    animation: "hop",
   },
   {
     name: "scan",
     href: "/scan",
     title: "Scan",
     label: "Scan",
-    icon: "camera-outline",
-    iconActive: "camera",
+    icon: "receipt-outline",
+    iconActive: "receipt",
+    animation: "wiggle",
   },
   {
     name: "account",
@@ -36,5 +43,6 @@ export const TABS: TabConfig[] = [
     label: "Account",
     icon: "settings-outline",
     iconActive: "settings",
+    animation: "spin",
   },
 ];

@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { useAuth } from "@/hooks/use-auth";
+import { useProfile } from "@/hooks/use-profile";
 import { supabase } from "@/lib/supabase";
 import { DELETED_USER_ID } from "@/utils/balances";
+import { readUserData, writeUserData } from "@/utils/offline-storage";
 
 export type GroupMember = {
   id: string;
@@ -59,12 +62,15 @@ function mapMembers(rows: MemberRow[]): GroupMember[] {
 }
 
 export function useGroupMembers(groupId: string | undefined) {
-  const [members, setMembers] = useState<GroupMember[]>([]);
+  const { session } = useAuth();
+  const userId = session?.user.id ?? null;
+  const { profile, isLoaded: isProfileLoaded } = useProfile();
+  const [serverMembers, setServerMembers] = useState<GroupMember[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
 
   const refresh = useCallback(async () => {
-    if (!groupId) {
-      setMembers([]);
+    if (!groupId || !userId) {
+      setServerMembers([]);
       setIsLoaded(true);
       return;
     }
@@ -77,15 +83,28 @@ export function useGroupMembers(groupId: string | undefined) {
     if (error) {
       console.warn("Failed to load group members", error);
     } else {
-      setMembers(mapMembers(data ?? []));
+      const next = mapMembers(data ?? []);
+      setServerMembers(next);
+      writeUserData(userId, `members:${groupId}`, next);
     }
     setIsLoaded(true);
-  }, [groupId]);
+  }, [groupId, userId]);
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
+      // The device's last known roster first (see use-groups.tsx's load for
+      // why) — without it, the add-entry form would have nobody to split
+      // an expense with while offline.
+      if (groupId && userId) {
+        const stored = await readUserData<GroupMember[]>(userId, `members:${groupId}`);
+        if (cancelled) return;
+        if (stored) {
+          setServerMembers(stored);
+          setIsLoaded(true);
+        }
+      }
       if (cancelled) return;
       await refresh();
     }
@@ -95,7 +114,20 @@ export function useGroupMembers(groupId: string | undefined) {
     return () => {
       cancelled = true;
     };
-  }, [refresh]);
+  }, [groupId, userId, refresh]);
+
+  // Your own row reflects your profile as this device knows it, including a
+  // name/picture change still waiting to sync (see use-profile.tsx), rather
+  // than lagging behind until it reaches the server.
+  const members = useMemo(
+    () =>
+      serverMembers.map((member) =>
+        isProfileLoaded && member.id === userId
+          ? { ...member, name: profile.name, avatarUrl: profile.avatarUrl }
+          : member
+      ),
+    [serverMembers, userId, isProfileLoaded, profile.name, profile.avatarUrl]
+  );
 
   return { members, isLoaded, refresh };
 }

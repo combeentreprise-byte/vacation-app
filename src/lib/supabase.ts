@@ -18,9 +18,15 @@ if (!supabaseUrl || !supabaseAnonKey) {
 // sense in an actual client runtime anyway, so it's disabled on the server.
 const isServer = typeof window === "undefined";
 
+// Where the client persists its session — supabase-js's own default key,
+// spelled out only so use-auth.tsx can read the stored session directly
+// when the client itself won't hand it back (see restoreOfflineSession).
+export const SUPABASE_AUTH_STORAGE_KEY = `sb-${new URL(supabaseUrl).hostname.split(".")[0]}-auth-token`;
+
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: {
     storage: isServer ? undefined : AsyncStorage,
+    storageKey: SUPABASE_AUTH_STORAGE_KEY,
     autoRefreshToken: !isServer,
     persistSession: !isServer,
     detectSessionInUrl: false,

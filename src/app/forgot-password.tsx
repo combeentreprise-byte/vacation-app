@@ -15,6 +15,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Colors } from "@/constants/colors";
+import { EMAIL_MAX_LENGTH } from "@/constants/limits";
 import { useAuth } from "@/hooks/use-auth";
 
 export default function ForgotPasswordScreen() {
@@ -82,6 +83,7 @@ export default function ForgotPasswordScreen() {
                   autoCorrect={false}
                   keyboardType="email-address"
                   style={styles.input}
+                  maxLength={EMAIL_MAX_LENGTH}
                 />
               </View>
 

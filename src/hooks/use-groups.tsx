@@ -9,7 +9,8 @@ import {
 
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/lib/supabase";
-import { ensureRatesCached } from "@/utils/exchange-rates";
+import { ensureRatesCached, prefetchRatesForOffline } from "@/utils/exchange-rates";
+import { readUserData, writeUserData } from "@/utils/offline-storage";
 
 export type Group = {
   id: string;
@@ -20,6 +21,8 @@ export type Group = {
   heroHue: number;
   photoUrl: string | null;
   createdAt: number;
+  // The viewer's own pin (group_members.pinned_at), not a group-wide one.
+  pinnedAt: number | null;
 };
 
 type GroupRow = {
@@ -33,7 +36,25 @@ type GroupRow = {
   created_at: string;
 };
 
-function mapGroup(row: GroupRow): Group {
+// The groups query embeds the viewer's own group_members row (filtered to
+// their user_id, so exactly one) to pick up their pin.
+type GroupWithPinRow = GroupRow & {
+  me: { pinned_at: string | null }[];
+};
+
+// Pinned groups first (most recently pinned on top), then everything else
+// newest-created first.
+function sortGroups(groups: Group[]): Group[] {
+  return [...groups].sort((a, b) => {
+    if (a.pinnedAt !== null || b.pinnedAt !== null) {
+      return (b.pinnedAt ?? -Infinity) - (a.pinnedAt ?? -Infinity);
+    }
+    return b.createdAt - a.createdAt;
+  });
+}
+
+function mapGroup(row: GroupWithPinRow): Group {
+  const pinnedAt = row.me[0]?.pinned_at ?? null;
   return {
     id: row.id,
     name: row.name,
@@ -43,6 +64,7 @@ function mapGroup(row: GroupRow): Group {
     heroHue: row.hue,
     photoUrl: row.photo_url,
     createdAt: new Date(row.created_at).getTime(),
+    pinnedAt: pinnedAt === null ? null : new Date(pinnedAt).getTime(),
   };
 }
 
@@ -62,10 +84,11 @@ type GroupsContextValue = {
     motive: string,
     hue: number,
     photoUrl: string | null
-  ) => Promise<void>;
+  ) => Promise<{ id?: string; error?: string }>;
   updateGroup: (id: string, updates: GroupUpdates) => Promise<void>;
   changeGroupCurrency: (id: string, currentCurrency: string, newCurrency: string) => Promise<{ error?: string }>;
   removeGroup: (id: string) => Promise<void>;
+  setGroupPinned: (id: string, pinned: boolean) => Promise<{ error?: string }>;
   joinGroup: (groupId: string) => Promise<{ error?: string }>;
   promoteToAdmin: (groupId: string, userId: string) => Promise<{ error?: string }>;
   kickMember: (groupId: string, userId: string) => Promise<{ error?: string }>;
@@ -88,13 +111,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
     const { data, error } = await supabase
       .from("groups")
-      .select("*")
-      .order("created_at", { ascending: false });
+      .select("*, me:group_members!inner(pinned_at)")
+      .eq("me.user_id", userId);
 
     if (error) {
+      // Offline (or otherwise failed): whatever's already showing — the
+      // device's stored copy, if nothing else — stays up rather than blanking.
       console.warn("Failed to load groups", error);
     } else {
-      setGroups((data ?? []).map(mapGroup));
+      const next = sortGroups((data ?? []).map(mapGroup));
+      setGroups(next);
+      writeUserData(userId, "groups", next);
+      prefetchRatesForOffline(next.map((group) => group.currency));
     }
     setIsLoaded(true);
   }, [userId]);
@@ -103,6 +131,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
 
     async function load() {
+      // Show the device's last known copy straight away, so the app is
+      // usable with no connection; the refresh below replaces it once (if)
+      // the server answers.
+      if (userId) {
+        const stored = await readUserData<Group[]>(userId, "groups");
+        if (cancelled) return;
+        if (stored) {
+          setGroups(stored);
+          setIsLoaded(true);
+        }
+      }
       if (cancelled) return;
       await refresh();
     }
@@ -112,7 +151,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [refresh]);
+  }, [userId, refresh]);
 
   const addGroup = useCallback(
     async (
@@ -123,13 +162,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       hue: number,
       photoUrl: string | null
     ) => {
-      if (!userId) return;
+      if (!userId) return { error: "Not signed in" };
 
       // Creating the group and joining it as its first member happen
       // atomically server-side (see create_group in schema.sql) rather than
       // as two separate client calls, so a dropped connection can't leave an
       // orphaned group that nobody, not even its creator, can ever see.
-      const { error } = await supabase.rpc("create_group", {
+      const { data, error } = await supabase.rpc("create_group", {
         group_name: name,
         group_description: description,
         group_currency: currency,
@@ -141,6 +180,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (error) console.warn("Failed to create group", error);
 
       await refresh();
+      return error ? { error: error.message } : { id: (data as GroupRow).id };
     },
     [userId, refresh]
   );
@@ -204,6 +244,35 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [userId, refresh]
   );
 
+  const setGroupPinned = useCallback(
+    async (id: string, pinned: boolean) => {
+      // Reorder immediately rather than waiting on the round-trip; the
+      // refresh below reconciles with the server either way (including
+      // rolling this back if set_group_pinned rejected it).
+      setGroups((prev) =>
+        sortGroups(
+          prev.map((group) =>
+            group.id === id ? { ...group, pinnedAt: pinned ? Date.now() : null } : group
+          )
+        )
+      );
+
+      const { error } = await supabase.rpc("set_group_pinned", {
+        p_group_id: id,
+        p_pinned: pinned,
+      });
+
+      await refresh();
+
+      if (error) {
+        console.warn("Failed to pin group", error);
+        return { error: error.message };
+      }
+      return {};
+    },
+    [refresh]
+  );
+
   const joinGroup = useCallback(
     async (groupId: string) => {
       if (!userId) return { error: "Not signed in" };
@@ -262,6 +331,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         updateGroup,
         changeGroupCurrency,
         removeGroup,
+        setGroupPinned,
         joinGroup,
         promoteToAdmin,
         kickMember,

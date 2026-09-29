@@ -44,6 +44,20 @@ alter table public.groups drop constraint if exists groups_description_length;
 alter table public.groups add constraint groups_description_length
   check (char_length(description) <= 300);
 
+-- Same pattern for the other free-text columns. Each limit mirrors a
+-- constant in src/constants/limits.ts.
+update public.groups set name = left(name, 50)
+  where char_length(name) > 50;
+alter table public.groups drop constraint if exists groups_name_length;
+alter table public.groups add constraint groups_name_length
+  check (char_length(name) <= 50);
+
+update public.profiles set name = rtrim(left(name, 25))
+  where char_length(name) > 25;
+alter table public.profiles drop constraint if exists profiles_name_length;
+alter table public.profiles add constraint profiles_name_length
+  check (char_length(name) <= 25);
+
 -- Which placeholder illustration + hue a group's hero shows (see HeroMotive
 -- in the client) — chosen once, randomly, at create_group time and never
 -- rerolled after, so it has to be stored rather than derived every render.
@@ -90,6 +104,10 @@ create table if not exists public.group_members (
 
 alter table public.group_members add column if not exists left_at timestamptz;
 alter table public.group_members add column if not exists is_admin boolean not null default false;
+-- Per-member (not per-group) so pinning a group only reorders your own group
+-- list. A timestamp rather than a flag so the most recently pinned group sorts
+-- first. Only ever written through set_group_pinned below.
+alter table public.group_members add column if not exists pinned_at timestamptz;
 
 -- Backfill for groups that already existed before is_admin was added: make
 -- each group's original creator an admin of their own group, so existing
@@ -129,6 +147,13 @@ alter table public.logs add column if not exists is_settlement boolean not null 
 alter table public.logs add column if not exists converted_amount numeric;
 update public.logs set converted_amount = amount where converted_amount is null;
 alter table public.logs alter column converted_amount set not null;
+
+-- Mirrors LOG_DETAILS_MAX_LENGTH in src/constants/limits.ts.
+update public.logs set details = left(details, 100)
+  where char_length(details) > 100;
+alter table public.logs drop constraint if exists logs_details_length;
+alter table public.logs add constraint logs_details_length
+  check (char_length(details) <= 100);
 
 create table if not exists public.log_members (
   -- Surrogate key (rather than primary key (log_id, user_id)) specifically
@@ -303,8 +328,11 @@ security definer
 set search_path = public
 as $$
 begin
+  -- Truncated to the profiles_name_length limit: the name can come from an
+  -- OAuth provider's metadata, which we don't control, and an overlong one
+  -- would otherwise violate the constraint and fail the whole sign-up.
   insert into public.profiles (id, name)
-  values (new.id, coalesce(new.raw_user_meta_data ->> 'name', 'Your Name'));
+  values (new.id, left(coalesce(new.raw_user_meta_data ->> 'name', 'Your Name'), 25));
   return new;
 end;
 $$;
@@ -361,10 +389,26 @@ grant execute on function public.create_group(text, text, text, text, integer, t
 -- explicitly since "create or replace" can't change a function's argument
 -- list in place and would otherwise leave this old overload lying around.
 drop function if exists public.create_log(uuid, numeric, text, text, boolean, uuid[]);
+-- Superseded by the 10-arg version below (adds the offline-sync params);
+-- same reason for the explicit drop.
+drop function if exists public.create_log(uuid, numeric, numeric, text, text, boolean, uuid[]);
 
 -- Same atomicity reasoning as create_group: a log and the list of who it was
 -- split with need to land together, not as two separate client calls that
 -- could be interrupted in between.
+--
+-- The last three params exist for offline entry (see use-logs.tsx's pending
+-- queue), where a log can be created on the device long before it reaches
+-- here:
+--   p_id — the client-generated id. Makes a retry idempotent: if a previous
+--     attempt landed but its response never made it back, the retry returns
+--     the existing row instead of inserting the expense twice.
+--   p_created_at — when the entry was actually made, not when it synced
+--     (clamped to now(), so a skewed device clock can't date it in the future).
+--   p_converted_currency — the currency p_converted_amount was computed in.
+--     If the group's currency changed while the entry sat in the queue,
+--     change_group_currency never saw it, so it's rescaled here instead,
+--     from the same shared exchange_rates cache.
 create or replace function public.create_log(
   p_group_id uuid,
   p_amount numeric,
@@ -372,7 +416,10 @@ create or replace function public.create_log(
   p_currency text,
   p_details text,
   p_payer_included boolean,
-  p_member_ids uuid[]
+  p_member_ids uuid[],
+  p_id uuid default null,
+  p_created_at timestamptz default null,
+  p_converted_currency text default null
 )
 returns public.logs
 language plpgsql
@@ -382,14 +429,58 @@ as $$
 declare
   new_log public.logs;
   member_id uuid;
+  group_currency text;
+  converted numeric := p_converted_amount;
+  rate numeric;
 begin
   if not public.is_group_member(p_group_id) then
     raise exception 'Not a member of this group';
   end if;
 
-  insert into public.logs (group_id, amount, converted_amount, currency, details, paid_by, payer_included)
-  values (p_group_id, p_amount, p_converted_amount, p_currency, p_details, auth.uid(), p_payer_included)
+  select currency into group_currency from public.groups where id = p_group_id;
+
+  if p_converted_currency is not null and p_converted_currency <> group_currency then
+    select (rates ->> group_currency)::numeric into rate
+    from public.exchange_rates
+    where base_currency = p_converted_currency;
+
+    if rate is null then
+      select 1 / nullif((rates ->> p_converted_currency)::numeric, 0) into rate
+      from public.exchange_rates
+      where base_currency = group_currency;
+    end if;
+
+    if rate is null then
+      raise exception 'No cached exchange rate from % to %', p_converted_currency, group_currency;
+    end if;
+
+    converted := p_converted_amount * rate;
+  end if;
+
+  insert into public.logs (id, group_id, amount, converted_amount, currency, details, paid_by, payer_included, created_at)
+  values (
+    coalesce(p_id, gen_random_uuid()),
+    p_group_id,
+    p_amount,
+    converted,
+    p_currency,
+    p_details,
+    auth.uid(),
+    p_payer_included,
+    least(p_created_at, now())
+  )
+  on conflict (id) do nothing
   returning * into new_log;
+
+  if new_log.id is null then
+    -- Already synced by an earlier attempt. Only hand it back if it's
+    -- genuinely the caller's own retry, not someone guessing another log's id.
+    select * into new_log from public.logs where id = p_id;
+    if new_log.paid_by is distinct from auth.uid() then
+      raise exception 'Log id already in use';
+    end if;
+    return new_log;
+  end if;
 
   foreach member_id in array p_member_ids loop
     insert into public.log_members (log_id, user_id) values (new_log.id, member_id);
@@ -399,7 +490,7 @@ begin
 end;
 $$;
 
-grant execute on function public.create_log(uuid, numeric, numeric, text, text, boolean, uuid[]) to authenticated;
+grant execute on function public.create_log(uuid, numeric, numeric, text, text, boolean, uuid[], uuid, timestamptz, text) to authenticated;
 
 -- Edits a log entry the caller themselves logged (paid_by = auth.uid(), same
 -- ownership scope as delete_log) — group_id and paid_by are deliberately not
@@ -646,7 +737,7 @@ declare
   next_admin_id uuid;
 begin
   update public.group_members
-  set left_at = now(), is_admin = false
+  set left_at = now(), is_admin = false, pinned_at = null
   where group_id = p_group_id
     and user_id = auth.uid();
 
@@ -709,7 +800,7 @@ $$;
 grant execute on function public.promote_to_admin(uuid, uuid) to authenticated;
 
 -- Removes another active member from the group, admin-only. This is just
--- leave_group's same soft-delete (left_at = now(), is_admin = false) applied
+-- leave_group's same soft-delete (left_at = now(), is_admin = false, pinned_at = null) applied
 -- to someone else's row instead of your own, so a kicked member's historical
 -- logs/balances stay intact and they can rejoin later via an invite link
 -- exactly like someone who left on their own — as a plain member, not
@@ -741,12 +832,49 @@ begin
   end if;
 
   update public.group_members
-  set left_at = now(), is_admin = false
+  set left_at = now(), is_admin = false, pinned_at = null
   where group_id = p_group_id and user_id = p_user_id;
 end;
 $$;
 
 grant execute on function public.kick_member(uuid, uuid) to authenticated;
+
+-- Pins/unpins a group on the caller's own group list, capped at 3 pinned
+-- groups (mirrors MAX_PINNED_GROUPS in src/constants/limits.ts). An RPC
+-- rather than a new self-update RLS policy on group_members, since that
+-- policy would also let a member flip their own is_admin.
+create or replace function public.set_group_pinned(p_group_id uuid, p_pinned boolean)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_group_member(p_group_id) then
+    raise exception 'You are not an active member of this group';
+  end if;
+
+  if p_pinned and (
+    select count(*) from public.group_members
+    where user_id = auth.uid()
+      and left_at is null
+      and pinned_at is not null
+      and group_id <> p_group_id
+  ) >= 3 then
+    raise exception 'You can pin at most 3 groups';
+  end if;
+
+  update public.group_members
+  set pinned_at = case
+    when not p_pinned then null
+    else coalesce(pinned_at, now())
+  end
+  where group_id = p_group_id
+    and user_id = auth.uid();
+end;
+$$;
+
+grant execute on function public.set_group_pinned(uuid, boolean) to authenticated;
 
 -- Joins a group, or reactivates a membership you'd previously left (same
 -- row, same history) instead of erroring on the primary-key conflict a plain

@@ -1,11 +1,11 @@
 import { Ionicons } from "@expo/vector-icons";
-import { decode as decodeBase64 } from "base64-arraybuffer";
-import { File } from "expo-file-system";
 import * as ImagePicker from "expo-image-picker";
+import { useFocusEffect } from "expo-router";
 import {
   type ComponentProps,
   type ComponentType,
   type ReactNode,
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -15,7 +15,6 @@ import {
   Alert,
   Animated,
   Image,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -26,10 +25,14 @@ import {
   View,
 } from "react-native";
 
+import { getInitials } from "@/components/avatar";
+import { CheckmarkIcon } from "@/components/checkmark-icon";
+import { EditIcon } from "@/components/edit-icon";
 import { Colors } from "@/constants/colors";
+import { PASSWORD_MAX_LENGTH, PROFILE_NAME_MAX_LENGTH } from "@/constants/limits";
 import { useAuth } from "@/hooks/use-auth";
+import { useLogs } from "@/hooks/use-logs";
 import { useProfile } from "@/hooks/use-profile";
-import { supabase } from "@/lib/supabase";
 
 type IoniconName = ComponentProps<typeof Ionicons>["name"];
 
@@ -43,13 +46,6 @@ const WebSwitch = Switch as unknown as ComponentType<
 
 const AnimatedTextInput = Animated.createAnimatedComponent(TextInput);
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
-
-function getInitials(name: string) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return "?";
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
-}
 
 // Where down the screen the identity block's center lands once slid into
 // edit position, as a fraction of the visible container's height (0.5 would
@@ -70,7 +66,7 @@ const EDIT_BUTTON_HEIGHT = 36;
 // Fallbacks for the button's two natural widths, used for exactly one frame
 // before the invisible measuring probes (see the JSX) report the real
 // values via onLayout.
-const EDIT_LABEL_WIDTH_FALLBACK = 58;
+const EDIT_LABEL_WIDTH_FALLBACK = 80;
 const EDIT_CHECK_WIDTH_FALLBACK = 46;
 // Shared by the avatar/username slide+grow AND the edit button's morph, so
 // the button always finishes its flip at exactly the moment the profile
@@ -158,30 +154,6 @@ function SettingsAccordionRow({
         </View>
       </Animated.View>
     </View>
-  );
-}
-
-// A row that reads like SettingsAccordionRow (same icon/label styling) but
-// fires immediately on tap instead of expanding a dropdown — no chevron,
-// since there's nothing to reveal.
-function SettingsActionRow({
-  icon,
-  label,
-  onPress,
-}: {
-  icon: IoniconName;
-  label: string;
-  onPress: () => void;
-}) {
-  return (
-    <Pressable style={styles.row} onPress={onPress}>
-      <View style={styles.rowIcon}>
-        <Ionicons name={icon} size={20} color={Colors.accent} />
-      </View>
-      <View style={styles.rowTextWrap}>
-        <Text style={styles.rowLabel}>{label}</Text>
-      </View>
-    </Pressable>
   );
 }
 
@@ -281,6 +253,7 @@ function PasswordDropdown({ onDone }: { onDone: () => void }) {
           placeholderTextColor={Colors.muted}
           secureTextEntry
           style={styles.fieldInput}
+          maxLength={PASSWORD_MAX_LENGTH}
         />
       </View>
 
@@ -293,6 +266,7 @@ function PasswordDropdown({ onDone }: { onDone: () => void }) {
           placeholderTextColor={Colors.muted}
           secureTextEntry
           style={styles.fieldInput}
+          maxLength={PASSWORD_MAX_LENGTH}
         />
       </View>
 
@@ -311,6 +285,60 @@ function PasswordDropdown({ onDone }: { onDone: () => void }) {
           {isSubmitting ? "Updating..." : "Update password"}
         </Text>
       </Pressable>
+    </View>
+  );
+}
+
+function SignOutDropdown({ onCancel }: { onCancel: () => void }) {
+  const { signOut } = useAuth();
+  const { pendingCount } = useLogs();
+  const { hasPendingChanges: hasPendingProfileChanges } = useProfile();
+  const [isSigningOut, setIsSigningOut] = useState(false);
+  // Signing out wipes this account's data from the device (see signOut in
+  // use-auth.tsx), including whatever was entered offline and hasn't synced.
+  const unsyncedParts = [
+    pendingCount === 1 ? "1 entry" : pendingCount > 1 ? `${pendingCount} entries` : null,
+    hasPendingProfileChanges ? "your profile changes" : null,
+  ].filter(Boolean);
+
+  const handleSignOut = async () => {
+    setIsSigningOut(true);
+    await signOut();
+    // No reset needed on success — Stack.Protected unmounts this screen
+    // once the auth listener sees the signed-out session.
+    setIsSigningOut(false);
+  };
+
+  return (
+    <View style={styles.dropdownContent}>
+      <Text style={styles.dangerExplainer}>
+        You&apos;ll need to sign in again to see your groups.
+      </Text>
+      {unsyncedParts.length > 0 ? (
+        <Text style={styles.dangerExplainer}>
+          Not synced yet: {unsyncedParts.join(" and ")}. Signing out now will lose them, so
+          connect to the internet first to keep them.
+        </Text>
+      ) : null}
+
+      <View style={styles.buttonPair}>
+        <Pressable style={[styles.cancelButton, styles.buttonPairItem]} onPress={onCancel}>
+          <Text style={styles.cancelButtonText}>Cancel</Text>
+        </Pressable>
+        <Pressable
+          style={[
+            styles.submitButton,
+            styles.buttonPairItem,
+            isSigningOut && styles.submitButtonDisabled,
+          ]}
+          onPress={handleSignOut}
+          disabled={isSigningOut}
+        >
+          <Text style={styles.submitButtonText}>
+            {isSigningOut ? "Signing out..." : "Sign out"}
+          </Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
@@ -367,13 +395,27 @@ function DangerZoneDropdown() {
   );
 }
 
+// Shared by the real button and its invisible width probe so the measured
+// width always matches what's actually rendered.
+function EditButtonLabel() {
+  return (
+    <View style={styles.editButtonLabel}>
+      <EditIcon size={18} color={Colors.accent} strokeWidth={44} />
+      <Text style={styles.editButtonText} numberOfLines={1}>
+        Edit
+      </Text>
+    </View>
+  );
+}
+
 export default function AccountSettingsScreen() {
-  const { profile, updateProfile } = useProfile();
-  const { session, signOut } = useAuth();
+  const { profile, updateName, updateAvatar } = useProfile();
+  const { session } = useAuth();
   const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState("");
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
+  const [signOutOpen, setSignOutOpen] = useState(false);
   const [dangerZoneOpen, setDangerZoneOpen] = useState(false);
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
   const scrollViewRef = useRef<ScrollView>(null);
@@ -420,6 +462,10 @@ export default function AccountSettingsScreen() {
   // Which glyph the (now separately-timed) button shows — flips at the
   // moment the button is fully closed, not when isEditing itself flips.
   const [buttonShowsCheck, setButtonShowsCheck] = useState(false);
+  // Bumped whenever edit mode is force-discarded (see the useFocusEffect
+  // below), so a still-pending enter-edit measurement callback can tell it's
+  // stale and bail instead of re-growing the profile after the reset.
+  const editSessionRef = useRef(0);
   const editButtonWidth = editButtonAnim.interpolate({
     inputRange: [0, 0.5, 1],
     outputRange: [editLabelWidth, 0, editCheckWidth],
@@ -512,40 +558,13 @@ export default function AccountSettingsScreen() {
     const asset = result.assets?.[0];
     if (result.canceled || !asset) return;
 
+    // Only covers stashing the picked file on the device — the upload itself
+    // happens in the background whenever there's a connection (see
+    // updateAvatar in use-profile.tsx), and the new picture shows right away.
     setIsUploadingAvatar(true);
     try {
-      // Always the same path per user (upsert: true) so re-uploading
-      // replaces the old picture instead of accumulating orphaned files —
-      // the "?v=" below is what defeats the browser/CDN cache for the
-      // now-stale response at that same URL. No extension on the path
-      // itself since the actual format varies (native's editor re-encodes
-      // to JPEG, but web's picker passes the original file through
-      // unchanged) — contentType below is what the served file is really
-      // labeled as, so it doesn't need to match a filename claim.
-      const path = `${userId}/avatar`;
-      let contentType = "image/jpeg";
-      let fileData: Blob | ArrayBuffer;
-      if (Platform.OS === "web") {
-        const blob = await (await fetch(asset.uri)).blob();
-        contentType = blob.type || contentType;
-        fileData = blob;
-      } else {
-        fileData = decodeBase64(await new File(asset.uri).base64());
-      }
-
-      const { error: uploadError } = await supabase.storage
-        .from("avatars")
-        .upload(path, fileData, { contentType, upsert: true });
-      if (uploadError) throw uploadError;
-
-      const { data } = supabase.storage.from("avatars").getPublicUrl(path);
-      updateProfile({ avatarUrl: `${data.publicUrl}?v=${Date.now()}` });
-    } catch (error) {
-      console.warn("Failed to upload avatar", error);
-      Alert.alert(
-        "Couldn't update photo",
-        error instanceof Error ? error.message : "Please try again."
-      );
+      const { error } = await updateAvatar(asset.uri);
+      if (error) Alert.alert("Couldn't update photo", error);
     } finally {
       setIsUploadingAvatar(false);
     }
@@ -575,7 +594,7 @@ export default function AccountSettingsScreen() {
     if (isEditing) {
       // Fade the editing affordances out first, then hide them and push
       // back up / shrink back down to rest, together.
-      updateProfile({ name: editName.trim() || profile.name });
+      updateName(editName.trim() || profile.name);
       Animated.timing(editEffectsOpacity, {
         toValue: 0,
         duration: 160,
@@ -605,6 +624,7 @@ export default function AccountSettingsScreen() {
     }
 
     setEditName(profile.name);
+    const editSession = editSessionRef.current;
     scrollViewRef.current?.scrollTo({ y: 0, animated: false });
     // Fires in parallel with the push+grow below (started separately since
     // it doesn't need the measured target) so the button finishes its flip
@@ -614,6 +634,7 @@ export default function AccountSettingsScreen() {
     requestAnimationFrame(() => {
       containerRef.current?.measureInWindow((_x, containerY, _w, containerHeight) => {
         topSectionRef.current?.measureInWindow((_bx, blockY, _bw, blockHeight) => {
+          if (editSession !== editSessionRef.current) return;
           const targetPush =
             containerY + containerHeight * EDIT_SLIDE_TARGET_FRACTION - (blockY + blockHeight / 2);
           Animated.parallel([
@@ -641,12 +662,26 @@ export default function AccountSettingsScreen() {
     });
   };
 
-  const handleLogOut = () => {
-    Alert.alert("Log out", "Are you sure you want to log out?", [
-      { text: "Cancel", style: "cancel" },
-      { text: "Log out", style: "destructive", onPress: () => signOut() },
-    ]);
-  };
+  // Leaving the tab without pressing the checkmark discards the unsaved
+  // name edit and snaps everything straight back to rest — no animation,
+  // since the screen is already out of view. setValue also stops any
+  // in-flight timing, whose start() callbacks then see finished: false and
+  // don't chain on to their next step.
+  useFocusEffect(
+    useCallback(
+      () => () => {
+        editSessionRef.current += 1;
+        identityPush.setValue(0);
+        identityGrow.setValue(0);
+        editEffectsOpacity.setValue(0);
+        editButtonAnim.setValue(0);
+        setButtonShowsCheck(false);
+        setIsEditing(false);
+        setEditName("");
+      },
+      [identityPush, identityGrow, editEffectsOpacity, editButtonAnim]
+    )
+  );
 
   return (
     <View ref={containerRef} style={styles.container}>
@@ -682,6 +717,7 @@ export default function AccountSettingsScreen() {
             <AnimatedTextInput
               value={editName}
               onChangeText={setEditName}
+              maxLength={PROFILE_NAME_MAX_LENGTH}
               style={[styles.nameText, styles.nameInput, nameGrowStyle, nameBorderStyle]}
             />
           ) : (
@@ -715,7 +751,15 @@ export default function AccountSettingsScreen() {
           >
             <PasswordDropdown onDone={() => setPasswordOpen(false)} />
           </SettingsAccordionRow>
-          <SettingsActionRow icon="log-out-outline" label="Sign out" onPress={handleLogOut} />
+          <SettingsAccordionRow
+            icon="log-out-outline"
+            label="Sign out"
+            subtitle="Sign out of your account on this device"
+            expanded={signOutOpen}
+            onToggle={() => setSignOutOpen((current) => !current)}
+          >
+            <SignOutDropdown onCancel={() => setSignOutOpen(false)} />
+          </SettingsAccordionRow>
           <SettingsAccordionRow
             icon="warning-outline"
             label="Danger Zone"
@@ -743,11 +787,9 @@ export default function AccountSettingsScreen() {
         hitSlop={8}
       >
         {buttonShowsCheck ? (
-          <Ionicons name="checkmark" size={18} color={Colors.accent} />
+          <CheckmarkIcon size={18} color={Colors.accent} strokeWidth={48} />
         ) : (
-          <Text style={styles.editButtonText} numberOfLines={1}>
-            Edit
-          </Text>
+          <EditButtonLabel />
         )}
       </AnimatedPressable>
 
@@ -760,14 +802,14 @@ export default function AccountSettingsScreen() {
         onLayout={(e) => setEditLabelWidth(e.nativeEvent.layout.width)}
         pointerEvents="none"
       >
-        <Text style={styles.editButtonText}>Edit</Text>
+        <EditButtonLabel />
       </View>
       <View
         style={[styles.editButton, styles.editButtonProbe]}
         onLayout={(e) => setEditCheckWidth(e.nativeEvent.layout.width)}
         pointerEvents="none"
       >
-        <Ionicons name="checkmark" size={18} color={Colors.accent} />
+        <CheckmarkIcon size={18} color={Colors.accent} strokeWidth={48} />
       </View>
     </View>
   );
@@ -805,6 +847,11 @@ const styles = StyleSheet.create({
   // where they're rendered.
   editButtonProbe: {
     opacity: 0,
+  },
+  editButtonLabel: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
   },
   editButtonText: {
     color: Colors.accent,
@@ -1009,6 +1056,26 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     color: Colors.muted,
     marginBottom: 4,
+  },
+  buttonPair: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  buttonPairItem: {
+    flex: 1,
+  },
+  cancelButton: {
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderRadius: 10,
+    paddingVertical: 11,
+    alignItems: "center",
+    marginTop: 4,
+  },
+  cancelButtonText: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: "600",
   },
   dangerButton: {
     backgroundColor: Colors.danger,

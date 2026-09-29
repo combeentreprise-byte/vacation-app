@@ -33,18 +33,36 @@ const VIEWPORT_MAX_HEIGHT_RATIO = 0.6;
 
 type PhotoCropModalProps = {
   imageUri: string;
+  // The picker's own reported dimensions — see the comment on rawCropAsset
+  // in new-group.tsx for why these are trusted over re-decoding the uri.
+  naturalWidth: number;
+  naturalHeight: number;
   aspectRatio: number; // width / height
   onCancel: () => void;
   onCropped: (uri: string) => void;
 };
 
-export function PhotoCropModal({ imageUri, aspectRatio, onCancel, onCropped }: PhotoCropModalProps) {
+export function PhotoCropModal({
+  imageUri,
+  naturalWidth: pickerWidth,
+  naturalHeight: pickerHeight,
+  aspectRatio,
+  onCancel,
+  onCropped,
+}: PhotoCropModalProps) {
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
-  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(null);
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(
+    pickerWidth > 0 && pickerHeight > 0 ? { width: pickerWidth, height: pickerHeight } : null
+  );
   const [isProcessing, setIsProcessing] = useState(false);
   const manipulatorContext = useImageManipulator(imageUri);
 
+  // expo-image-picker's own width/height are 0 only when the OS didn't
+  // report them (documented edge case) — Image.getSize is the fallback for
+  // that case only, not the primary source (see rawCropAsset in
+  // new-group.tsx for why: it was found to be unreliable on-device).
   useEffect(() => {
+    if (naturalSize) return;
     let cancelled = false;
     Image.getSize(
       imageUri,
@@ -59,7 +77,7 @@ export function PhotoCropModal({ imageUri, aspectRatio, onCancel, onCropped }: P
     return () => {
       cancelled = true;
     };
-  }, [imageUri, onCancel]);
+  }, [imageUri, naturalSize, onCancel]);
 
   let viewportWidth = windowWidth * VIEWPORT_WIDTH_RATIO;
   let viewportHeight = viewportWidth / aspectRatio;

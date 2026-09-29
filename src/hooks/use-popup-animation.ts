@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Animated } from "react-native";
 
 // Shared entrance/exit animation for every popup in the app (member/log
@@ -7,12 +7,21 @@ import { Animated } from "react-native";
 // RN's Modal has no exit-animation hook of its own (setting visible={false}
 // unmounts immediately), so this keeps the Modal mounted through the closing
 // animation via its own `isMounted` state and only lets the caller's `isOpen`
-// go false once that animation finishes.
+// go false once that animation finishes. The optional `onClosed` fires at
+// that same moment, so a caller that needs to present something native right
+// after (e.g. the share sheet) can wait for this Modal to be truly gone first.
 export const POPUP_CLOSE_DURATION_MS = 160;
 
-export function usePopupAnimation(isOpen: boolean) {
+export function usePopupAnimation(isOpen: boolean, onClosed?: () => void) {
   const [isMounted, setIsMounted] = useState(isOpen);
   const [progress] = useState(() => new Animated.Value(isOpen ? 1 : 0));
+
+  // Latest onClosed, kept out of the animation effect's dependencies so a new
+  // function reference doesn't restart an in-flight animation.
+  const onClosedRef = useRef(onClosed);
+  useEffect(() => {
+    onClosedRef.current = onClosed;
+  }, [onClosed]);
 
   // Mounting has to happen in time for the entrance animation to have
   // something to animate, so it's applied directly during render (React's
@@ -40,6 +49,15 @@ export function usePopupAnimation(isOpen: boolean) {
       });
     }
   }, [isOpen, progress]);
+
+  // Fired from an effect on the mounted -> unmounted transition (rather than
+  // alongside setIsMounted above) so it runs only after the Modal's unmount
+  // has actually been committed, not while it's still on screen.
+  const wasMountedRef = useRef(isMounted);
+  useEffect(() => {
+    if (wasMountedRef.current && !isMounted) onClosedRef.current?.();
+    wasMountedRef.current = isMounted;
+  }, [isMounted]);
 
   return { isMounted, progress };
 }

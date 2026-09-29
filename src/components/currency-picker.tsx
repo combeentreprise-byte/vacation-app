@@ -1,6 +1,18 @@
 import { Ionicons } from "@expo/vector-icons";
-import { useMemo, useState } from "react";
-import { Image, Modal, Pressable, SectionList, StyleSheet, Text, TextInput, View } from "react-native";
+import { useEffect, useMemo, useState } from "react";
+import {
+  Animated,
+  Dimensions,
+  Easing,
+  Image,
+  Modal,
+  Pressable,
+  SectionList,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Colors } from "@/constants/colors";
@@ -12,6 +24,9 @@ type CurrencyPickerModalProps = {
   onSelect: (code: string) => void;
   onClose: () => void;
 };
+
+const OPEN_DURATION_MS = 450;
+const CLOSE_DURATION_MS = 250;
 
 type CurrencySection = {
   title: string;
@@ -80,6 +95,42 @@ export function CurrencyPickerModal({
   const insets = useSafeAreaInsets();
   const [query, setQuery] = useState("");
 
+  // The Modal itself doesn't animate (animationType="none"): its built-in
+  // "slide" moves the whole transparent layer, backdrop tint included, so the
+  // tint visibly slid up with the sheet. Instead the tint fades in place while
+  // only the sheet slides. Same keep-mounted-through-close approach as
+  // usePopupAnimation, since setting visible={false} unmounts immediately.
+  const [isMounted, setIsMounted] = useState(visible);
+  const [progress] = useState(() => new Animated.Value(visible ? 1 : 0));
+  if (visible && !isMounted) {
+    setIsMounted(true);
+  }
+
+  useEffect(() => {
+    if (visible) {
+      Animated.timing(progress, {
+        toValue: 1,
+        duration: OPEN_DURATION_MS,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    } else {
+      Animated.timing(progress, {
+        toValue: 0,
+        duration: CLOSE_DURATION_MS,
+        easing: Easing.in(Easing.cubic),
+        useNativeDriver: true,
+      }).start(({ finished }) => {
+        if (finished) setIsMounted(false);
+      });
+    }
+  }, [visible, progress]);
+
+  const sheetTranslateY = progress.interpolate({
+    inputRange: [0, 1],
+    outputRange: [Dimensions.get("window").height, 0],
+  });
+
   const sections = useMemo(
     () => groupByFirstLetter(CURRENCIES.filter((currency) => matchesQuery(currency, query))),
     [query]
@@ -96,10 +147,20 @@ export function CurrencyPickerModal({
   };
 
   return (
-    <Modal transparent visible={visible} animationType="slide" onRequestClose={handleClose}>
-      <View style={styles.backdrop}>
-        <View
-          style={[styles.sheet, { paddingTop: insets.top + 16, paddingBottom: insets.bottom + 12 }]}
+    <Modal transparent visible={isMounted} animationType="none" onRequestClose={handleClose}>
+      <Animated.View
+        pointerEvents="none"
+        style={[StyleSheet.absoluteFill, styles.backdrop, { opacity: progress }]}
+      />
+      <View style={styles.sheetContainer}>
+        <Animated.View
+          style={[
+            styles.sheet,
+            {
+              paddingBottom: insets.bottom + 12,
+              transform: [{ translateY: sheetTranslateY }],
+            },
+          ]}
         >
           <View style={styles.header}>
             <Text style={styles.title}>Select currency</Text>
@@ -155,7 +216,7 @@ export function CurrencyPickerModal({
               <Text style={styles.emptyText}>No currencies match &quot;{query}&quot;</Text>
             }
           />
-        </View>
+        </Animated.View>
       </View>
     </Modal>
   );
@@ -163,8 +224,10 @@ export function CurrencyPickerModal({
 
 const styles = StyleSheet.create({
   backdrop: {
-    flex: 1,
     backgroundColor: "rgba(17, 24, 28, 0.45)",
+  },
+  sheetContainer: {
+    flex: 1,
     justifyContent: "flex-end",
   },
   sheet: {
@@ -172,6 +235,7 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     height: "80%",
+    paddingTop: 20,
     paddingHorizontal: 20,
   },
   header: {

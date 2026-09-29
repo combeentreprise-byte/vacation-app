@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Image, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
 
 import { resolveHeroMotiveVariant } from "@/utils/hero-motive";
@@ -66,6 +67,7 @@ export function HeroMotive({
         width={fill}
         height={fill}
         color={line}
+        holeColor={background}
         preserveAspectRatio={PRESERVE_ASPECT_RATIO[verticalAlign]}
       />
     </View>
@@ -86,7 +88,17 @@ type GroupHeroProps = {
 // `verticalAlign` only mean something for the motive illustration's own
 // letterboxing — a photo always covers its container edge-to-edge — so
 // they're passed through to HeroMotive alone rather than used here too.
-export function GroupHero({ photoUrl, motive, hue, style, fill, verticalAlign }: GroupHeroProps) {
+// Memoized so a parent re-render that doesn't touch these props (e.g. the
+// group list toggling "Manage groups") skips re-rendering the SVG subtree —
+// the traced motives are heavy enough that re-rendering one per card shows.
+export const GroupHero = memo(function GroupHero({
+  photoUrl,
+  motive,
+  hue,
+  style,
+  fill,
+  verticalAlign,
+}: GroupHeroProps) {
   if (!photoUrl) {
     return (
       <HeroMotive motive={motive} hue={hue} style={style} fill={fill} verticalAlign={verticalAlign} />
@@ -97,7 +109,7 @@ export function GroupHero({ photoUrl, motive, hue, style, fill, verticalAlign }:
       <Image source={{ uri: photoUrl }} style={styles.photoFill} resizeMode="cover" />
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   container: {

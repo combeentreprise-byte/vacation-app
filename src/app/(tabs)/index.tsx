@@ -1,10 +1,11 @@
 import { Ionicons } from "@expo/vector-icons";
-import { router } from "expo-router";
-import { useState } from "react";
+import { router, useFocusEffect } from "expo-router";
+import { useCallback, useMemo, useState } from "react";
 import {
   Alert,
   Animated,
   FlatList,
+  type GestureResponderEvent,
   Pressable,
   StyleSheet,
   Text,
@@ -13,7 +14,10 @@ import {
 } from "react-native";
 
 import { GroupHero } from "@/components/hero-motive";
+import { type LeaveGroupRequest, LeaveGroupPopup } from "@/components/leave-group-popup";
+import { PinIcon } from "@/components/pin-icon";
 import { Colors } from "@/constants/colors";
+import { MAX_PINNED_GROUPS } from "@/constants/limits";
 import { type Group, useGroups } from "@/hooks/use-groups";
 import { supabase } from "@/lib/supabase";
 
@@ -23,21 +27,76 @@ const LEAVE_SLOT_WIDTH = 44;
 // long a name/description runs — useWindowDimensions (not Dimensions.get)
 // so it re-measures on rotation/resize instead of freezing at mount.
 const CARD_HEIGHT_RATIO = 0.2;
+const LIST_PADDING = 20;
 
 export default function GroupScreen() {
-  const { groups, isLoaded, removeGroup } = useGroups();
+  const { groups, isLoaded, removeGroup, setGroupPinned } = useGroups();
   const [isManaging, setIsManaging] = useState(false);
   const [slideAnim] = useState(() => new Animated.Value(0));
+  // The group whose leave icon was tapped, plus what LeaveGroupPopup needs
+  // to show its confirmation (it only reads `anchor` and `isLastMember`).
+  const [leaveTarget, setLeaveTarget] = useState<
+    (LeaveGroupRequest & { group: Group }) | null
+  >(null);
   const { height: windowHeight } = useWindowDimensions();
   const cardHeight = windowHeight * CARD_HEIGHT_RATIO;
+  // Manage mode shrinks each card's width (the pin/leave slot slides in on its
+  // left) — pinning the hero to the card's full, un-shrunk width and its right
+  // edge means that animation only changes the card's clipping frame, instead
+  // of re-laying-out and redrawing every motive SVG on every frame. Measured
+  // from the list itself (not the window) so it holds on wide web layouts too.
+  const [listWidth, setListWidth] = useState<number | null>(null);
+  const heroStyle = useMemo(
+    () =>
+      listWidth === null
+        ? styles.cardPhotoArea
+        : [styles.cardPhotoAreaPinned, { width: listWidth - LIST_PADDING * 2 }],
+    [listWidth]
+  );
+
+  // The tabs are a swipeable pager that keeps every tab mounted, so without
+  // this, Manage mode (and any open leave confirmation) would still be open
+  // when the user comes back from another tab.
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        setIsManaging(false);
+        setLeaveTarget(null);
+        slideAnim.stopAnimation();
+        slideAnim.setValue(0);
+      };
+    }, [slideAnim])
+  );
 
   const handleCreate = () => {
     router.push("/new-group");
   };
 
+  // Active member count per group, fetched in one query when Manage mode
+  // opens so tapping a leave icon can open its confirmation instantly instead
+  // of waiting on a per-group lookup (handleLeave falls back to one if this
+  // hasn't arrived yet).
+  const [activeMemberCounts, setActiveMemberCounts] = useState<Record<string, number> | null>(null);
+
+  const prefetchActiveMemberCounts = async () => {
+    setActiveMemberCounts(null);
+    const { data, error } = await supabase
+      .from("group_members")
+      .select("group_id")
+      .in("group_id", groups.map((group) => group.id))
+      .is("left_at", null);
+    if (error) return;
+    const counts: Record<string, number> = {};
+    for (const row of data ?? []) {
+      counts[row.group_id] = (counts[row.group_id] ?? 0) + 1;
+    }
+    setActiveMemberCounts(counts);
+  };
+
   const toggleManaging = () => {
     const next = !isManaging;
     setIsManaging(next);
+    if (next) prefetchActiveMemberCounts();
     Animated.timing(slideAnim, {
       toValue: next ? 1 : 0,
       duration: 200,
@@ -45,38 +104,46 @@ export default function GroupScreen() {
     }).start();
   };
 
-  const handleLeave = async (group: Group) => {
+  const handleTogglePin = async (group: Group) => {
+    const pinned = group.pinnedAt === null;
+    // Same cap set_group_pinned enforces server-side — checked here too just
+    // so the user gets an explanation instead of a silent snap-back.
+    if (pinned && groups.filter((g) => g.pinnedAt !== null).length >= MAX_PINNED_GROUPS) {
+      Alert.alert("Pin limit reached", `You can pin up to ${MAX_PINNED_GROUPS} groups. Unpin one first.`);
+      return;
+    }
+    const { error } = await setGroupPinned(group.id, pinned);
+    if (error) Alert.alert("Couldn't pin group", error);
+  };
+
+  const handleLeave = async (group: Group, event: GestureResponderEvent) => {
+    // Read before the await — the event isn't guaranteed to still hold its
+    // coordinates once the handler has yielded.
+    const anchor = { x: event.nativeEvent.pageX, y: event.nativeEvent.pageY };
     // Best-effort check for which confirmation copy to show; leave_group
     // itself (schema.sql) makes the actual delete-vs-leave call server-side,
     // so a stale count here can't cause the wrong thing to happen, only the
     // wrong warning to be shown for it.
-    const { count } = await supabase
-      .from("group_members")
-      .select("user_id", { count: "exact", head: true })
-      .eq("group_id", group.id)
-      .is("left_at", null);
-    const isLastMember = (count ?? 1) <= 1;
+    let count = activeMemberCounts?.[group.id];
+    if (count === undefined) {
+      const result = await supabase
+        .from("group_members")
+        .select("user_id", { count: "exact", head: true })
+        .eq("group_id", group.id)
+        .is("left_at", null);
+      count = result.count ?? 1;
+    }
+    setLeaveTarget({ group, anchor, isLastMember: count <= 1 });
+  };
 
-    Alert.alert(
-      isLastMember ? "Delete group" : "Leave group",
-      isLastMember
-        ? "You're the last member of this group. Leaving will permanently delete the group and all its logs and balances — this can't be undone."
-        : "Are you sure you want to leave this group?",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: isLastMember ? "Delete" : "Leave",
-          style: "destructive",
-          onPress: () => {
-            removeGroup(group.id);
-            if (groups.length === 1) {
-              setIsManaging(false);
-              slideAnim.setValue(0);
-            }
-          },
-        },
-      ]
-    );
+  const handleConfirmLeave = () => {
+    if (!leaveTarget) return;
+    setLeaveTarget(null);
+    removeGroup(leaveTarget.group.id);
+    if (groups.length === 1) {
+      setIsManaging(false);
+      slideAnim.setValue(0);
+    }
   };
 
   if (!isLoaded) {
@@ -97,62 +164,86 @@ export default function GroupScreen() {
   }
 
   return (
-    <FlatList<Group>
-      data={groups}
-      keyExtractor={(item) => item.id}
-      contentContainerStyle={styles.list}
-      extraData={isManaging}
-      ListHeaderComponent={
-        <View style={styles.listHeader}>
-          <Pressable onPress={toggleManaging} hitSlop={8}>
-            <Text style={styles.manageText}>{isManaging ? "Done" : "Manage groups"}</Text>
-          </Pressable>
-          <Pressable onPress={handleCreate} hitSlop={12}>
-            <Ionicons name="add" size={24} color={Colors.accent} />
-          </Pressable>
-        </View>
-      }
-      renderItem={({ item }) => (
-        <View style={styles.row}>
-          <Animated.View
-            style={[
-              styles.leaveSlot,
-              {
-                width: slideAnim.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [0, LEAVE_SLOT_WIDTH],
-                }),
-                opacity: slideAnim,
-              },
-            ]}
-            pointerEvents={isManaging ? "auto" : "none"}
-          >
-            <Pressable onPress={() => handleLeave(item)} hitSlop={8}>
-              <Ionicons name="log-out-outline" size={22} color={Colors.danger} />
+    <>
+      <FlatList<Group>
+        data={groups}
+        keyExtractor={(item) => item.id}
+        contentContainerStyle={styles.list}
+        onLayout={(event) => setListWidth(event.nativeEvent.layout.width)}
+        extraData={isManaging}
+        ListHeaderComponent={
+          <View style={styles.listHeader}>
+            <Pressable onPress={toggleManaging} hitSlop={8}>
+              <Text style={styles.manageText}>{isManaging ? "Done" : "Manage groups"}</Text>
             </Pressable>
-          </Animated.View>
-          <Pressable
-            style={[styles.card, { height: cardHeight }]}
-            onPress={() => router.push({ pathname: "/group/[id]", params: { id: item.id } })}
-          >
-            {/* The card body itself stands in for a future decorative photo
-                (see cardPhotoArea) — the ribbon just sits on top of it. */}
-            <GroupHero
-              photoUrl={item.photoUrl}
-              motive={item.heroMotive}
-              hue={item.heroHue}
-              verticalAlign="top"
-              style={styles.cardPhotoArea}
-            />
-            <View style={styles.cardRibbon}>
-              <Text style={styles.cardTitle} numberOfLines={1}>
-                {item.name}
-              </Text>
-            </View>
-          </Pressable>
-        </View>
-      )}
-    />
+            <Pressable onPress={handleCreate} hitSlop={12}>
+              <Ionicons name="add" size={24} color={Colors.accent} />
+            </Pressable>
+          </View>
+        }
+        renderItem={({ item }) => (
+          <View style={styles.row}>
+            <Animated.View
+              style={[
+                styles.leaveSlot,
+                {
+                  width: slideAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [0, LEAVE_SLOT_WIDTH],
+                  }),
+                  opacity: slideAnim,
+                },
+              ]}
+              pointerEvents={isManaging ? "auto" : "none"}
+            >
+              <Pressable
+                onPress={() => handleTogglePin(item)}
+                hitSlop={8}
+                accessibilityLabel={item.pinnedAt === null ? "Pin group" : "Unpin group"}
+              >
+                {/* Shows the action a tap performs: crossed out on a pinned
+                    group (unpin), plain on an unpinned one (pin). */}
+                <PinIcon size={22} color={Colors.text} crossed={item.pinnedAt !== null} />
+              </Pressable>
+              <Pressable
+                onPress={(event) => handleLeave(item, event)}
+                hitSlop={8}
+                accessibilityLabel="Leave group"
+              >
+                <Ionicons name="log-out-outline" size={22} color={Colors.danger} />
+              </Pressable>
+            </Animated.View>
+            <Pressable
+              style={[styles.card, { height: cardHeight }]}
+              onPress={() => router.push({ pathname: "/group/[id]", params: { id: item.id } })}
+            >
+              {/* The card body itself stands in for a future decorative photo
+                  (see cardPhotoArea) — the ribbon just sits on top of it. */}
+              <GroupHero
+                photoUrl={item.photoUrl}
+                motive={item.heroMotive}
+                hue={item.heroHue}
+                verticalAlign="top"
+                style={heroStyle}
+              />
+              <View style={styles.cardRibbon}>
+                <Text style={styles.cardTitle} numberOfLines={1}>
+                  {item.name}
+                </Text>
+                {item.pinnedAt !== null && (
+                  <PinIcon size={20} color={Colors.text} />
+                )}
+              </View>
+            </Pressable>
+          </View>
+        )}
+      />
+      <LeaveGroupPopup
+        request={leaveTarget}
+        onClose={() => setLeaveTarget(null)}
+        onConfirm={handleConfirmLeave}
+      />
+    </>
   );
 }
 
@@ -168,7 +259,7 @@ const styles = StyleSheet.create({
     fontSize: 15,
   },
   list: {
-    padding: 20,
+    padding: LIST_PADDING,
     gap: 12,
   },
   listHeader: {
@@ -189,6 +280,7 @@ const styles = StyleSheet.create({
   leaveSlot: {
     alignItems: "center",
     justifyContent: "center",
+    gap: 20,
     overflow: "hidden",
   },
   card: {
@@ -207,6 +299,12 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
   },
+  cardPhotoAreaPinned: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+  },
   cardRibbon: {
     position: "absolute",
     left: 0,
@@ -215,8 +313,12 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.background,
     paddingHorizontal: 16,
     paddingVertical: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   cardTitle: {
+    flex: 1,
     fontSize: 16,
     fontWeight: "600",
     color: Colors.text,

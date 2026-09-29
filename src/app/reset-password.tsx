@@ -15,6 +15,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Colors } from "@/constants/colors";
+import { PASSWORD_MAX_LENGTH } from "@/constants/limits";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/lib/supabase";
 import { extractSessionTokensFromUrl } from "@/utils/oauth";
@@ -108,6 +109,7 @@ export default function ResetPasswordScreen() {
                 placeholderTextColor={Colors.muted}
                 secureTextEntry
                 style={styles.input}
+                maxLength={PASSWORD_MAX_LENGTH}
               />
             </View>
 
@@ -120,6 +122,7 @@ export default function ResetPasswordScreen() {
                 placeholderTextColor={Colors.muted}
                 secureTextEntry
                 style={styles.input}
+                maxLength={PASSWORD_MAX_LENGTH}
               />
             </View>
 

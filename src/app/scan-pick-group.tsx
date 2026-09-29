@@ -1,8 +1,8 @@
 import { Ionicons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { ModalHeader } from "@/components/modal-header";
 import { Colors } from "@/constants/colors";
 import { type Group, useGroups } from "@/hooks/use-groups";
 
@@ -10,7 +10,6 @@ import { type Group, useGroups } from "@/hooks/use-groups";
 // amount but no group yet, and Add entry needs a groupId — this just lets
 // the user pick which group the scan belongs to before landing there.
 export default function ScanPickGroupScreen() {
-  const insets = useSafeAreaInsets();
   const { groups } = useGroups();
   const { prefillAmount, prefillCurrency } = useLocalSearchParams<{
     prefillAmount?: string;
@@ -32,12 +31,7 @@ export default function ScanPickGroupScreen() {
 
   return (
     <View style={styles.flex}>
-      <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
-        <Text style={styles.headerTitle}>Log it in which group?</Text>
-        <Pressable onPress={() => router.back()} hitSlop={12}>
-          <Ionicons name="close" size={24} color={Colors.text} />
-        </Pressable>
-      </View>
+      <ModalHeader title="Log it in which group?" onClose={() => router.back()} />
 
       {groups.length === 0 ? (
         <View style={styles.empty}>
@@ -65,19 +59,6 @@ export default function ScanPickGroupScreen() {
 const styles = StyleSheet.create({
   flex: {
     flex: 1,
-  },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 20,
-    paddingBottom: 16,
-    backgroundColor: Colors.background,
-  },
-  headerTitle: {
-    fontSize: 18,
-    fontWeight: "600",
-    color: Colors.text,
   },
   list: {
     padding: 20,
