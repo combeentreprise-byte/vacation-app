@@ -3,7 +3,6 @@ import { router, useFocusEffect } from "expo-router";
 import { useCallback, useMemo, useState } from "react";
 import {
   Alert,
-  Animated,
   FlatList,
   type GestureResponderEvent,
   Pressable,
@@ -12,7 +11,17 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
+import Animated, {
+  cancelAnimation,
+  Easing,
+  interpolate,
+  type SharedValue,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
 
+import { CrossfadeLabel } from "@/components/crossfade-label";
 import { GroupHero } from "@/components/hero-motive";
 import { type LeaveGroupRequest, LeaveGroupPopup } from "@/components/leave-group-popup";
 import { PinIcon } from "@/components/pin-icon";
@@ -28,11 +37,14 @@ const LEAVE_SLOT_WIDTH = 44;
 // so it re-measures on rotation/resize instead of freezing at mount.
 const CARD_HEIGHT_RATIO = 0.2;
 const LIST_PADDING = 20;
+const MANAGE_ANIMATION = { duration: 280, easing: Easing.out(Easing.cubic) };
 
 export default function GroupScreen() {
   const { groups, isLoaded, removeGroup, setGroupPinned } = useGroups();
   const [isManaging, setIsManaging] = useState(false);
-  const [slideAnim] = useState(() => new Animated.Value(0));
+  // Driven on the UI thread (Reanimated) so the slide stays smooth even while
+  // toggling Manage mode re-renders every row on the JS thread.
+  const manageProgress = useSharedValue(0);
   // The group whose leave icon was tapped, plus what LeaveGroupPopup needs
   // to show its confirmation (it only reads `anchor` and `isLastMember`).
   const [leaveTarget, setLeaveTarget] = useState<
@@ -62,10 +74,10 @@ export default function GroupScreen() {
       return () => {
         setIsManaging(false);
         setLeaveTarget(null);
-        slideAnim.stopAnimation();
-        slideAnim.setValue(0);
+        cancelAnimation(manageProgress);
+        manageProgress.set(0);
       };
-    }, [slideAnim])
+    }, [manageProgress])
   );
 
   const handleCreate = () => {
@@ -97,11 +109,7 @@ export default function GroupScreen() {
     const next = !isManaging;
     setIsManaging(next);
     if (next) prefetchActiveMemberCounts();
-    Animated.timing(slideAnim, {
-      toValue: next ? 1 : 0,
-      duration: 200,
-      useNativeDriver: false,
-    }).start();
+    manageProgress.set(withTiming(next ? 1 : 0, MANAGE_ANIMATION));
   };
 
   const handleTogglePin = async (group: Group) => {
@@ -142,7 +150,8 @@ export default function GroupScreen() {
     removeGroup(leaveTarget.group.id);
     if (groups.length === 1) {
       setIsManaging(false);
-      slideAnim.setValue(0);
+      cancelAnimation(manageProgress);
+      manageProgress.set(0);
     }
   };
 
@@ -174,7 +183,12 @@ export default function GroupScreen() {
         ListHeaderComponent={
           <View style={styles.listHeader}>
             <Pressable onPress={toggleManaging} hitSlop={8}>
-              <Text style={styles.manageText}>{isManaging ? "Done" : "Manage groups"}</Text>
+              <CrossfadeLabel
+                first="Manage groups"
+                second="Done"
+                showSecond={isManaging}
+                style={styles.manageText}
+              />
             </Pressable>
             <Pressable onPress={handleCreate} hitSlop={12}>
               <Ionicons name="add" size={24} color={Colors.accent} />
@@ -183,19 +197,7 @@ export default function GroupScreen() {
         }
         renderItem={({ item }) => (
           <View style={styles.row}>
-            <Animated.View
-              style={[
-                styles.leaveSlot,
-                {
-                  width: slideAnim.interpolate({
-                    inputRange: [0, 1],
-                    outputRange: [0, LEAVE_SLOT_WIDTH],
-                  }),
-                  opacity: slideAnim,
-                },
-              ]}
-              pointerEvents={isManaging ? "auto" : "none"}
-            >
+            <ManageSlot progress={manageProgress} isManaging={isManaging}>
               <Pressable
                 onPress={() => handleTogglePin(item)}
                 hitSlop={8}
@@ -212,7 +214,7 @@ export default function GroupScreen() {
               >
                 <Ionicons name="log-out-outline" size={22} color={Colors.danger} />
               </Pressable>
-            </Animated.View>
+            </ManageSlot>
             <Pressable
               style={[styles.card, { height: cardHeight }]}
               onPress={() => router.push({ pathname: "/group/[id]", params: { id: item.id } })}
@@ -247,6 +249,32 @@ export default function GroupScreen() {
   );
 }
 
+// The pin/leave column that slides in on each card's left in Manage mode. Its
+// icons sit in a fixed-width column pinned to the slot's right edge, so as the
+// slot widens they glide in alongside the card instead of being squeezed.
+function ManageSlot({
+  progress,
+  isManaging,
+  children,
+}: {
+  progress: SharedValue<number>;
+  isManaging: boolean;
+  children: React.ReactNode;
+}) {
+  const slotStyle = useAnimatedStyle(() => ({
+    width: progress.value * LEAVE_SLOT_WIDTH,
+  }));
+  const iconsStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(progress.value, [0.3, 1], [0, 1], "clamp"),
+    transform: [{ translateX: interpolate(progress.value, [0, 1], [-8, 0]) }],
+  }));
+  return (
+    <Animated.View style={[styles.leaveSlot, slotStyle]} pointerEvents={isManaging ? "auto" : "none"}>
+      <Animated.View style={[styles.leaveSlotIcons, iconsStyle]}>{children}</Animated.View>
+    </Animated.View>
+  );
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -278,10 +306,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   leaveSlot: {
+    alignSelf: "stretch",
+    alignItems: "flex-end",
+    justifyContent: "center",
+    overflow: "hidden",
+  },
+  leaveSlotIcons: {
+    width: LEAVE_SLOT_WIDTH,
     alignItems: "center",
     justifyContent: "center",
     gap: 20,
-    overflow: "hidden",
   },
   card: {
     flex: 1,

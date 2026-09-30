@@ -1,11 +1,12 @@
 import { Ionicons } from "@expo/vector-icons";
 import * as ImagePicker from "expo-image-picker";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import {
   Alert,
   Animated,
   Easing,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -13,15 +14,16 @@ import {
   type StyleProp,
   StyleSheet,
   Text,
-  TextInput,
   useWindowDimensions,
   View,
   type ViewStyle,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { CurrencyPickerModal } from "@/components/currency-picker";
-import { HeroMotive } from "@/components/hero-motive";
+import { PopHeroMotive } from "@/components/hero-motive";
 import { PhotoCropModal } from "@/components/photo-crop-modal";
+import { FocusTextInput, PressableScale } from "@/components/press-feedback";
 import { Colors } from "@/constants/colors";
 import {
   GROUP_DESCRIPTION_MAX_LENGTH,
@@ -175,8 +177,14 @@ export type GroupFormInitialValues = Omit<GroupFormValues, "photo"> & {
 };
 
 type GroupFormProps = {
-  // Rendered above the hero — the screen's own header.
+  // Rendered above the hero — the screen's own header. Never scrolls.
   header: ReactNode;
+  // Rendered at the top of the scrolling content, above the hero.
+  intro?: ReactNode;
+  // Keeps the submit button in a bar pinned to the bottom of the screen
+  // (riding up with the keyboard) instead of at the end of the fields, with
+  // the hero scrolling along with the fields to leave them room.
+  pinSubmitButton?: boolean;
   initialValues?: GroupFormInitialValues;
   submitLabel: string;
   submittingLabel: string;
@@ -193,6 +201,8 @@ type GroupFormProps = {
 // onSubmit, since the two callers save very differently.
 export function GroupForm({
   header,
+  intro,
+  pinSubmitButton = false,
   initialValues,
   submitLabel,
   submittingLabel,
@@ -200,6 +210,7 @@ export function GroupForm({
   onSubmit,
 }: GroupFormProps) {
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
   const [name, setName] = useState(() => initialValues?.name ?? "");
   const [description, setDescription] = useState(() => initialValues?.description ?? "");
   const descriptionLineLimit = useLineLimit(description, setDescription, GROUP_DESCRIPTION_MAX_LINES);
@@ -307,6 +318,22 @@ export function GroupForm({
   };
   const canSubmit = name.trim().length > 0 && !isSubmitting && !disabled;
 
+  // The pinned bar keeps clear of the home indicator, but not while the
+  // keyboard is up: the keyboard already covers that strip, and the inset on
+  // top of it would leave a gap between the button and the keyboard.
+  const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
+  useEffect(() => {
+    if (!pinSubmitButton) return;
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+    const showListener = Keyboard.addListener(showEvent, () => setIsKeyboardVisible(true));
+    const hideListener = Keyboard.addListener(hideEvent, () => setIsKeyboardVisible(false));
+    return () => {
+      showListener.remove();
+      hideListener.remove();
+    };
+  }, [pinSubmitButton]);
+
   // Shared by both the camera icon (no remembered photo to restore) and the
   // gallery icon (photo mode, to swap the current pick) — same permission +
   // picker call either way, only the resulting state transition differs at
@@ -398,6 +425,76 @@ export function GroupForm({
     }
   };
 
+  const hero = (
+    <View style={[styles.hero, { height: windowHeight * HERO_HEIGHT_RATIO }]}>
+      <PopHeroMotive
+        motive={heroPick.motive}
+        hue={heroPick.hue}
+        fill="92%"
+        verticalAlign="bottom"
+      />
+      {(pickedPhoto || currentPhotoUrl) && (
+        // Kept mounted (just hidden) rather than unmounted while in motive
+        // mode — a remote currentPhotoUrl is a real network image, and
+        // unmounting this <Image> discards its decoded bitmap, forcing a
+        // full re-fetch (a visible gray flash while it reloads) the moment
+        // isPhotoMode flips back to true. A freshly `pickedPhoto` local
+        // file uri doesn't have this problem (already decoded, on-disk),
+        // which is why this only ever showed up for a group's pre-existing
+        // photo, not a photo just picked in this same editing session.
+        <View
+          style={[StyleSheet.absoluteFill, !isPhotoMode && styles.heroPhotoLayerHidden]}
+          pointerEvents={isPhotoMode ? "auto" : "none"}
+        >
+          <Image
+            source={{ uri: pickedPhoto ? pickedPhoto.uri : currentPhotoUrl! }}
+            style={styles.heroPhoto}
+            resizeMode="cover"
+          />
+        </View>
+      )}
+      <HeroButton
+        style={[styles.heroButton, styles.heroButtonTop]}
+        onPress={
+          isPhotoMode
+            ? handleSwitchToMotive
+            : hasRememberedPhoto
+              ? handleRestorePhoto
+              : handlePickPhoto
+        }
+        frontIcon={iconPhotoMode ? "business-outline" : "camera"}
+        backIcon={flipTargetPhotoMode ? "business-outline" : "camera"}
+        flipProgress={heroButtonFlipAnim}
+      />
+      <HeroButton
+        style={[styles.heroButton, styles.heroButtonBottom]}
+        onPress={isPhotoMode ? handlePickPhoto : () => setHeroPick(pickRandomHeroMotive())}
+        frontIcon={iconPhotoMode ? "images-outline" : "shuffle"}
+        backIcon={flipTargetPhotoMode ? "images-outline" : "shuffle"}
+        flipProgress={heroButtonFlipAnim}
+      />
+    </View>
+  );
+
+  // Disabled dimming lives on a wrapper — PressableScale animates the
+  // button's own opacity, which would override it.
+  const submitButton = (
+    <View
+      style={[!pinSubmitButton && styles.createButtonInline, !canSubmit && styles.createButtonDisabled]}
+    >
+      <PressableScale
+        style={styles.createButton}
+        pressedScale={0.98}
+        onPress={handleSubmit}
+        disabled={!canSubmit}
+      >
+        <Text style={styles.createButtonText}>
+          {isSubmitting ? submittingLabel : submitLabel}
+        </Text>
+      </PressableScale>
+    </View>
+  );
+
   return (
     <KeyboardAvoidingView
       style={styles.flex}
@@ -405,103 +502,68 @@ export function GroupForm({
     >
       {header}
 
-      <View style={[styles.hero, { height: windowHeight * HERO_HEIGHT_RATIO }]}>
-        <HeroMotive motive={heroPick.motive} hue={heroPick.hue} fill="92%" verticalAlign="bottom" />
-        {(pickedPhoto || currentPhotoUrl) && (
-          // Kept mounted (just hidden) rather than unmounted while in motive
-          // mode — a remote currentPhotoUrl is a real network image, and
-          // unmounting this <Image> discards its decoded bitmap, forcing a
-          // full re-fetch (a visible gray flash while it reloads) the moment
-          // isPhotoMode flips back to true. A freshly `pickedPhoto` local
-          // file uri doesn't have this problem (already decoded, on-disk),
-          // which is why this only ever showed up for a group's pre-existing
-          // photo, not a photo just picked in this same editing session.
-          <View
-            style={[StyleSheet.absoluteFill, !isPhotoMode && styles.heroPhotoLayerHidden]}
-            pointerEvents={isPhotoMode ? "auto" : "none"}
-          >
-            <Image
-              source={{ uri: pickedPhoto ? pickedPhoto.uri : currentPhotoUrl! }}
-              style={styles.heroPhoto}
-              resizeMode="cover"
+      {pinSubmitButton ? null : hero}
+
+      <ScrollView style={styles.flex} keyboardShouldPersistTaps="handled">
+        {intro}
+        {pinSubmitButton ? hero : null}
+        <View style={styles.form}>
+          <View style={styles.field}>
+            <Text style={styles.label}>Group name</Text>
+            <FocusTextInput
+              value={name}
+              onChangeText={setName}
+              placeholder="e.g. Summer Trip"
+              placeholderTextColor={Colors.muted}
+              style={styles.input}
+              maxLength={GROUP_NAME_MAX_LENGTH}
             />
           </View>
-        )}
-        <HeroButton
-          style={[styles.heroButton, styles.heroButtonTop]}
-          onPress={
-            isPhotoMode
-              ? handleSwitchToMotive
-              : hasRememberedPhoto
-                ? handleRestorePhoto
-                : handlePickPhoto
-          }
-          frontIcon={iconPhotoMode ? "business-outline" : "camera"}
-          backIcon={flipTargetPhotoMode ? "business-outline" : "camera"}
-          flipProgress={heroButtonFlipAnim}
-        />
-        <HeroButton
-          style={[styles.heroButton, styles.heroButtonBottom]}
-          onPress={isPhotoMode ? handlePickPhoto : () => setHeroPick(pickRandomHeroMotive())}
-          frontIcon={iconPhotoMode ? "images-outline" : "shuffle"}
-          backIcon={flipTargetPhotoMode ? "images-outline" : "shuffle"}
-          flipProgress={heroButtonFlipAnim}
-        />
-      </View>
 
-      <ScrollView
-        style={styles.flex}
-        contentContainerStyle={styles.form}
-        keyboardShouldPersistTaps="handled"
-      >
-        <View style={styles.field}>
-          <Text style={styles.label}>Group name</Text>
-          <TextInput
-            value={name}
-            onChangeText={setName}
-            placeholder="e.g. Summer Trip"
-            placeholderTextColor={Colors.muted}
-            style={styles.input}
-            maxLength={GROUP_NAME_MAX_LENGTH}
-          />
-        </View>
+          <View style={styles.field}>
+            <Text style={styles.label}>Currency</Text>
+            <PressableScale
+              style={styles.input}
+              pressedScale={0.98}
+              onPress={() => setIsPickerVisible(true)}
+            >
+              <Text style={currency ? styles.inputValue : styles.inputPlaceholder}>
+                {currency || "Select a currency"}
+              </Text>
+            </PressableScale>
+          </View>
 
-        <View style={styles.field}>
-          <Text style={styles.label}>Currency</Text>
-          <Pressable style={styles.input} onPress={() => setIsPickerVisible(true)}>
-            <Text style={currency ? styles.inputValue : styles.inputPlaceholder}>
-              {currency || "Select a currency"}
+          <View style={styles.field}>
+            <Text style={styles.label}>Description</Text>
+            <FocusTextInput
+              value={description}
+              {...descriptionLineLimit}
+              placeholder="What's this group for?"
+              placeholderTextColor={Colors.muted}
+              style={[styles.input, styles.textArea]}
+              multiline
+              textAlignVertical="top"
+              maxLength={GROUP_DESCRIPTION_MAX_LENGTH}
+            />
+            <Text style={styles.charCount}>
+              {description.length}/{GROUP_DESCRIPTION_MAX_LENGTH} characters
             </Text>
-          </Pressable>
-        </View>
+          </View>
 
-        <View style={styles.field}>
-          <Text style={styles.label}>Description</Text>
-          <TextInput
-            value={description}
-            {...descriptionLineLimit}
-            placeholder="What's this group for?"
-            placeholderTextColor={Colors.muted}
-            style={[styles.input, styles.textArea]}
-            multiline
-            textAlignVertical="top"
-            maxLength={GROUP_DESCRIPTION_MAX_LENGTH}
-          />
-          <Text style={styles.charCount}>
-            {description.length}/{GROUP_DESCRIPTION_MAX_LENGTH} characters
-          </Text>
+          {pinSubmitButton ? null : submitButton}
         </View>
-
-        <Pressable
-          style={[styles.createButton, !canSubmit && styles.createButtonDisabled]}
-          onPress={handleSubmit}
-          disabled={!canSubmit}
-        >
-          <Text style={styles.createButtonText}>
-            {isSubmitting ? submittingLabel : submitLabel}
-          </Text>
-        </Pressable>
       </ScrollView>
+
+      {pinSubmitButton ? (
+        <View
+          style={[
+            styles.submitBar,
+            { paddingBottom: SUBMIT_BAR_PADDING + (isKeyboardVisible ? 0 : insets.bottom) },
+          ]}
+        >
+          {submitButton}
+        </View>
+      ) : null}
 
       <CurrencyPickerModal
         visible={isPickerVisible}
@@ -534,6 +596,8 @@ export function GroupForm({
     </KeyboardAvoidingView>
   );
 }
+
+const SUBMIT_BAR_PADDING = 12;
 
 const styles = StyleSheet.create({
   flex: {
@@ -631,11 +695,19 @@ const styles = StyleSheet.create({
     color: Colors.muted,
     textAlign: "right",
   },
+  submitBar: {
+    paddingHorizontal: 20,
+    paddingTop: SUBMIT_BAR_PADDING,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: Colors.border,
+  },
   createButton: {
     backgroundColor: Colors.accent,
     borderRadius: 10,
     paddingVertical: 14,
     alignItems: "center",
+  },
+  createButtonInline: {
     marginTop: 8,
   },
   createButtonDisabled: {

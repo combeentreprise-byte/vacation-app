@@ -10,31 +10,61 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from "react-native";
+import Animated, {
+  Easing,
+  interpolateColor,
+  useAnimatedStyle,
+  useSharedValue,
+  withDelay,
+  withSequence,
+  withTiming,
+} from "react-native-reanimated";
 
 import { Avatar } from "@/components/avatar";
+import { CrossfadeLabel } from "@/components/crossfade-label";
 import { CurrencyPickerModal } from "@/components/currency-picker";
 import { ModalHeader } from "@/components/modal-header";
+import { FocusTextInput, PressableScale } from "@/components/press-feedback";
 import { Colors } from "@/constants/colors";
 import { CURRENCIES } from "@/constants/currencies";
 import { LOG_DETAILS_MAX_LENGTH, LOG_DETAILS_MAX_LINES } from "@/constants/limits";
 import { useAuth } from "@/hooks/use-auth";
+import { useGroupAccess } from "@/hooks/use-group-access";
 import { useGroupMembers } from "@/hooks/use-group-members";
 import { useGroups } from "@/hooks/use-groups";
 import { useLineLimit } from "@/hooks/use-line-limit";
 import { useLogs } from "@/hooks/use-logs";
 import { useProfile } from "@/hooks/use-profile";
+import { useRefreshOnRefocus } from "@/hooks/use-refresh-on-refocus";
+import { entriesNeedUnlock, freeEntriesLeft, isMemberUnlocked, joinNames } from "@/utils/access";
 import { getExchangeRate } from "@/utils/exchange-rates";
 
 const MEMBER_GRID_GAP = 10;
+const TILE_SELECT_ANIMATION = { duration: 320, easing: Easing.inOut(Easing.quad) };
+const UNSELECTED_AVATAR_OPACITY = 0.4;
+// "Select all" / "Deselect all" ripples through the tiles one after another
+// in display order — this is the gap between neighbours, shrunk for big
+// groups so the whole ripple never takes longer than CASCADE_MAX_SPREAD_MS.
+const CASCADE_STEP_MS = 60;
+const CASCADE_MAX_SPREAD_MS = 480;
+const SELF_TILE_ID = "self";
+// A tile briefly swells when it becomes selected (or dips when deselected),
+// then eases back — a single pop, no overshoot.
+const TILE_POP_SCALE = 1.08;
+const TILE_UNPOP_SCALE = 0.92;
+const TILE_POP_GROW = { duration: 110, easing: Easing.out(Easing.quad) };
+const TILE_POP_SETTLE = { duration: 180, easing: Easing.inOut(Easing.quad) };
+const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
 function MemberTile({
   name,
   label = name,
   avatarUrl,
   selected,
+  locked = false,
+  animationDelay = 0,
   onToggle,
   minWidth,
   onLayout,
@@ -45,31 +75,81 @@ function MemberTile({
   label?: string;
   avatarUrl: string | null;
   selected: boolean;
+  // Not unlocked while the group's entries need everyone on them to be:
+  // shown with a lock badge. Still tappable — the screen decides what a tap
+  // does (deselect, or explain why they can't be picked).
+  locked?: boolean;
+  // How long to wait before animating a change to `selected` — nonzero only
+  // while a "Select all" / "Deselect all" cascade is playing.
+  animationDelay?: number;
   onToggle: () => void;
   minWidth: number;
   onLayout?: (event: LayoutChangeEvent) => void;
 }) {
+  // Eases between selected/unselected (on the UI thread) rather than
+  // snapping, so "Select all" / "Deselect all" flipping every tile at once
+  // reads as one smooth change.
+  const selection = useSharedValue(selected ? 1 : 0);
+  const scale = useSharedValue(1);
+  // Skips the pop on mount — only a change after the tile first rendered
+  // should pop.
+  const hasMounted = useRef(false);
+  useEffect(() => {
+    selection.set(withDelay(animationDelay, withTiming(selected ? 1 : 0, TILE_SELECT_ANIMATION)));
+    if (hasMounted.current) {
+      scale.set(
+        withDelay(
+          animationDelay,
+          withSequence(
+            withTiming(selected ? TILE_POP_SCALE : TILE_UNPOP_SCALE, TILE_POP_GROW),
+            withTiming(1, TILE_POP_SETTLE)
+          )
+        )
+      );
+    }
+    hasMounted.current = true;
+    // Only a change to `selected` should (re)start the animation — a delay
+    // left over from the last cascade mustn't replay it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, selection, scale]);
+  const tileStyle = useAnimatedStyle(() => ({
+    borderColor: interpolateColor(selection.value, [0, 1], [Colors.border, Colors.accent]),
+    transform: [{ scale: scale.value }],
+  }));
+  const avatarStyle = useAnimatedStyle(() => ({
+    opacity: UNSELECTED_AVATAR_OPACITY + (1 - UNSELECTED_AVATAR_OPACITY) * selection.value,
+  }));
+  const nameStyle = useAnimatedStyle(() => ({
+    color: interpolateColor(selection.value, [0, 1], [Colors.muted, Colors.text]),
+  }));
   return (
-    <Pressable
-      style={[styles.memberTile, { minWidth }, selected && styles.memberTileSelected]}
+    <AnimatedPressable
+      style={[styles.memberTile, { minWidth }, tileStyle]}
       onPress={onToggle}
       onLayout={onLayout}
       accessibilityRole="checkbox"
-      accessibilityState={{ checked: selected }}
+      accessibilityState={{ checked: selected, disabled: locked && !selected }}
+      accessibilityHint={locked ? "Not unlocked" : undefined}
     >
-      <Avatar
-        name={name}
-        avatarUrl={avatarUrl}
-        style={[styles.memberAvatar, !selected && styles.memberAvatarUnselected]}
-        textStyle={styles.memberAvatarText}
-      />
-      <Text
-        style={[styles.memberTileName, !selected && styles.memberTileNameUnselected]}
-        numberOfLines={1}
-      >
+      <View>
+        <Animated.View style={avatarStyle}>
+          <Avatar
+            name={name}
+            avatarUrl={avatarUrl}
+            style={styles.memberAvatar}
+            textStyle={styles.memberAvatarText}
+          />
+        </Animated.View>
+        {locked ? (
+          <View style={styles.lockBadge}>
+            <Ionicons name="lock-closed" size={10} color={Colors.accentText} />
+          </View>
+        ) : null}
+      </View>
+      <Animated.Text style={[styles.memberTileName, nameStyle]} numberOfLines={1}>
         {label}
-      </Text>
-    </Pressable>
+      </Animated.Text>
+    </AnimatedPressable>
   );
 }
 
@@ -116,6 +196,41 @@ export default function AddEntryScreen() {
     existingLog?.memberIds.filter(
       (id) => id === null || !members.some((member) => member.id === id)
     ) ?? [];
+
+  // Once your free entries in this group are used up (everyone gets their own
+  // in each group), everyone on an entry has to be unlocked — you (always its
+  // payer) and everyone it's split with — the same rule create_log/update_log
+  // enforce server-side (check_entry_access in schema.sql), checked here
+  // first so it's clear before submitting. Entries of yours in the group
+  // still waiting to sync count against the free ones too. (A held entry was
+  // turned down, so it doesn't.)
+  const { access: groupAccess, refresh: refreshGroupAccess } = useGroupAccess(groupId);
+  // Back from /unlock (its "Unlock to add entries" button), this form's copy
+  // of the group's access predates the purchase.
+  useRefreshOnRefocus(refreshGroupAccess);
+  const pendingInGroup = isEditMode
+    ? 0
+    : logs.filter((log) => log.groupId === groupId && log.isPending && !log.isHeld).length;
+  const needsUnlock = entriesNeedUnlock(groupAccess, pendingInGroup);
+  const isLocked = (id: string) => needsUnlock && !isMemberUnlocked(groupAccess, id);
+  const viewerLocked = !!session && isLocked(session.user.id);
+  // Not worth mentioning to someone who's unlocked: they don't need them.
+  const freeLeft =
+    groupAccess?.paywallEnabled &&
+    !isEditMode &&
+    !isMemberUnlocked(groupAccess, session?.user.id ?? "")
+      ? freeEntriesLeft(groupAccess, pendingInGroup)
+      : 0;
+  const memberName = (id: string) =>
+    allMembers.find((member) => member.id === id)?.name ?? "Someone";
+  // Only non-null ids: a deleted account's slot has no one left to unlock
+  // (check_entry_access skips those too).
+  const lockedPreservedIds = preservedMemberIds.filter(
+    (id): id is string => id !== null && isLocked(id)
+  );
+  // The member whose tile was last tapped while locked, to say why nothing
+  // happened.
+  const [lockedTapId, setLockedTapId] = useState<string | null>(null);
 
   // A scanned amount of 0/negative/NaN isn't usable, and a scanned currency
   // that isn't one of ours (e.g. the model misread it, or it's a currency
@@ -191,18 +306,53 @@ export default function AddEntryScreen() {
     setTileWidths((current) => (current[id] === width ? current : { ...current, [id]: width }));
   };
 
-  const allSelected = includeMyself && members.every((member) => selectedIds[member.id]);
+  // Locked members can't be picked, so "Select all" means everyone who can be.
+  const allSelected =
+    includeMyself &&
+    members.every((member) => isLocked(member.id) || selectedIds[member.id]);
+
+  // Per-tile animation delays for the "Select all" / "Deselect all" cascade;
+  // cleared by any single-tile tap so that one animates straight away.
+  const [cascadeDelays, setCascadeDelays] = useState<Record<string, number>>({});
 
   const toggleMember = (id: string) => {
+    setCascadeDelays({});
+    // A locked member can still be taken off an entry (one being edited may
+    // already include them), just not put on one.
+    if (isLocked(id) && !selectedIds[id]) {
+      setLockedTapId(id);
+      return;
+    }
+    setLockedTapId(null);
     setSelectedIds((current) => ({ ...current, [id]: !current[id] }));
+  };
+
+  const toggleMyself = () => {
+    setCascadeDelays({});
+    setIncludeMyself((current) => !current);
   };
 
   const toggleAll = () => {
     const next = !allSelected;
     const updated: Record<string, boolean> = {};
     members.forEach((member) => {
-      updated[member.id] = next;
+      updated[member.id] = next && !isLocked(member.id);
     });
+    // The selection itself changes all at once (so the form is immediately
+    // valid); only the animation is staggered, across the tiles that actually
+    // flip, in the order they're shown.
+    const changing = [
+      ...(includeMyself !== next ? [SELF_TILE_ID] : []),
+      ...orderedMembers
+        .filter((member) => !!selectedIds[member.id] !== updated[member.id])
+        .map((m) => m.id),
+    ];
+    setLockedTapId(null);
+    const step =
+      changing.length > 1
+        ? Math.min(CASCADE_STEP_MS, CASCADE_MAX_SPREAD_MS / (changing.length - 1))
+        : 0;
+    setCascadeDelays(Object.fromEntries(changing.map((id, index) => [id, index * step])));
     setSelectedIds(updated);
     setIncludeMyself(next);
   };
@@ -215,12 +365,33 @@ export default function AddEntryScreen() {
   // non-empty split even if nothing in the editable checklist is checked,
   // so it counts toward "there's a valid split" the same as a selected tile.
   const hasSelection = Object.values(selectedIds).some(Boolean) || preservedMemberIds.length > 0;
+  // Picked but not unlocked: an entry being edited that already had them, or
+  // someone picked before the group's access had loaded.
+  const lockedSelectedIds = Object.keys(selectedIds).filter(
+    (id) => selectedIds[id] && isLocked(id)
+  );
   const canSubmit =
     amount.trim().length > 0 &&
     !Number.isNaN(amountValue) &&
     amountValue > 0 &&
     hasSelection &&
+    !viewerLocked &&
+    lockedSelectedIds.length === 0 &&
+    lockedPreservedIds.length === 0 &&
     !isSubmitting;
+  // Whichever explanation applies to the lock state, shown above the button.
+  const lockedSelectedNames = lockedSelectedIds.map(memberName);
+  const accessNote = viewerLocked
+    ? isEditMode
+      ? "Your free entries in this group are used up, so editing one needs an unlock. Settling up and deleting your own entries stay free."
+      : "Your free entries in this group are used up, so adding one needs an unlock. Settling up and deleting your own entries stay free."
+    : lockedPreservedIds.length > 0
+      ? `${joinNames(lockedPreservedIds.map(memberName))} left the group and ${lockedPreservedIds.length === 1 ? "isn't" : "aren't"} unlocked, so this entry can't be changed anymore. You can still delete it.`
+      : lockedSelectedNames.length > 0
+        ? `${joinNames(lockedSelectedNames)} ${lockedSelectedNames.length === 1 ? "isn't" : "aren't"} unlocked, so they can't be on entries yet. Tap to take them off.`
+        : lockedTapId
+          ? `${memberName(lockedTapId)} isn't unlocked, so they can't be on entries yet.`
+          : null;
 
   const handleSubmit = async () => {
     if (!canSubmit || !groupId || !session || !group) return;
@@ -306,7 +477,7 @@ export default function AddEntryScreen() {
         <View style={styles.field}>
           <Text style={styles.label}>Amount you spent</Text>
           <View style={styles.amountRow}>
-            <TextInput
+            <FocusTextInput
               value={amount}
               onChangeText={setAmount}
               placeholder="0.00"
@@ -314,20 +485,21 @@ export default function AddEntryScreen() {
               keyboardType="decimal-pad"
               style={[styles.input, styles.amountInput]}
             />
-            <Pressable
+            <PressableScale
               style={[styles.input, styles.currencyInput]}
               onPress={() => setIsCurrencyPickerVisible(true)}
             >
               <Text style={currency ? styles.currencyValue : styles.currencyPlaceholder}>
                 {currency || "USD"}
               </Text>
-            </Pressable>
+            </PressableScale>
           </View>
           {isPrefilled ? (
             <Text style={styles.prefillHint}>Filled in from your scanned receipt — double-check it.</Text>
           ) : null}
-          <Pressable
+          <PressableScale
             style={styles.scanButton}
+            pressedScale={0.98}
             onPress={() =>
               router.push({
                 pathname: "/scan-receipt",
@@ -337,12 +509,12 @@ export default function AddEntryScreen() {
           >
             <Ionicons name="receipt-outline" size={18} color={Colors.accent} />
             <Text style={styles.scanButtonText}>Scan receipt</Text>
-          </Pressable>
+          </PressableScale>
         </View>
 
         <View style={styles.field}>
           <Text style={styles.label}>Details</Text>
-          <TextInput
+          <FocusTextInput
             value={details}
             {...detailsLineLimit}
             placeholder="What was this for?"
@@ -360,9 +532,15 @@ export default function AddEntryScreen() {
         <View style={styles.field}>
           <View style={styles.labelRow}>
             <Text style={styles.label}>Purchase was for</Text>
-            <Pressable onPress={toggleAll} hitSlop={8}>
-              <Text style={styles.selectAllText}>{allSelected ? "Deselect all" : "Select all"}</Text>
-            </Pressable>
+            <PressableScale onPress={toggleAll} hitSlop={8} pressedOpacity={0.5}>
+              <CrossfadeLabel
+                first="Select all"
+                second="Deselect all"
+                showSecond={allSelected}
+                align="right"
+                style={styles.selectAllText}
+              />
+            </PressableScale>
           </View>
           <View
             style={[styles.memberGrid, !isGridMeasured && styles.memberGridHidden]}
@@ -373,7 +551,8 @@ export default function AddEntryScreen() {
               label="You"
               avatarUrl={profile.avatarUrl}
               selected={includeMyself}
-              onToggle={() => setIncludeMyself((current) => !current)}
+              animationDelay={cascadeDelays[SELF_TILE_ID]}
+              onToggle={toggleMyself}
               minWidth={defaultTileWidth}
             />
             {orderedMembers.map((member) => (
@@ -382,6 +561,8 @@ export default function AddEntryScreen() {
                 name={member.name}
                 avatarUrl={member.avatarUrl}
                 selected={!!selectedIds[member.id]}
+                locked={isLocked(member.id)}
+                animationDelay={cascadeDelays[member.id]}
                 onToggle={() => toggleMember(member.id)}
                 minWidth={defaultTileWidth}
                 onLayout={handleTileLayout(member.id)}
@@ -390,21 +571,49 @@ export default function AddEntryScreen() {
           </View>
         </View>
 
-        <Pressable
-          style={[styles.submitButton, !canSubmit && styles.submitButtonDisabled]}
-          onPress={handleSubmit}
-          disabled={!canSubmit}
-        >
-          <Text style={styles.submitButtonText}>
-            {isSubmitting
-              ? isEditMode
-                ? "Saving..."
-                : "Submitting..."
-              : isEditMode
-                ? "Save changes"
-                : "Submit entry"}
+        {accessNote ? (
+          <View style={styles.accessNote}>
+            <Ionicons name="lock-closed-outline" size={16} color={Colors.muted} />
+            <Text style={styles.accessNoteText}>{accessNote}</Text>
+          </View>
+        ) : freeLeft > 0 ? (
+          <Text style={styles.freeEntriesHint}>
+            You have {freeLeft === 1 ? "1 free entry" : `${freeLeft} free entries`} left in this group
           </Text>
-        </Pressable>
+        ) : null}
+
+        {viewerLocked ? (
+          <PressableScale
+            style={styles.submitButton}
+            pressedScale={0.98}
+            onPress={() => router.push({ pathname: "/unlock", params: { groupId } })}
+          >
+            <Text style={styles.submitButtonText}>
+              {isEditMode ? "Unlock to edit entries" : "Unlock to add entries"}
+            </Text>
+          </PressableScale>
+        ) : (
+          // Disabled dimming lives on a wrapper — PressableScale animates the
+          // button's own opacity, which would override it.
+          <View style={!canSubmit && styles.submitButtonDisabled}>
+            <PressableScale
+              style={styles.submitButton}
+              pressedScale={0.98}
+              onPress={handleSubmit}
+              disabled={!canSubmit}
+            >
+              <Text style={styles.submitButtonText}>
+                {isSubmitting
+                  ? isEditMode
+                    ? "Saving..."
+                    : "Submitting..."
+                  : isEditMode
+                    ? "Save changes"
+                    : "Submit entry"}
+              </Text>
+            </PressableScale>
+          </View>
+        )}
       </ScrollView>
 
       <CurrencyPickerModal
@@ -524,9 +733,6 @@ const styles = StyleSheet.create({
     borderColor: Colors.border,
     borderRadius: 12,
   },
-  memberTileSelected: {
-    borderColor: Colors.accent,
-  },
   memberAvatar: {
     width: 48,
     height: 48,
@@ -535,9 +741,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     overflow: "hidden",
-  },
-  memberAvatarUnselected: {
-    opacity: 0.4,
   },
   memberAvatarText: {
     color: Colors.accentText,
@@ -550,8 +753,39 @@ const styles = StyleSheet.create({
     color: Colors.text,
     textAlign: "center",
   },
-  memberTileNameUnselected: {
+  // Same corner placement as the group screen's AdminBadge.
+  lockBadge: {
+    position: "absolute",
+    bottom: -2,
+    right: -2,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: Colors.background,
+    backgroundColor: Colors.muted,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  accessNote: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    padding: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  accessNoteText: {
+    flex: 1,
+    fontSize: 13,
+    lineHeight: 18,
     color: Colors.muted,
+  },
+  freeEntriesHint: {
+    fontSize: 13,
+    color: Colors.muted,
+    textAlign: "center",
   },
   submitButton: {
     backgroundColor: Colors.accent,

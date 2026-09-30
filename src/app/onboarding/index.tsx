@@ -120,17 +120,25 @@ export default function OnboardingProfileScreen() {
             </View>
           </Pressable>
 
+          {/* Equal-width sides keep the main link centered under the
+              picture whether or not "Remove" is showing beside it. */}
           <View style={styles.photoLinks}>
+            <View style={styles.photoLinkSide} />
             <Pressable onPress={handlePickPhoto} disabled={isStoringPhoto} hitSlop={8}>
               <Text style={styles.linkText}>{draft.avatar ? "Change photo" : "Add a photo"}</Text>
             </Pressable>
-            {draft.avatar ? (
-              <Pressable onPress={() => setAvatar(null)} disabled={isStoringPhoto} hitSlop={8}>
-                <Text style={styles.removeText}>Remove</Text>
-              </Pressable>
-            ) : (
-              <Text style={styles.optionalText}>Optional</Text>
-            )}
+            <View style={[styles.photoLinkSide, styles.photoLinkSideRight]}>
+              {draft.avatar ? (
+                <Pressable
+                  style={styles.removeLink}
+                  onPress={() => setAvatar(null)}
+                  disabled={isStoringPhoto}
+                  hitSlop={8}
+                >
+                  <Text style={styles.removeText}>Remove</Text>
+                </Pressable>
+              ) : null}
+            </View>
           </View>
         </View>
 
@@ -226,7 +234,19 @@ const styles = StyleSheet.create({
   photoLinks: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 16,
+    alignSelf: "stretch",
+  },
+  photoLinkSide: {
+    flex: 1,
+  },
+  photoLinkSideRight: {
+    alignItems: "flex-start",
+  },
+  // Spaced on the link itself rather than as padding on its side column,
+  // which would make that column wider than the left one and pull the
+  // center link off-center.
+  removeLink: {
+    marginLeft: 16,
   },
   linkText: {
     fontSize: 15,
@@ -236,10 +256,6 @@ const styles = StyleSheet.create({
   removeText: {
     fontSize: 15,
     color: Colors.danger,
-  },
-  optionalText: {
-    fontSize: 13,
-    color: Colors.muted,
   },
   field: {
     gap: 8,

@@ -44,6 +44,9 @@ type GroupActionsMenuProps = {
   onClose: () => void;
   onEdit: () => void;
   onInvite: () => void;
+  // Opens the group's plan (see group-plan.tsx). Left out while plans aren't
+  // shown at all, which hides the row.
+  onPlan?: () => void;
   // Called once the user confirms in the menu's own leave confirmation —
   // tapping "Leave group" morphs the menu into that confirmation in place
   // rather than opening a separate alert.
@@ -64,6 +67,7 @@ export function GroupActionsMenu({
   onClose,
   onEdit,
   onInvite,
+  onPlan,
   onLeave,
   onClosed,
   canEdit,
@@ -200,6 +204,7 @@ export function GroupActionsMenu({
     // person-add-outline's body sits ~1px right of center to make room for
     // its "+", compared to create-outline and log-out-outline.
     { key: "invite", icon: "person-add-outline", label: "Invite member", iconOffsetX: -1, onPress: onInvite },
+    ...(onPlan ? [{ key: "plan", icon: "ticket-outline" as const, label: "Group plan", onPress: onPlan }] : []),
   ];
 
   return (

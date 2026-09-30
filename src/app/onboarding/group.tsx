@@ -29,20 +29,27 @@ export default function OnboardingGroupScreen() {
   return (
     <GroupForm
       header={
-        <>
-          <OnboardingHeader
-            step={2}
-            onBack={() => router.back()}
-            action={{ label: "Skip", onPress: handleSkip }}
-          />
-          <View style={styles.intro}>
-            <Text style={styles.title}>Create your first group</Text>
-            <Text style={styles.subtitle}>
-              A trip, a flat, a weekend away. You can invite everyone once you&apos;re signed up.
-            </Text>
-          </View>
-        </>
+        <OnboardingHeader
+          step={2}
+          onBack={() => router.back()}
+          action={{ label: "Skip", onPress: handleSkip }}
+        />
       }
+      intro={
+        <View style={styles.intro}>
+          {/* Carries the intro's white up past the top of the scroll
+              content, so pulling the page down (iOS's bounce) shows white
+              under the header instead of the gray page behind, which would
+              otherwise read as a gap between the two. The scroll view clips
+              it, so it's never visible at rest. */}
+          <View style={styles.overscrollFill} />
+          <Text style={styles.title}>Create your first group</Text>
+          <Text style={styles.subtitle}>
+            A trip, a flat, a weekend away. You can invite everyone once you&apos;re signed up.
+          </Text>
+        </View>
+      }
+      pinSubmitButton
       initialValues={
         savedGroup
           ? {
@@ -67,6 +74,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingBottom: 16,
     gap: 6,
+    backgroundColor: Colors.background,
+  },
+  overscrollFill: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: "100%",
+    height: 1000,
     backgroundColor: Colors.background,
   },
   title: {

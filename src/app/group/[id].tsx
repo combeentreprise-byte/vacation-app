@@ -1,12 +1,11 @@
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
-import * as Linking from "expo-linking";
-import { router, useLocalSearchParams, useNavigation } from "expo-router";
+import { router, useFocusEffect, useLocalSearchParams, useNavigation } from "expo-router";
 import type {
   NavigationProp,
   NavigationState as RouterNavigationState,
   ParamListBase,
 } from "expo-router/react-navigation";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Animated,
@@ -18,7 +17,6 @@ import {
   type NativeSyntheticEvent,
   Platform,
   Pressable,
-  Share,
   type StyleProp,
   StyleSheet,
   Text,
@@ -47,17 +45,36 @@ import { Avatar } from "@/components/avatar";
 import { FlagIcon } from "@/components/currency-picker";
 import { GroupActionsMenu } from "@/components/group-actions-menu";
 import { GroupHero } from "@/components/hero-motive";
+import { InviteMotiveCard } from "@/components/invite-motive-card";
 import { ConfirmationBody } from "@/components/leave-group-confirmation";
 import type { MenuAnchor } from "@/components/menu-anchor";
 import { PageHeader } from "@/components/page-header";
 import { Colors } from "@/constants/colors";
 import { CURRENCIES } from "@/constants/currencies";
+import { useAccess } from "@/hooks/use-access";
 import { useAuth } from "@/hooks/use-auth";
+import { type GroupAccess, type GroupPlan, useGroupAccess } from "@/hooks/use-group-access";
+import {
+  type GroupEvent,
+  type GroupEventKind,
+  type PlanEventDetails,
+  useGroupEvents,
+} from "@/hooks/use-group-events";
 import { type GroupMember, useGroupMembers } from "@/hooks/use-group-members";
 import { useGroups } from "@/hooks/use-groups";
 import { type LogEntry, useLogs } from "@/hooks/use-logs";
 import { useProfile } from "@/hooks/use-profile";
+import { useRefreshOnRefocus } from "@/hooks/use-refresh-on-refocus";
+import {
+  entriesNeedUnlock,
+  formatAccessDate,
+  freeEntriesLeft,
+  isMemberUnlocked,
+  joinNames,
+  unlockEndsEarly,
+} from "@/utils/access";
 import { calculateMemberBalances, DELETED_USER_ID } from "@/utils/balances";
+import { shareGroupInvite } from "@/utils/invite";
 import { goBackOrToGroups } from "@/utils/navigation";
 
 type TabRoute = { key: "members" | "logs"; title: string };
@@ -72,13 +89,6 @@ type StackScreenNavigation = NavigationProp<
   object,
   { transitionEnd: { data: { closing: boolean } } }
 >;
-
-function shareInviteLink(groupId: string) {
-  const url = Linking.createURL(`join/${groupId}`);
-  Share.share({ message: url }).catch((error) => {
-    Alert.alert("Couldn't open share sheet", String(error));
-  });
-}
 
 const TAB_ROUTES: TabRoute[] = [
   { key: "members", title: "Members" },
@@ -95,14 +105,16 @@ const HERO_HEIGHT_RATIO = 0.28;
 // since the bar itself has no ListFooter/layout the FAB could measure.
 const SUMMARY_BAR_HEIGHT = 50;
 
-// How many lines a collapsed description shows before offering "Show more".
-const DESCRIPTION_COLLAPSED_LINES = 4;
-// Matches styles.description's lineHeight â€” used to compute the collapsed
-// pixel height a measured description is compared against (see
-// descriptionMeasure below). Kept as a constant rather than read back from
-// the stylesheet since RN style objects aren't guaranteed to round-trip.
+// Matches styles.description's lineHeight. Kept as a constant rather than
+// read back from the stylesheet since RN style objects aren't guaranteed to
+// round-trip.
 const DESCRIPTION_LINE_HEIGHT = 21;
-const DESCRIPTION_COLLAPSED_HEIGHT = DESCRIPTION_COLLAPSED_LINES * DESCRIPTION_LINE_HEIGHT;
+// A collapsed description is hidden entirely behind "Show description".
+const DESCRIPTION_COLLAPSED_HEIGHT = 0;
+// Space between an expanded description and the toggle below it. Part of the
+// animated box's own height (rather than a flex gap) so a collapsed box
+// takes up no room at all.
+const DESCRIPTION_TOGGLE_GAP = 8;
 // Height of the gradient that softens the description box's clipped bottom
 // edge (see DescriptionFade).
 const DESCRIPTION_FADE_HEIGHT = Math.round(DESCRIPTION_LINE_HEIGHT * 1.5);
@@ -151,11 +163,6 @@ const BOTTOM_OBSTRUCTION_HEIGHT = SUMMARY_BAR_HEIGHT + FAB_BOTTOM_MARGIN + FAB_D
 // touching the FAB on the smallest supported screens.
 const BOTTOM_CLEARANCE_GAP_RATIO = 0.02;
 
-// Below this many rows, a pane's content is too short to ever scroll for
-// real â€” tying the hero's collapse to that pane's scroll position just
-// means reacting to rubber-band/bounce noise instead of an actual scroll
-// gesture, which is what caused the flicker this constant exists to avoid.
-const MIN_ITEMS_TO_COLLAPSE_HERO = 7;
 // How long the hero/title/description take to ease into the incoming tab's
 // collapse state on a tab switch â€” a bit slower than the TabView's own slide,
 // which read as too abrupt at a matching ~280ms.
@@ -168,10 +175,178 @@ function currencyCountryCode(code: string) {
   return CURRENCIES.find((currency) => currency.code === code)?.countryCode;
 }
 
+type AccessTone = "muted" | "success" | "warning";
+
+const ACCESS_TONE_COLORS: Record<AccessTone, string> = {
+  muted: Colors.muted,
+  success: Colors.success,
+  warning: Colors.warning,
+};
+
+function capitalize(text: string) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+// What GroupAccessLine says: where the group stands (its plan, free entries
+// left, or locked), plus the one thing most worth acting on, if any — for
+// the sponsor, someone without a seat; for anyone, an unlock running out
+// early or people who can't be on entries.
+function describeGroupAccess(
+  groupAccess: GroupAccess,
+  // Everyone, the viewer and members who left included.
+  members: GroupMember[],
+  viewerId: string,
+  pendingInGroup: number
+): {
+  icon: keyof typeof Ionicons.glyphMap;
+  text: string;
+  tone: AccessTone;
+  prompt: { text: string; tone: AccessTone } | null;
+} {
+  const plan = groupAccess.plan;
+  const freeLeft = freeEntriesLeft(groupAccess, pendingInGroup);
+  const needsUnlock = entriesNeedUnlock(groupAccess, pendingInGroup);
+  const viewerUnlocked = isMemberUnlocked(groupAccess, viewerId);
+  const nameOf = (id: string | null) =>
+    id === viewerId ? "you" : (members.find((member) => member.id === id)?.name ?? "someone");
+  const active = members.filter((member) => member.isActive && member.id !== DELETED_USER_ID);
+  const locked = active.filter((member) => !isMemberUnlocked(groupAccess, member.id));
+  const lockedNames = locked.map((member) => nameOf(member.id));
+  const areLocked = `${capitalize(joinNames(lockedNames, 2))} ${
+    lockedNames.length === 1 && lockedNames[0] !== "you" ? "isn't" : "aren't"
+  } unlocked`;
+
+  let main: { icon: keyof typeof Ionicons.glyphMap; text: string; tone: AccessTone };
+  if (plan) {
+    const seatsFree = plan.seatCount - plan.seatsUsed;
+    main = {
+      icon: "lock-open-outline",
+      tone: "success",
+      text: `Unlocked by ${nameOf(plan.sponsorId)} · ${plan.willRenew ? "renews" : "until"} ${formatAccessDate(plan.endsAt)}${
+        seatsFree > 0 ? ` · ${seatsFree} ${seatsFree === 1 ? "seat" : "seats"} free` : ""
+      }`,
+    };
+  } else if (!groupAccess.paywallEnabled) {
+    // Only testers see plans before the paywall is on.
+    main = { icon: "ticket-outline", tone: "muted", text: "No group plan yet" };
+  } else if (freeLeft > 0 && !viewerUnlocked) {
+    main = {
+      icon: "gift-outline",
+      tone: "muted",
+      text: `You have ${freeLeft} free ${freeLeft === 1 ? "entry" : "entries"} left in this group`,
+    };
+  } else if (!viewerUnlocked) {
+    main = { icon: "lock-closed-outline", tone: "muted", text: "Entries are locked · Unlock" };
+  } else {
+    main = {
+      icon: "lock-open-outline",
+      tone: "success",
+      text: `You're unlocked until ${formatAccessDate(groupAccess.members[viewerId]?.unlockedUntil as number)}`,
+    };
+  }
+
+  const endingEarly = active.find((member) =>
+    unlockEndsEarly(groupAccess.members[member.id], plan?.endsAt ?? null)
+  );
+  let prompt: { text: string; tone: AccessTone } | null = null;
+  if (plan?.canManage && locked.length > 0) {
+    const canGive =
+      plan.seatCount > plan.seatsUsed ||
+      members.some((member) => !member.isActive && groupAccess.members[member.id]?.hasSeat);
+    prompt = {
+      text: `${areLocked} · ${canGive ? "Give a seat" : "No seats left"}`,
+      tone: "warning",
+    };
+  } else if (needsUnlock && !viewerUnlocked && plan) {
+    const sponsorIsActive = active.some((member) => member.id === plan.sponsorId);
+    prompt = {
+      text: `You don't have a seat · Ask ${
+        sponsorIsActive ? nameOf(plan.sponsorId) : "an admin"
+      } or unlock yourself`,
+      tone: "warning",
+    };
+  } else if (endingEarly) {
+    const until = formatAccessDate(
+      groupAccess.members[endingEarly.id]?.unlockedUntil as number
+    );
+    prompt = {
+      text: `${endingEarly.id === viewerId ? "Your" : `${endingEarly.name}'s`} unlock ends ${until}${
+        plan ? ", before the plan does" : ""
+      }`,
+      tone: "warning",
+    };
+  } else if (needsUnlock && viewerUnlocked && locked.length > 0) {
+    prompt = { text: `${areLocked}, so they can't be on entries yet`, tone: "muted" };
+  }
+
+  return { ...main, prompt };
+}
+
+// Where the group stands with the paywall, under its currency. Opens the
+// group plan screen, or /unlock while there's no plan yet.
+function GroupAccessLine({
+  groupAccess,
+  members,
+  viewerId,
+  pendingInGroup,
+  onPress,
+}: {
+  groupAccess: GroupAccess;
+  members: GroupMember[];
+  viewerId: string;
+  pendingInGroup: number;
+  onPress: () => void;
+}) {
+  const { icon, text, tone, prompt } = describeGroupAccess(
+    groupAccess,
+    members,
+    viewerId,
+    pendingInGroup
+  );
+  return (
+    <Pressable style={styles.accessLine} onPress={onPress} accessibilityRole="button">
+      <Ionicons name={icon} size={16} color={ACCESS_TONE_COLORS[tone]} />
+      <View style={styles.accessLineText}>
+        <Text style={[styles.accessLineMain, { color: ACCESS_TONE_COLORS[tone] }]}>{text}</Text>
+        {prompt ? (
+          <Text style={[styles.accessLinePrompt, { color: ACCESS_TONE_COLORS[prompt.tone] }]}>
+            {prompt.text}
+          </Text>
+        ) : null}
+      </View>
+      <Ionicons name="chevron-forward" size={16} color={Colors.muted} />
+    </Pressable>
+  );
+}
+
+const ADMIN_BADGE_BORDER_WIDTH = 2;
+
 function AdminBadge({ size }: { size: number }) {
+  // Sized against the circle's inner area (inside the 2px border on each
+  // side) rather than its full width, so the shield keeps the same
+  // proportion at small sizes instead of crowding the ring. At 28 this
+  // works out to the same 16.8 as the old `size * 0.6`.
+  const iconSize = (size - 2 * ADMIN_BADGE_BORDER_WIDTH) * 0.7;
   return (
     <View style={[styles.adminBadge, { width: size, height: size, borderRadius: size / 2 }]}>
-      <Ionicons name="shield" size={size * 0.6} color={Colors.accentText} />
+      <Ionicons name="shield" size={iconSize} color={Colors.accentText} />
+    </View>
+  );
+}
+
+// Marks whoever sponsors the group's running plan. Sits on the avatar's
+// opposite corner from AdminBadge, since a sponsor is often an admin too.
+function SponsorBadge({ size }: { size: number }) {
+  const iconSize = (size - 2 * ADMIN_BADGE_BORDER_WIDTH) * 0.65;
+  return (
+    <View style={[styles.adminBadge, styles.sponsorBadge, { width: size, height: size, borderRadius: size / 2 }]}>
+      {/* The star's points make its glyph sit visually low in the circle. */}
+      <Ionicons
+        name="star"
+        size={iconSize}
+        color={Colors.accentText}
+        style={{ transform: [{ translateY: -iconSize * 0.07 }] }}
+      />
     </View>
   );
 }
@@ -350,18 +525,86 @@ function formatDebt(debt: number, currency: string) {
   return { isSettled, isOwed, amountLabel };
 }
 
+// Where a member stands with the paywall, when it's worth saying on their
+// row: locked (once the group's entries need an unlock), or unlocked but
+// running out early (see unlockEndsEarly).
+type MemberAccessLabel = { text: string; tone: "locked" | "warning" };
+
+function describeMemberAccess(
+  member: GroupMember,
+  groupAccess: GroupAccess | null,
+  needsUnlock: boolean
+): MemberAccessLabel | null {
+  if (!groupAccess?.paywallEnabled || !member.isActive) return null;
+  if (needsUnlock && !isMemberUnlocked(groupAccess, member.id)) {
+    return { text: "Locked", tone: "locked" };
+  }
+  const memberAccess = groupAccess.members[member.id];
+  if (unlockEndsEarly(memberAccess, groupAccess.plan?.endsAt ?? null)) {
+    return {
+      text: `Unlocked until ${formatAccessDate(memberAccess.unlockedUntil as number)}`,
+      tone: "warning",
+    };
+  }
+  return null;
+}
+
+function MemberAccessNote({ label }: { label: MemberAccessLabel }) {
+  const color = label.tone === "warning" ? Colors.warning : Colors.muted;
+  return (
+    <View style={styles.memberAccessNote}>
+      <Ionicons
+        name={label.tone === "warning" ? "time-outline" : "lock-closed"}
+        size={12}
+        color={color}
+      />
+      <Text style={[styles.leftLabel, { color }]}>{label.text}</Text>
+    </View>
+  );
+}
+
 function MemberRow({
   member,
   debt,
   currency,
+  accessLabel,
+  isSponsor = false,
   onPress,
+  isViewer = false,
 }: {
   member: GroupMember;
   debt: number;
   currency: string;
-  onPress: () => void;
+  accessLabel?: MemberAccessLabel | null;
+  isSponsor?: boolean;
+  onPress?: () => void;
+  // Your own row: labelled "You", with no debt column (you can't owe
+  // yourself) and nothing to open on press.
+  isViewer?: boolean;
 }) {
   const { isSettled, isOwed, amountLabel } = formatDebt(debt, currency);
+
+  if (isViewer) {
+    return (
+      <View style={styles.memberRow}>
+        <View style={styles.avatarBadgeWrapper}>
+          <Avatar
+            name={member.name}
+            avatarUrl={member.avatarUrl}
+            style={styles.avatar}
+            textStyle={styles.avatarText}
+          />
+          {member.isAdmin ? <AdminBadge size={18} /> : null}
+          {isSponsor ? <SponsorBadge size={18} /> : null}
+        </View>
+        <View style={styles.memberNameColumn}>
+          <Text style={styles.memberName}>{member.name}</Text>
+          <Text style={styles.leftLabel}>You</Text>
+          {accessLabel ? <MemberAccessNote label={accessLabel} /> : null}
+        </View>
+      </View>
+    );
+  }
 
   return (
     <Pressable style={styles.memberRow} onPress={onPress}>
@@ -373,12 +616,14 @@ function MemberRow({
           textStyle={styles.avatarText}
         />
         {member.isAdmin ? <AdminBadge size={18} /> : null}
+        {isSponsor ? <SponsorBadge size={18} /> : null}
       </View>
       <View style={styles.memberNameColumn}>
         <Text style={[styles.memberName, !member.isActive && styles.memberNameInactive]}>
           {member.name}
         </Text>
         {!member.isActive ? <Text style={styles.leftLabel}>Left group</Text> : null}
+        {accessLabel ? <MemberAccessNote label={accessLabel} /> : null}
       </View>
       <View style={styles.memberDivider} />
       <View style={styles.debtColumn}>
@@ -510,6 +755,7 @@ function MemberDetailOverlay({
   debt,
   currency,
   viewerIsAdmin,
+  sponsorId,
   onClose,
   onSettle,
   onPromote,
@@ -519,6 +765,8 @@ function MemberDetailOverlay({
   debt: number;
   currency: string;
   viewerIsAdmin: boolean;
+  // The running group plan's sponsor, for their SponsorBadge.
+  sponsorId: string | null;
   onClose: () => void;
   onSettle: () => Promise<void>;
   onPromote: () => Promise<void>;
@@ -656,8 +904,7 @@ function MemberDetailOverlay({
     },
     kick: {
       title: `Remove ${name}?`,
-      message:
-        "They'll be removed from this group. Their existing logs and balances stay visible, and they can rejoin later via an invite link.",
+      message: "Their existing logs and balances stay visible, and they can rejoin later via an invite link.",
       confirmLabel: "Remove",
       destructive: true,
     },
@@ -706,6 +953,7 @@ function MemberDetailOverlay({
                       textStyle={styles.avatarLargeText}
                     />
                     {displayMember.isAdmin ? <AdminBadge size={28} /> : null}
+                    {displayMember.id === sponsorId ? <SponsorBadge size={28} /> : null}
                   </View>
                   <Text style={styles.memberDetailName}>{displayMember.name}</Text>
                   {isSettled ? (
@@ -734,7 +982,13 @@ function MemberDetailOverlay({
                     chosen={chosen}
                     isConfirming={isConfirming}
                     disabled={!canPromote}
-                    icon={<Ionicons name="arrow-up" size={MEMBER_ROW_ICON_SIZE} color={Colors.text} />}
+                    icon={
+                      <Ionicons
+                        name={targetIsAdmin ? "shield-outline" : "arrow-up-circle-outline"}
+                        size={MEMBER_ROW_ICON_SIZE}
+                        color={Colors.text}
+                      />
+                    }
                     label={promoteLabel}
                     title={confirmation.promote.title}
                     labelColor={Colors.text}
@@ -767,11 +1021,17 @@ function MemberDetailOverlay({
                     isConfirming={isConfirming}
                     disabled={!canSettle}
                     icon={
-                      <MaterialCommunityIcons
-                        name="handshake-outline"
-                        size={MEMBER_ROW_ICON_SIZE}
-                        color={Colors.text}
-                      />
+                      // Ionicons has no scale, so the settled state borrows
+                      // MaterialCommunityIcons' one.
+                      isSettled ? (
+                        <MaterialCommunityIcons
+                          name="scale-balance"
+                          size={MEMBER_ROW_ICON_SIZE}
+                          color={Colors.text}
+                        />
+                      ) : (
+                        <Ionicons name="cash-outline" size={MEMBER_ROW_ICON_SIZE} color={Colors.text} />
+                      )
                     }
                     label={isSettled ? "You're settled up" : "Settle debt"}
                     title={confirmation.settle.title}
@@ -816,30 +1076,42 @@ function MemberDetailOverlay({
 function MembersPane({
   currency,
   members,
+  viewer,
   balances,
+  groupAccess,
+  needsUnlock,
   onSelectMember,
   onScroll,
+  onContentHeightChange,
   minListHeight,
   footerHeight,
 }: {
   currency: string;
   members: GroupMember[];
+  // Always listed last, after even members who've left.
+  viewer: GroupMember | null;
   balances: Record<string, number>;
+  // For each row's lock / unlock-ending note (see describeMemberAccess).
+  groupAccess: GroupAccess | null;
+  needsUnlock: boolean;
   onSelectMember: (member: GroupMember) => void;
-  // Left undefined below the row threshold â€” see isMembersCollapsible in
+  // Left undefined while too short to collapse â€” see isMembersCollapsible in
   // GroupDetailScreen for why.
   onScroll?: (event: NativeSyntheticEvent<NativeScrollEvent>) => void;
+  // Reports the list's full content height, which is what decides
+  // whether this pane is collapsible in the first place.
+  onContentHeightChange: (height: number) => void;
   minListHeight: number;
   footerHeight: number;
 }) {
   // Active members first; members who've left sink to the bottom rather than
   // interrupting the active list.
-  const sortedMembers = useMemo(
-    () => [...members].sort((a, b) => Number(!a.isActive) - Number(!b.isActive)),
-    [members]
-  );
+  const sortedMembers = useMemo(() => {
+    const sorted = [...members].sort((a, b) => Number(!a.isActive) - Number(!b.isActive));
+    return viewer ? [...sorted, viewer] : sorted;
+  }, [members, viewer]);
 
-  if (members.length === 0) {
+  if (sortedMembers.length === 0) {
     return (
       <View style={styles.pane}>
         <Text style={styles.paneText}>No other members yet</Text>
@@ -855,15 +1127,29 @@ function MembersPane({
       contentContainerStyle={[styles.membersList, { minHeight: minListHeight }]}
       onScroll={onScroll}
       scrollEventThrottle={16}
+      onContentSizeChange={(_width, height) => onContentHeightChange(height)}
       ListFooterComponent={<View style={{ height: footerHeight }} />}
-      renderItem={({ item }) => (
-        <MemberRow
-          member={item}
-          debt={balances[item.id] ?? 0}
-          currency={currency}
-          onPress={() => onSelectMember(item)}
-        />
-      )}
+      renderItem={({ item }) =>
+        item === viewer ? (
+          <MemberRow
+            member={item}
+            debt={0}
+            currency={currency}
+            accessLabel={describeMemberAccess(item, groupAccess, needsUnlock)}
+            isSponsor={item.id === groupAccess?.plan?.sponsorId}
+            isViewer
+          />
+        ) : (
+          <MemberRow
+            member={item}
+            debt={balances[item.id] ?? 0}
+            currency={currency}
+            accessLabel={describeMemberAccess(item, groupAccess, needsUnlock)}
+            isSponsor={item.id === groupAccess?.plan?.sponsorId}
+            onPress={() => onSelectMember(item)}
+          />
+        )
+      }
     />
   );
   // Wrapped in a definite-height box only for a non-collapsible pane
@@ -908,7 +1194,12 @@ function LogRow({
   return (
     <Pressable style={styles.logCard} onPress={onPress}>
       <Text style={styles.logAmount}>{formatLogHeadline(log, payerName, groupCurrency)}</Text>
-      {log.isPending ? (
+      {log.isHeld ? (
+        <View style={styles.logPending}>
+          <Ionicons name="lock-closed-outline" size={14} color={Colors.warning} />
+          <Text style={[styles.logPendingText, styles.logHeldText]}>Needs an unlock</Text>
+        </View>
+      ) : log.isPending ? (
         <View style={styles.logPending}>
           <Ionicons name="cloud-upload-outline" size={14} color={Colors.muted} />
           <Text style={styles.logPendingText}>Waiting to sync</Text>
@@ -932,6 +1223,194 @@ function LogRow({
         </View>
       ) : null}
     </Pressable>
+  );
+}
+
+// resolvePayerName's mid-sentence counterpart ("Alice made you an admin").
+function resolveEventTargetName(
+  targetId: string | null,
+  members: GroupMember[],
+  currentUserId: string
+) {
+  if (targetId === null) return "Deleted user";
+  if (targetId === currentUserId) return "you";
+  return members.find((member) => member.id === targetId)?.name ?? "someone";
+}
+
+// Kept short enough to fit one line at phone width with typical names —
+// EventRow truncates rather than wraps. admin_auto_promoted doesn't name
+// who left: that member_left event is always the entry right below it.
+function formatEventText(event: GroupEvent, members: GroupMember[], currentUserId: string) {
+  const actor = resolvePayerName(event.actorId, members, currentUserId);
+  switch (event.kind) {
+    case "group_created":
+      return `${actor} created the group`;
+    case "member_joined":
+      return `${actor} joined the group`;
+    case "member_left":
+      return `${actor} left the group`;
+    case "member_kicked":
+      return `${actor} removed ${resolveEventTargetName(event.targetId, members, currentUserId)}`;
+    case "admin_promoted":
+      return `${actor} made ${resolveEventTargetName(event.targetId, members, currentUserId)} an admin`;
+    case "admin_auto_promoted":
+      return `${resolvePayerName(event.targetId, members, currentUserId)} became an admin`;
+    case "plan_started":
+      return `${actor} unlocked the group`;
+    case "plan_seat_given":
+      return `${actor} gave ${resolveEventTargetName(event.targetId, members, currentUserId)} a seat`;
+  }
+}
+
+const EVENT_ICONS: Record<GroupEventKind, keyof typeof Ionicons.glyphMap> = {
+  group_created: "flag-outline",
+  member_joined: "enter-outline",
+  member_left: "exit-outline",
+  // Same icon as the member popup's "Kick group member" row.
+  member_kicked: "person-remove-outline",
+  admin_promoted: "shield-outline",
+  admin_auto_promoted: "shield-outline",
+  plan_started: "lock-open-outline",
+  plan_seat_given: "ticket-outline",
+};
+const EVENT_ICON_SIZE = 14;
+const PLAN_EVENT_ICON_CIRCLE = 28;
+
+// "5.10.2026" — the plan cards spell out the full date, unlike
+// formatAccessDate's short "5 Oct".
+function formatPlanEventDate(ms: number) {
+  const date = new Date(ms);
+  return `${date.getDate()}.${date.getMonth() + 1}.${date.getFullYear()}`;
+}
+
+function pluralSeats(count: number) {
+  return `${count} ${count === 1 ? "seat" : "seats"}`;
+}
+
+// "It expires in 12 days, on 5.10.2026." Uses the group's running plan when
+// the event is about it, so an upgrade or renewal since shows up here too;
+// otherwise the plan as it was recorded.
+function formatPlanExpiry(details: PlanEventDetails, runningPlan: GroupPlan | null) {
+  const live = runningPlan?.id === details.planId ? runningPlan : null;
+  const endsAt = live?.endsAt ?? details.endsAt;
+  const willRenew = live?.willRenew ?? details.willRenew ?? false;
+  const date = formatPlanEventDate(endsAt);
+  const msLeft = endsAt - Date.now();
+  if (msLeft <= 0) return `It ended on ${date}.`;
+  const days = Math.ceil(msLeft / 86_400_000);
+  return `It ${willRenew ? "renews" : "expires"} in ${days} ${days === 1 ? "day" : "days"}, on ${date}.`;
+}
+
+// "You and Ben already have a seat. 2 seats left to give out."
+function formatPlanStartSeats(
+  details: PlanEventDetails,
+  members: GroupMember[],
+  currentUserId: string
+) {
+  const holders = details.seatHolders ?? [];
+  const names = holders.map((id) =>
+    id === currentUserId
+      ? "you"
+      : (members.find((member) => member.id === id)?.name ?? "Deleted user")
+  );
+  const left = details.seatCount - holders.length;
+  const leftText = left > 0 ? `${pluralSeats(left)} left to give out.` : "Every seat is taken.";
+  if (names.length === 0) return leftText;
+  const who = capitalize(joinNames(names));
+  const verb = names.length === 1 && names[0] !== "you" ? "has" : "have";
+  return `${who} already ${verb} a seat. ${leftText}`;
+}
+
+// A membership change in the Logs tab. Deliberately a smaller, tinted,
+// single-line card so it always reads as shorter and quieter than the
+// expense cards around it, and not pressable: there's nothing to open.
+// Plan events are the exception (PlanEventCard): buying a plan and handing
+// out its seats matter enough to get a bigger card of their own.
+function EventRow({
+  event,
+  members,
+  currentUserId,
+  groupPlan,
+}: {
+  event: GroupEvent;
+  members: GroupMember[];
+  currentUserId: string;
+  groupPlan: GroupPlan | null;
+}) {
+  // A copy saved on the device before details existed falls back to the
+  // one-line card until the next refresh.
+  if (event.details && (event.kind === "plan_started" || event.kind === "plan_seat_given")) {
+    return (
+      <PlanEventCard
+        event={event}
+        details={event.details}
+        members={members}
+        currentUserId={currentUserId}
+        groupPlan={groupPlan}
+      />
+    );
+  }
+  return (
+    <View style={styles.eventCard}>
+      <Ionicons name={EVENT_ICONS[event.kind]} size={EVENT_ICON_SIZE} color={Colors.eventText} />
+      <Text style={styles.eventText} numberOfLines={1}>
+        {formatEventText(event, members, currentUserId)}
+      </Text>
+    </View>
+  );
+}
+
+function PlanEventCard({
+  event,
+  details,
+  members,
+  currentUserId,
+  groupPlan,
+}: {
+  event: GroupEvent;
+  details: PlanEventDetails;
+  members: GroupMember[];
+  currentUserId: string;
+  groupPlan: GroupPlan | null;
+}) {
+  const isStart = event.kind === "plan_started";
+  const actor = resolvePayerName(event.actorId, members, currentUserId);
+  const title = isStart
+    ? `${actor} bought a ${details.seatCount}-seat plan for this group`
+    : formatEventText(event, members, currentUserId);
+  const seatsLeft = details.seatCount - (details.seatsUsed ?? 0);
+  const lines = isStart
+    ? [
+        formatPlanExpiry(details, groupPlan),
+        formatPlanStartSeats(details, members, currentUserId),
+      ]
+    : [seatsLeft > 0 ? `${pluralSeats(seatsLeft)} left to give out.` : "That was the last seat."];
+
+  return (
+    <View style={styles.planEventCard}>
+      <View style={styles.planEventHeader}>
+        {/* Same star as SponsorBadge, so the purchase reads as the sponsor's. */}
+        <View
+          style={[
+            styles.planEventIcon,
+            { backgroundColor: isStart ? Colors.sponsor : Colors.eventText },
+          ]}
+        >
+          <Ionicons
+            name={isStart ? "star" : "ticket"}
+            size={16}
+            color={Colors.accentText}
+            style={isStart ? { transform: [{ translateY: -1 }] } : undefined}
+          />
+        </View>
+        <Text style={styles.planEventTitle}>{title}</Text>
+      </View>
+      {lines.map((line) => (
+        <Text key={line} style={styles.planEventText}>
+          {line}
+        </Text>
+      ))}
+    </View>
   );
 }
 
@@ -1160,6 +1639,7 @@ function LogDetailOverlay({
   viewerName,
   viewerAvatarUrl,
   viewerIsAdmin,
+  sponsorId,
   groupCurrency,
   onClose,
   onDelete,
@@ -1173,6 +1653,8 @@ function LogDetailOverlay({
   viewerName: string;
   viewerAvatarUrl: string | null;
   viewerIsAdmin: boolean;
+  // The running group plan's sponsor, for their SponsorBadge.
+  sponsorId: string | null;
   groupCurrency: string;
   onClose: () => void;
   onDelete: (log: LogEntry) => void;
@@ -1258,6 +1740,14 @@ function LogDetailOverlay({
                   </Text>
                 ) : null}
 
+                {displayLog.isHeld ? (
+                  <Text style={styles.heldNote}>
+                    Only on this device, and not counted in balances yet
+                    {displayLog.heldReason ? `: ${displayLog.heldReason}` : "."} It syncs once
+                    everyone on it is unlocked.
+                  </Text>
+                ) : null}
+
                 <View style={styles.detailMembersList}>
                   {purchasedFor.map((member) => {
                     const content = (
@@ -1270,6 +1760,7 @@ function LogDetailOverlay({
                             textStyle={styles.avatarText}
                           />
                           {member.isAdmin ? <AdminBadge size={18} /> : null}
+                          {member.id === sponsorId ? <SponsorBadge size={18} /> : null}
                         </View>
                         <Text style={styles.memberName}>{member.name}</Text>
                       </>
@@ -1322,38 +1813,64 @@ function LogDetailOverlay({
   );
 }
 
+// One row of the Logs tab: an expense/settlement or a membership event.
+type LogsPaneItem =
+  | { type: "log"; key: string; createdAt: number; log: LogEntry }
+  | { type: "event"; key: string; createdAt: number; event: GroupEvent };
+
 function LogsPane({
   groupId,
+  events,
   members,
   currentUserId,
   viewerName,
   viewerAvatarUrl,
   viewerIsAdmin,
+  sponsorId,
+  groupPlan,
   groupCurrency,
   onSelectMember,
   onScroll,
+  onContentHeightChange,
   minListHeight,
   footerHeight,
 }: {
   groupId: string;
+  events: GroupEvent[];
   members: GroupMember[];
   currentUserId: string;
   viewerName: string;
   viewerAvatarUrl: string | null;
   viewerIsAdmin: boolean;
+  sponsorId: string | null;
+  // For the plan cards' expiry (see formatPlanExpiry).
+  groupPlan: GroupPlan | null;
   groupCurrency: string;
   onSelectMember: (member: GroupMember) => void;
-  // Left undefined below the row threshold â€” see isLogsCollapsible in
+  // Left undefined while too short to collapse â€” see isLogsCollapsible in
   // GroupDetailScreen for why.
   onScroll?: (event: NativeSyntheticEvent<NativeScrollEvent>) => void;
+  // Reports the list's full content height, which is what decides
+  // whether this pane is collapsible in the first place.
+  onContentHeightChange: (height: number) => void;
   minListHeight: number;
   footerHeight: number;
 }) {
   const { logs, deleteLog } = useLogs();
   const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
-  const groupLogs = logs
-    .filter((log) => log.groupId === groupId)
-    .sort((a, b) => b.createdAt - a.createdAt);
+  // Newest first. The sort is stable, so events that tie on createdAt keep
+  // the order useGroupEvents fetched them in (see its refresh).
+  const items: LogsPaneItem[] = [
+    ...logs
+      .filter((log) => log.groupId === groupId)
+      .map((log) => ({ type: "log" as const, key: `log:${log.id}`, createdAt: log.createdAt, log })),
+    ...events.map((event) => ({
+      type: "event" as const,
+      key: `event:${event.id}`,
+      createdAt: event.createdAt,
+      event,
+    })),
+  ].sort((a, b) => b.createdAt - a.createdAt);
 
   // Closes the log popup before handing off to the member popup, rather than
   // stacking two modals, so the member detail screen (settle/promote/kick)
@@ -1393,7 +1910,7 @@ function LogsPane({
     if (error) Alert.alert("Couldn't delete entry", `${error}\n\nPlease try again.`);
   };
 
-  if (groupLogs.length === 0) {
+  if (items.length === 0) {
     return (
       <View style={styles.pane}>
         <Text style={styles.paneText}>No entries yet</Text>
@@ -1402,26 +1919,45 @@ function LogsPane({
   }
 
   const list = (
-    <Animated.FlatList<LogEntry>
-      data={groupLogs}
-      keyExtractor={(item) => item.id}
+    <Animated.FlatList<LogsPaneItem>
+      data={items}
+      keyExtractor={(item) => item.key}
       style={minListHeight > 0 ? styles.flex : undefined}
       contentContainerStyle={[styles.membersList, { minHeight: minListHeight }]}
       onScroll={onScroll}
       scrollEventThrottle={16}
+      onContentSizeChange={(_width, height) => onContentHeightChange(height)}
+      // Every row in the first pass, not FlatList's default 10: the reported
+      // content height decides isLogsCollapsible, and switching that
+      // remounts this list. If the first 10 rows came in under the threshold
+      // and the rest pushed it over, the remount would start back at 10 rows
+      // and flip it back, over and over. Short event rows make that
+      // in-between range easy to land in. Costs little, since the default
+      // render window already fills in every row of a typical group
+      // right after mount anyway.
+      initialNumToRender={items.length}
       ListFooterComponent={<View style={{ height: footerHeight }} />}
-      renderItem={({ item }) => (
-        <LogRow
-          log={item}
-          members={members}
-          currentUserId={currentUserId}
-          viewerName={viewerName}
-          viewerAvatarUrl={viewerAvatarUrl}
-          viewerIsAdmin={viewerIsAdmin}
-          groupCurrency={groupCurrency}
-          onPress={() => setSelectedLog(item)}
-        />
-      )}
+      renderItem={({ item }) =>
+        item.type === "event" ? (
+          <EventRow
+            event={item.event}
+            members={members}
+            currentUserId={currentUserId}
+            groupPlan={groupPlan}
+          />
+        ) : (
+          <LogRow
+            log={item.log}
+            members={members}
+            currentUserId={currentUserId}
+            viewerName={viewerName}
+            viewerAvatarUrl={viewerAvatarUrl}
+            viewerIsAdmin={viewerIsAdmin}
+            groupCurrency={groupCurrency}
+            onPress={() => setSelectedLog(item.log)}
+          />
+        )
+      }
     />
   );
 
@@ -1438,6 +1974,7 @@ function LogsPane({
         viewerName={viewerName}
         viewerAvatarUrl={viewerAvatarUrl}
         viewerIsAdmin={viewerIsAdmin}
+        sponsorId={sponsorId}
         groupCurrency={groupCurrency}
         onClose={() => setSelectedLog(null)}
         onDelete={handleDelete}
@@ -1680,12 +2217,11 @@ export default function GroupDetailScreen() {
   //
   // Only meaningful for a non-collapsible pane (see nonCollapsibleMinHeight
   // usage below) â€” applying this same viewport-sized floor to a collapsible
-  // (>= MIN_ITEMS_TO_COLLAPSE_HERO row) pane too was actively harmful: if
-  // that pane's real content + footer happened to add up to less than a
-  // full viewport, the floor padded out the *entire remaining difference*
+  // pane too was actively harmful: if that pane's real content + footer
+  // happened to add up to less than a full viewport, the floor padded out the *entire remaining difference*
   // as literal blank space below the last row â€” which is how "half the
-  // screen" of dead space happened. A collapsible-by-count list is already
-  // long enough that it doesn't need this floor for genuine scrollability.
+  // screen" of dead space happened. A collapsible list is by definition
+  // already long enough that it doesn't need this floor to scroll.
   //
   // Subtracts heroHeight because a non-collapsible pane's hero never slides
   // away (scrollGate stays shut for it â€” see below), so contentLayer sits
@@ -1695,8 +2231,8 @@ export default function GroupDetailScreen() {
   // exists below the visible viewport and can never be scrolled into view.
   // Sizing the pane off the full tabViewHeight (as before) let its FlatList
   // believe it had that much real viewport to work with, so a pane whose
-  // rows fell just short of MIN_ITEMS_TO_COLLAPSE_HERO but still added up
-  // to close to a screenful â€” enough to push the trailing footerHeight
+  // rows fell just short of collapsible but still added up to close to a
+  // screenful â€” enough to push the trailing footerHeight
   // spacer past the true (smaller) visible height â€” would stop scrolling
   // heroHeight short of its real end, permanently hiding that spacer (and
   // the last row's intended clearance) behind the summary bar/FAB with no
@@ -1710,12 +2246,11 @@ export default function GroupDetailScreen() {
   // gap sized off the actual device height (BOTTOM_CLEARANCE_GAP_RATIO),
   // not a flat pixel value â€” a flat value either undershoots on a tall
   // device or, as a large one did here, dominates a short one. A
-  // collapsible (>= MIN_ITEMS_TO_COLLAPSE_HERO row) pane used to also bake
-  // heroHeight's worth of extra into this same trailing footer, on the
+  // collapsible pane used to also bake heroHeight's worth of extra into this same trailing footer, on the
   // theory that it needed that much guaranteed scroll *distance* to ever
   // reach fully-collapsed. But that distance is needed early in the
   // scroll, to let the collapse animation finish â€” a real multi-row list's
-  // own natural content is already comfortably taller than a viewport
+  // own natural content is already taller than a viewport plus heroHeight
   // (that's what makes it collapsible in the first place), so it doesn't
   // need extra reserved *at the very end* too; baking it into the
   // permanent trailing footer just left dead space sitting below the last
@@ -1830,26 +2365,35 @@ export default function GroupDetailScreen() {
   const [menuAnchor, setMenuAnchor] = useState<MenuAnchor | null>(null);
   // Set by handleInvite, consumed by handleMenuClosed.
   const pendingInviteRef = useRef(false);
+  // The hidden InviteMotiveCard captured as the invite's preview image.
+  const inviteMotiveCardRef = useRef<View>(null);
   // Opens the invite share sheet for a group fresh out of onboarding, once
   // this screen has finished sliding in rather than on mount, so the sheet
   // isn't presented over a screen still mid-transition. The param is
   // cleared first so it can't fire again (e.g. on a web reload).
-  const groupIdToInvite = invite === "1" ? group?.id : undefined;
+  const groupToInvite = invite === "1" ? group : undefined;
+  const inviterName = profile.name;
   useEffect(() => {
-    if (!groupIdToInvite) return;
+    if (!groupToInvite) return;
     const unsubscribe = navigation.addListener("transitionEnd", (event) => {
       if (event.data.closing) return;
       unsubscribe();
       router.setParams({ invite: undefined });
-      shareInviteLink(groupIdToInvite);
+      shareGroupInvite({
+        groupId: groupToInvite.id,
+        groupName: groupToInvite.name,
+        inviterName,
+        photoUrl: groupToInvite.photoUrl,
+        motiveCardRef: inviteMotiveCardRef,
+      });
     });
     return unsubscribe;
-  }, [groupIdToInvite, navigation]);
+  }, [groupToInvite, inviterName, navigation]);
   const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false);
   // The description's natural (unclamped) rendered height in px â€” measured
   // via an invisible clone rather than guessed from character/newline count,
-  // so "Show more" only appears when the collapsed cap is actually cutting
-  // something off. Null until that measurement lands. onTextLayout would be
+  // so "Show description" only appears once there is measured text to
+  // reveal. Null until that measurement lands. onTextLayout would be
   // the more direct way to get a line count, but react-native-web doesn't
   // implement it at all, so onLayout + a height comparison is what actually
   // works on both web and native.
@@ -1864,7 +2408,7 @@ export default function GroupDetailScreen() {
   // Skips animating the very first time a description's height is measured,
   // and again whenever the description text itself changes (edited or
   // switched groups), so the box doesn't visibly animate open on load/edit â€”
-  // only an actual Show more/less press should animate (see
+  // only an actual Show/Hide description press should animate (see
   // toggleDescription).
   // Opacity of the gradient softening the clip edge (see DescriptionFade).
   // Kept fully on for the whole height animation in both directions so every
@@ -1879,17 +2423,17 @@ export default function GroupDetailScreen() {
   useEffect(() => {
     if (descriptionNaturalHeight === null || hasMeasuredDescriptionRef.current) return;
     hasMeasuredDescriptionRef.current = true;
-    const collapsedHeight = Math.min(descriptionNaturalHeight, DESCRIPTION_COLLAPSED_HEIGHT);
-    descriptionHeightAnim.setValue(isDescriptionExpanded ? descriptionNaturalHeight : collapsedHeight);
+    descriptionHeightAnim.setValue(
+      isDescriptionExpanded ? descriptionNaturalHeight + DESCRIPTION_TOGGLE_GAP : DESCRIPTION_COLLAPSED_HEIGHT
+    );
     descriptionFadeAnim.setValue(isDescriptionExpanded ? 0 : 1);
   }, [descriptionNaturalHeight, isDescriptionExpanded, descriptionHeightAnim, descriptionFadeAnim]);
   const toggleDescription = () => {
     const nextExpanded = !isDescriptionExpanded;
-    const collapsedHeight =
-      descriptionNaturalHeight !== null
-        ? Math.min(descriptionNaturalHeight, DESCRIPTION_COLLAPSED_HEIGHT)
+    const targetHeight =
+      nextExpanded && descriptionNaturalHeight !== null
+        ? descriptionNaturalHeight + DESCRIPTION_TOGGLE_GAP
         : DESCRIPTION_COLLAPSED_HEIGHT;
-    const targetHeight = nextExpanded ? descriptionNaturalHeight ?? DESCRIPTION_COLLAPSED_HEIGHT : collapsedHeight;
     setIsDescriptionExpanded(nextExpanded);
     // Easing.out(cubic) at 320ms front-loads almost all the motion into the
     // first ~15% of the duration, so a single 21px line finishes revealing
@@ -1899,7 +2443,7 @@ export default function GroupDetailScreen() {
     // read as smoothly sliding/uncovering rather than lines appearing.
     Animated.timing(descriptionHeightAnim, {
       toValue: targetHeight,
-      duration: 450,
+      duration: 340,
       easing: Easing.inOut(Easing.cubic),
       useNativeDriver: false,
     }).start(({ finished }) => {
@@ -1908,7 +2452,7 @@ export default function GroupDetailScreen() {
       if (!finished || !nextExpanded) return;
       Animated.timing(descriptionFadeAnim, {
         toValue: 0,
-        duration: 200,
+        duration: 150,
         easing: Easing.out(Easing.quad),
         useNativeDriver: false,
       }).start();
@@ -1918,39 +2462,105 @@ export default function GroupDetailScreen() {
     if (!nextExpanded) {
       Animated.timing(descriptionFadeAnim, {
         toValue: 1,
-        duration: 150,
+        duration: 120,
         easing: Easing.out(Easing.quad),
         useNativeDriver: false,
       }).start();
     }
   };
-  // Whether the collapsed cap actually cuts anything off — gates both the
-  // Show more/less toggle and the bottom-edge fade.
+  // Whether there's measured text for the collapsed box to hide — gates both
+  // the Show/Hide description toggle and the bottom-edge fade.
   const isDescriptionTruncatable =
-    descriptionNaturalHeight !== null && descriptionNaturalHeight > DESCRIPTION_COLLAPSED_HEIGHT + 1;
+    descriptionNaturalHeight !== null && descriptionNaturalHeight > 1;
   const [selectedMember, setSelectedMember] = useState<GroupMember | null>(null);
-  const { logs, settleDebt } = useLogs();
+  const { logs, settleDebt, refresh: refreshLogs } = useLogs();
+  // Entries are otherwise only fetched when the app starts, so without this
+  // someone who just joined wouldn't see the group's earlier entries, and
+  // nobody would see what others added since.
+  useFocusEffect(
+    useCallback(() => {
+      refreshLogs();
+    }, [refreshLogs])
+  );
   const { members: allMembers, refresh: refreshMembers } = useGroupMembers(group?.id);
+  const { events, refresh: refreshEvents } = useGroupEvents(group?.id);
+  const { plansVisible } = useAccess();
+  const { access: groupAccess, refresh: refreshGroupAccess } = useGroupAccess(group?.id);
+  // Coming back from the unlock or plan screens (or anywhere) may mean a new
+  // plan or seat.
+  useRefreshOnRefocus(refreshGroupAccess);
+  // This device's own entries in the group still waiting to sync, which may
+  // use up free entries once they do (held ones were turned down, so don't).
+  const pendingInGroup = logs.filter(
+    (log) => log.groupId === group?.id && log.isPending && !log.isHeld
+  ).length;
+  // The server's count of free entries left goes stale as entries land, so
+  // it's re-fetched whenever the group's synced entries change.
+  const syncedEntryCount = logs.filter(
+    (log) => log.groupId === group?.id && !log.isPending && !log.isSettlement
+  ).length;
+  const lastSyncedEntryCountRef = useRef(syncedEntryCount);
+  useEffect(() => {
+    if (lastSyncedEntryCountRef.current === syncedEntryCount) return;
+    lastSyncedEntryCountRef.current = syncedEntryCount;
+    refreshGroupAccess();
+  }, [syncedEntryCount, refreshGroupAccess]);
+  const needsUnlock = entriesNeedUnlock(groupAccess, pendingInGroup);
+  const viewerNeedsUnlock = needsUnlock && !isMemberUnlocked(groupAccess, session?.user.id ?? "");
   // The list of "other" members is what everything below actually wants;
   // seeing your own name in your own balance list would be meaningless.
   const members = allMembers.filter((member) => member.id !== session?.user.id);
-  const viewerIsAdmin = allMembers.find((member) => member.id === session?.user.id)?.isAdmin ?? false;
-  // Each pane only drives the hero's collapse once it has enough rows to
-  // genuinely scroll (see MIN_ITEMS_TO_COLLAPSE_HERO) â€” group?.id guards
-  // this running before the not-found check below, same as useGroupMembers
-  // above.
-  const groupLogsCount = logs.filter((log) => log.groupId === group?.id).length;
-  const isMembersCollapsible = members.length >= MIN_ITEMS_TO_COLLAPSE_HERO;
-  const isLogsCollapsible = groupLogsCount >= MIN_ITEMS_TO_COLLAPSE_HERO;
+  const viewerMember = allMembers.find((member) => member.id === session?.user.id);
+  const viewerIsAdmin = viewerMember?.isAdmin ?? false;
+  // Your own row at the bottom of the Members tab. Name/picture come from
+  // your profile rather than the member row, so a not-yet-synced change
+  // shows up here straight away.
+  const viewerRow = useMemo(
+    () =>
+      viewerMember
+        ? { ...viewerMember, name: profile.name, avatarUrl: profile.avatarUrl }
+        : null,
+    [viewerMember, profile.name, profile.avatarUrl]
+  );
+  // Each pane only drives the hero's collapse once its content is tall
+  // enough to scroll the hero fully away: a full viewport plus heroHeight.
+  // Any shorter and the list runs out of scroll range with the hero stuck
+  // part-way, its bottom rows pushed below the screen (the list still thinks
+  // it has the full tab area) with no way to scroll them back into view, and
+  // the hero reacts to rubber-band/bounce noise instead of a real scroll.
+  // Measured rather than guessed from a row count, since member rows and log
+  // cards are very different heights. A non-collapsible pane reports at
+  // least nonCollapsibleMinHeight (its content floor), which is always below
+  // this, so the measurement can't flip-flop between the two layouts.
+  // group?.id guards this running before the not-found check below, same as
+  // useGroupMembers above.
+  const [paneContentHeights, setPaneContentHeights] = useState<Record<TabRoute["key"], number>>({
+    members: 0,
+    logs: 0,
+  });
+  const handlePaneContentHeight = (key: TabRoute["key"], height: number) =>
+    setPaneContentHeights((previous) =>
+      previous[key] === height ? previous : { ...previous, [key]: height }
+    );
+  const collapsibleContentHeight = (tabViewHeight || windowHeight) + heroHeight;
+  // Everything LogsPane lists: expenses/settlements plus membership events.
+  const logsPaneItemCount = logs.filter((log) => log.groupId === group?.id).length + events.length;
+  // The counts guard against a stale height left behind by a pane that has
+  // since switched to its empty state (which has no list to re-measure).
+  const isMembersCollapsible =
+    members.length + (viewerRow ? 1 : 0) > 0 &&
+    paneContentHeights.members >= collapsibleContentHeight;
+  const isLogsCollapsible =
+    logsPaneItemCount > 0 && paneContentHeights.logs >= collapsibleContentHeight;
   // Whichever tab is active, if it's not (or no longer) collapsible, the
   // hero should sit fully expanded rather than showing whatever state the
   // other tab's scrolling last left it in â€” scrollY is shared between both
   // panes (see handleMembersScroll/handleLogsScroll above), so switching into a short tab
   // doesn't otherwise reset it on its own. Closing scrollGate (see
   // gatedScrollY above) is what actually guarantees the hero can't move
-  // while inactive; zeroing scrollY itself is just so that if the pane
-  // later becomes collapsible again, the gate reopens onto a clean 0
-  // instead of snapping to whatever scrollY drifted to while gated off.
+  // while inactive. scrollY is left as-is while gated off: whenever the gate
+  // reopens, this effect sets scrollY first, so it never reopens onto
+  // whatever scrollY drifted to in the meantime.
   //
   // A collapsible tab instead gets scrollY restored from its own pane's last
   // recorded offset (see paneScrollOffsets above), so the hero matches
@@ -1967,10 +2577,17 @@ export default function GroupDetailScreen() {
   // are already fully clamped, so starting from a real offset of e.g.
   // 2000px would spend most of the duration visibly doing nothing and then
   // snap at the end â€” clamping changes nothing on screen, and the next real
-  // scroll event puts the true offset back anyway. The gate is only closed
-  // once a non-collapsible tab's ease back to 0 has actually finished
-  // (closing it first would itself be the snap); an interrupted animation
-  // (another quick tab switch) leaves that to the next run of this effect.
+  // scroll event puts the true offset back anyway.
+  //
+  // A non-collapsible tab eases the gate itself shut rather than easing
+  // scrollY back to 0 and closing the gate once that finishes. On device, a
+  // scroll event reaching scrollY cancels any native animation running on it
+  // (e.g. the previous tab's list still settling after a fling to the bottom),
+  // and that left the hero stuck collapsed over a tab whose own list can't
+  // scroll it back. Only this effect ever touches the gate, so nothing can
+  // cancel its animation, and gated at 0 the hero is expanded no matter what
+  // scrollY holds. (Only the active tab's list drives scrollY at all — see
+  // renderScene — this just makes sure a non-collapsible tab can't get stuck.)
   const previousActiveTabKeyRef = useRef<TabRoute["key"] | null>(null);
   useEffect(() => {
     if (!isMembersCollapsible) paneScrollOffsets.delete("members");
@@ -1984,15 +2601,22 @@ export default function GroupDetailScreen() {
     const targetOffset = activeIsCollapsible
       ? Math.min(paneScrollOffsets.get(activeKey) ?? 0, heroHeight)
       : 0;
-    if (activeIsCollapsible) scrollGate.setValue(1);
-    Animated.timing(scrollY, {
-      toValue: targetOffset,
-      duration: TAB_SWITCH_HERO_DURATION_MS,
-      easing: Easing.inOut(Easing.cubic),
-      useNativeDriver: true,
-    }).start(({ finished }) => {
-      if (finished && !activeIsCollapsible) scrollGate.setValue(0);
-    });
+    if (activeIsCollapsible) {
+      scrollGate.setValue(1);
+      Animated.timing(scrollY, {
+        toValue: targetOffset,
+        duration: TAB_SWITCH_HERO_DURATION_MS,
+        easing: Easing.inOut(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    } else {
+      Animated.timing(scrollGate, {
+        toValue: 0,
+        duration: TAB_SWITCH_HERO_DURATION_MS,
+        easing: Easing.inOut(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    }
     Animated.timing(titleClearanceAnim, {
       // Same formula as titleClearanceForOffset, inlined so this effect's
       // deps stay honest (targetOffset is already clamped to 0..heroHeight).
@@ -2018,7 +2642,13 @@ export default function GroupDetailScreen() {
   // settle/promote copy, and the header summary needs the total.
   const balances = useMemo(() => {
     if (!group || !session) return {};
-    return calculateMemberBalances(logs, group.id, session.user.id);
+    // A held entry may never sync (see LogEntry.isHeld), so it isn't counted
+    // until it does.
+    return calculateMemberBalances(
+      logs.filter((log) => !log.isHeld),
+      group.id,
+      session.user.id
+    );
   }, [logs, group, session]);
   const totalBalance = useMemo(
     () => Object.values(balances).reduce((sum, value) => sum + value, 0),
@@ -2096,7 +2726,7 @@ export default function GroupDetailScreen() {
       Alert.alert("Couldn't promote member", error);
       return;
     }
-    await refreshMembers();
+    await Promise.all([refreshMembers(), refreshEvents()]);
     setSelectedMember(null);
   };
 
@@ -2107,7 +2737,7 @@ export default function GroupDetailScreen() {
       Alert.alert("Couldn't remove member", error);
       return;
     }
-    await refreshMembers();
+    await Promise.all([refreshMembers(), refreshEvents()]);
     setSelectedMember(null);
   };
 
@@ -2129,11 +2759,36 @@ export default function GroupDetailScreen() {
   const handleMenuClosed = () => {
     if (!pendingInviteRef.current) return;
     pendingInviteRef.current = false;
-    shareInviteLink(group.id);
+    shareGroupInvite({
+      groupId: group.id,
+      groupName: group.name,
+      inviterName: profile.name,
+      photoUrl: group.photoUrl,
+      motiveCardRef: inviteMotiveCardRef,
+    });
   };
 
+  // Straight to unlocking when the entry form couldn't be submitted anyway.
   const handleAddEntry = () => {
-    router.push({ pathname: "/add-entry", params: { groupId: group.id } });
+    router.push({
+      pathname: viewerNeedsUnlock ? "/unlock" : "/add-entry",
+      params: { groupId: group.id },
+    });
+  };
+
+  const handleOpenPlan = () => {
+    setMenuAnchor(null);
+    router.push({ pathname: "/group-plan", params: { groupId: group.id } });
+  };
+
+  // With no plan yet there's nothing to manage, so the access line goes
+  // straight to buying one ("Entries are locked · Unlock").
+  const handleAccessLinePress = () => {
+    if (groupAccess?.plan) {
+      handleOpenPlan();
+      return;
+    }
+    router.push({ pathname: "/unlock", params: { groupId: group.id } });
   };
 
   // Best-effort check for which confirmation copy the menu shows; leave_group
@@ -2150,6 +2805,17 @@ export default function GroupDetailScreen() {
     goBackOrToGroups();
   };
 
+  // Only the active tab's list drives scrollY. The other tab's list keeps
+  // emitting scroll events for a moment after a switch if it was still
+  // moving (momentum/bounce after a fling), and each one would overwrite
+  // scrollY with that list's offset, cancelling the effect's ease into the
+  // new tab's state. The inactive list still records its offset, so
+  // switching back restores the hero to where that list actually came to
+  // rest rather than where it was at the moment of the switch.
+  const activeTabKey = TAB_ROUTES[tabIndex]?.key ?? "members";
+  const recordPaneOffset =
+    (key: TabRoute["key"]) => (event: NativeSyntheticEvent<NativeScrollEvent>) =>
+      paneScrollOffsets.set(key, event.nativeEvent.contentOffset.y);
   const renderScene = ({ route }: { route: TabRoute }) => {
     switch (route.key) {
       case "members":
@@ -2157,9 +2823,19 @@ export default function GroupDetailScreen() {
           <MembersPane
             currency={group.currency}
             members={members}
+            viewer={viewerRow}
             balances={balances}
+            groupAccess={plansVisible ? groupAccess : null}
+            needsUnlock={needsUnlock}
             onSelectMember={setSelectedMember}
-            onScroll={isMembersCollapsible ? handleMembersScroll : undefined}
+            onScroll={
+              isMembersCollapsible
+                ? activeTabKey === "members"
+                  ? handleMembersScroll
+                  : recordPaneOffset("members")
+                : undefined
+            }
+            onContentHeightChange={(height) => handlePaneContentHeight("members", height)}
             minListHeight={isMembersCollapsible ? 0 : nonCollapsibleMinHeight}
             footerHeight={listFooterHeight}
           />
@@ -2168,14 +2844,24 @@ export default function GroupDetailScreen() {
         return (
           <LogsPane
             groupId={group.id}
+            events={events}
             members={members}
             currentUserId={currentUserId}
             viewerName={profile.name}
             viewerAvatarUrl={profile.avatarUrl}
             viewerIsAdmin={viewerIsAdmin}
+            sponsorId={plansVisible ? (groupAccess?.plan?.sponsorId ?? null) : null}
+            groupPlan={groupAccess?.plan ?? null}
             groupCurrency={group.currency}
             onSelectMember={handleSelectMemberFromLogs}
-            onScroll={isLogsCollapsible ? handleLogsScroll : undefined}
+            onScroll={
+              isLogsCollapsible
+                ? activeTabKey === "logs"
+                  ? handleLogsScroll
+                  : recordPaneOffset("logs")
+                : undefined
+            }
+            onContentHeightChange={(height) => handlePaneContentHeight("logs", height)}
             minListHeight={isLogsCollapsible ? 0 : nonCollapsibleMinHeight}
             footerHeight={listFooterHeight}
           />
@@ -2195,7 +2881,17 @@ export default function GroupDetailScreen() {
 
   return (
     <View style={styles.flex}>
-      {/* Collapsible hero: a full-bleed placeholder today (same pictogram
+      {/* First child, so everything below paints over it — see
+          InviteMotiveCard. Only needed when there's no photo to share
+          instead, and only iOS attaches an image to the invite. */}
+      {Platform.OS === "ios" && !group.photoUrl && (
+        <InviteMotiveCard
+          ref={inviteMotiveCardRef}
+          motive={group.heroMotive}
+          hue={group.heroHue}
+        />
+      )}
+      {/* Collapsible hero:a full-bleed placeholder today (same pictogram
           idea as the group list's cards), somewhere a real photo drops in
           later. Its translateY is driven by scrollY from whichever tab's
           list is being scrolled, so it slides up and out of view together
@@ -2259,9 +2955,8 @@ export default function GroupDetailScreen() {
           {group.description ? (
             <>
               {/* Invisible, unclamped clone purely to measure how tall the
-                  description would really be â€” lets the toggle only appear
-                  when the collapsed cap is actually cutting something off,
-                  instead of guessing from character/newline count. */}
+                  description would really be, which is the height the box
+                  expands to. */}
               <Text
                 style={[styles.description, styles.descriptionMeasure, webWordBreakStyle]}
                 onLayout={(event) => setDescriptionNaturalHeight(event.nativeEvent.layout.height)}
@@ -2270,36 +2965,38 @@ export default function GroupDetailScreen() {
               </Text>
               {/* Always renders the full text â€” animating the wrapper's
                   height (rather than toggling numberOfLines) is what makes
-                  the grow/shrink smooth. DESCRIPTION_COLLAPSED_HEIGHT is an
-                  exact multiple of the line height, so the collapsed clip
-                  always lands on a line boundary rather than mid-line.
-                  width/minWidth:0 fix a web-only flexbox trap: this View is
-                  a flex child, and CSS `word-wrap/overflow-wrap: break-word`
+                  the grow/shrink smooth. Wrapped with the toggle in a gap-less
+                  View so the collapsed (zero-height) box adds no spacing.
+                  width/minWidth:0 (here and on the wrapper) fix a web-only
+                  flexbox trap: these Views are flex children, and CSS
+                  `word-wrap/overflow-wrap: break-word`
                   (RNW's Text default, and webWordBreakStyle below) only
                   affects painting, not a flex item's automatic min-content
                   width â€” so without an explicit width, the browser still
                   sized this box to fit a long unbreakable word instead of
                   wrapping it, which is what actually clipped the word. */}
-              <Animated.View
-                style={{
-                  height: descriptionHeightAnim,
-                  overflow: "hidden",
-                  width: "100%",
-                  minWidth: 0,
-                }}
-              >
-                <Text style={[styles.description, webWordBreakStyle]}>{group.description}</Text>
+              <View style={{ width: "100%", minWidth: 0 }}>
+                <Animated.View
+                  style={{
+                    height: descriptionHeightAnim,
+                    overflow: "hidden",
+                    width: "100%",
+                    minWidth: 0,
+                  }}
+                >
+                  <Text style={[styles.description, webWordBreakStyle]}>{group.description}</Text>
+                  {isDescriptionTruncatable ? (
+                    <DescriptionFade opacity={descriptionFadeAnim} />
+                  ) : null}
+                </Animated.View>
                 {isDescriptionTruncatable ? (
-                  <DescriptionFade opacity={descriptionFadeAnim} />
+                  <Pressable onPress={toggleDescription} hitSlop={8}>
+                    <Text style={styles.showMoreText}>
+                      {isDescriptionExpanded ? "Hide description" : "Show description"}
+                    </Text>
+                  </Pressable>
                 ) : null}
-              </Animated.View>
-              {isDescriptionTruncatable ? (
-                <Pressable onPress={toggleDescription} hitSlop={8}>
-                  <Text style={styles.showMoreText}>
-                    {isDescriptionExpanded ? "Show less" : "Show more"}
-                  </Text>
-                </Pressable>
-              ) : null}
+              </View>
             </>
           ) : null}
 
@@ -2307,6 +3004,16 @@ export default function GroupDetailScreen() {
             <FlagIcon countryCode={currencyCountryCode(group.currency)} width={20} height={14} />
             <Text style={styles.currencyCode}>{group.currency || "Not set"}</Text>
           </View>
+
+          {plansVisible && groupAccess ? (
+            <GroupAccessLine
+              groupAccess={groupAccess}
+              members={allMembers}
+              viewerId={currentUserId}
+              pendingInGroup={pendingInGroup}
+              onPress={handleAccessLinePress}
+            />
+          ) : null}
         </View>
 
         <View style={styles.tabViewWrapper} onLayout={handleTabViewLayout}>
@@ -2340,6 +3047,8 @@ export default function GroupDetailScreen() {
         style={[styles.fab, { bottom: 20 + insets.bottom + SUMMARY_BAR_HEIGHT }]}
         onPress={handleAddEntry}
         hitSlop={4}
+        accessibilityRole="button"
+        accessibilityLabel="Add entry"
       >
         <Ionicons name="add" size={28} color={Colors.accentText} />
       </Pressable>
@@ -2349,6 +3058,7 @@ export default function GroupDetailScreen() {
         onClose={() => setMenuAnchor(null)}
         onEdit={handleEditGroup}
         onInvite={handleInvite}
+        onPlan={plansVisible ? handleOpenPlan : undefined}
         onLeave={handleLeave}
         onClosed={handleMenuClosed}
         canEdit={viewerIsAdmin}
@@ -2363,6 +3073,7 @@ export default function GroupDetailScreen() {
         debt={selectedMember ? (balances[selectedMember.id] ?? 0) : 0}
         currency={group.currency}
         viewerIsAdmin={viewerIsAdmin}
+        sponsorId={plansVisible ? (groupAccess?.plan?.sponsorId ?? null) : null}
         onClose={() => setSelectedMember(null)}
         onSettle={handleSettle}
         onPromote={handlePromote}
@@ -2520,6 +3231,11 @@ const styles = StyleSheet.create({
     fontStyle: "italic",
     color: Colors.muted,
   },
+  heldNote: {
+    fontSize: 13,
+    lineHeight: 18,
+    color: Colors.warning,
+  },
   currencyRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -2530,6 +3246,28 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
     color: Colors.text,
+  },
+  accessLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 4,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  accessLineText: {
+    flex: 1,
+    gap: 2,
+  },
+  accessLineMain: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  accessLinePrompt: {
+    fontSize: 13,
   },
   segmentRow: {
     flexDirection: "row",
@@ -2661,8 +3399,13 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.accent,
     alignItems: "center",
     justifyContent: "center",
-    borderWidth: 2,
+    borderWidth: ADMIN_BADGE_BORDER_WIDTH,
     borderColor: Colors.background,
+  },
+  sponsorBadge: {
+    right: undefined,
+    left: -2,
+    backgroundColor: Colors.sponsor,
   },
   avatarText: {
     color: Colors.accentText,
@@ -2684,6 +3427,11 @@ const styles = StyleSheet.create({
   leftLabel: {
     fontSize: 12,
     color: Colors.muted,
+  },
+  memberAccessNote: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
   },
   memberDivider: {
     width: 1,
@@ -2735,6 +3483,9 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: Colors.muted,
   },
+  logHeldText: {
+    color: Colors.warning,
+  },
   logAvatars: {
     flexDirection: "row",
   },
@@ -2756,6 +3507,60 @@ const styles = StyleSheet.create({
     color: Colors.accentText,
     fontSize: 9,
     fontWeight: "700",
+  },
+  // EventRow's card: same shape as logCard, but tinted and roughly half the
+  // padding/type size, with a single line of text — so it's always shorter
+  // than even an avatar-less expense card.
+  eventCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: Colors.eventSurface,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: Colors.eventBorder,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  eventText: {
+    flexShrink: 1,
+    fontSize: 13,
+    fontWeight: "500",
+    color: Colors.eventText,
+  },
+  // PlanEventCard: the event card's tint, but bigger than an expense card,
+  // since a plan being bought or a seat handed out matters more.
+  planEventCard: {
+    gap: 6,
+    backgroundColor: Colors.eventSurface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: Colors.eventBorder,
+    padding: 14,
+  },
+  planEventHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  planEventIcon: {
+    width: PLAN_EVENT_ICON_CIRCLE,
+    height: PLAN_EVENT_ICON_CIRCLE,
+    borderRadius: PLAN_EVENT_ICON_CIRCLE / 2,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  planEventTitle: {
+    flexShrink: 1,
+    fontSize: 15,
+    fontWeight: "700",
+    color: Colors.eventText,
+  },
+  planEventText: {
+    marginLeft: PLAN_EVENT_ICON_CIRCLE + 10,
+    fontSize: 14,
+    fontWeight: "500",
+    color: Colors.eventText,
   },
   detailBackdrop: {
     position: "absolute",

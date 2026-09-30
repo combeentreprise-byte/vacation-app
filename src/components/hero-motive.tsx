@@ -1,5 +1,13 @@
-import { memo } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Image, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
+import Animated, {
+  Easing,
+  useAnimatedStyle,
+  useSharedValue,
+  withSequence,
+  withTiming,
+} from "react-native-reanimated";
+import { scheduleOnRN } from "react-native-worklets";
 
 import { resolveHeroMotiveVariant } from "@/utils/hero-motive";
 
@@ -74,6 +82,85 @@ export function HeroMotive({
   );
 }
 
+const POP_OUT = { duration: 140, easing: Easing.in(Easing.quad) };
+const POP_OVERSHOOT = 1.06;
+const POP_GROW = { duration: 170, easing: Easing.out(Easing.quad) };
+const POP_SETTLE = { duration: 150, easing: Easing.inOut(Easing.quad) };
+const POP_BACKGROUND = { duration: 260, easing: Easing.inOut(Easing.quad) };
+
+const TRANSFORM_ORIGIN: Record<VerticalAlign, string> = {
+  top: "center top",
+  center: "center",
+  bottom: "center bottom",
+};
+
+// A HeroMotive that "pops" between motives instead of swapping instantly
+// (the create/edit group form's shuffle button): the current artwork shrinks
+// away, the background color slides to the new hue, and the new artwork
+// grows back in with a single slight overshoot. The swap itself waits for
+// the shrink to actually finish, so a new motive is never shown mid-shrink —
+// and shuffling again mid-pop just restarts the shrink from wherever it is.
+export function PopHeroMotive({
+  motive,
+  hue,
+  style,
+  fill = DEFAULT_MOTIVE_FILL,
+  verticalAlign = "center",
+}: HeroMotiveProps) {
+  const [shown, setShown] = useState({ motive, hue });
+  const { Motive, background, line } = resolveHeroMotiveVariant(shown.motive, shown.hue);
+  const targetBackground = resolveHeroMotiveVariant(motive, hue).background;
+
+  const scale = useSharedValue(1);
+  const backgroundColor = useSharedValue(background);
+
+  useEffect(() => {
+    if (motive === shown.motive && hue === shown.hue) return;
+    backgroundColor.set(withTiming(targetBackground, POP_BACKGROUND));
+    scale.set(
+      withTiming(0, POP_OUT, (finished) => {
+        if (finished) scheduleOnRN(setShown, { motive, hue });
+      })
+    );
+  }, [motive, hue, shown, targetBackground, scale, backgroundColor]);
+
+  // Grows the new artwork back in once it has actually been swapped in —
+  // skipped on mount so the first motive just appears.
+  const hasMounted = useRef(false);
+  useEffect(() => {
+    if (!hasMounted.current) {
+      hasMounted.current = true;
+      return;
+    }
+    scale.set(
+      withSequence(withTiming(POP_OVERSHOOT, POP_GROW), withTiming(1, POP_SETTLE))
+    );
+  }, [shown, scale]);
+
+  const containerStyle = useAnimatedStyle(() => ({ backgroundColor: backgroundColor.value }));
+  const artworkStyle = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
+
+  return (
+    <Animated.View style={[styles.container, style, containerStyle]}>
+      <Animated.View
+        style={[
+          styles.popArtwork,
+          { justifyContent: JUSTIFY_CONTENT[verticalAlign], transformOrigin: TRANSFORM_ORIGIN[verticalAlign] },
+          artworkStyle,
+        ]}
+      >
+        <Motive
+          width={fill}
+          height={fill}
+          color={line}
+          holeColor={background}
+          preserveAspectRatio={PRESERVE_ASPECT_RATIO[verticalAlign]}
+        />
+      </Animated.View>
+    </Animated.View>
+  );
+}
+
 type GroupHeroProps = {
   photoUrl: string | null;
   motive: string;
@@ -116,6 +203,11 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
+  },
+  popArtwork: {
+    width: "100%",
+    height: "100%",
+    alignItems: "center",
   },
   photoFill: {
     width: "100%",

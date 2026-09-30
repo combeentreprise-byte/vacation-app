@@ -3,6 +3,7 @@ import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
 import { Colors } from "@/constants/colors";
+import { AccessProvider } from "@/hooks/use-access";
 import { AuthProvider, useAuth } from "@/hooks/use-auth";
 import { GroupsProvider } from "@/hooks/use-groups";
 import { LogsProvider } from "@/hooks/use-logs";
@@ -51,6 +52,18 @@ function RootNavigator() {
             name="scan-pick-group"
             options={{ presentation: "modal", animation: "slide_from_bottom" }}
           />
+          <Stack.Screen
+            name="unlock"
+            options={{ presentation: "modal", animation: "slide_from_bottom" }}
+          />
+          <Stack.Screen
+            name="group-plan"
+            options={{ presentation: "modal", animation: "slide_from_bottom" }}
+          />
+          <Stack.Screen
+            name="plans"
+            options={{ presentation: "modal", animation: "slide_from_bottom" }}
+          />
           <Stack.Screen name="join/[id]" />
         </Stack.Protected>
 
@@ -81,11 +94,13 @@ export default function RootLayout() {
       <AuthProvider>
         <ProfileProvider>
           <GroupsProvider>
-            <LogsProvider>
-              <OnboardingProvider>
-                <RootNavigator />
-              </OnboardingProvider>
-            </LogsProvider>
+            <AccessProvider>
+              <LogsProvider>
+                <OnboardingProvider>
+                  <RootNavigator />
+                </OnboardingProvider>
+              </LogsProvider>
+            </AccessProvider>
           </GroupsProvider>
         </ProfileProvider>
       </AuthProvider>

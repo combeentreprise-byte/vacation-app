@@ -42,6 +42,11 @@ export type LogEntry = {
   // Entered on this device but not on the server yet (see PendingLog) —
   // already counted in balances, just not visible to anyone else so far.
   isPending?: boolean;
+  // A pending entry the server turned down because someone on it isn't
+  // unlocked (see PendingLog.heldReason) — waiting for that to change rather
+  // than syncing, and left out of balances until it does.
+  isHeld?: boolean;
+  heldReason?: string;
 };
 
 type LogRow = {
@@ -74,7 +79,10 @@ function mapLog(row: LogRow): LogEntry {
   };
 }
 
-type NewLogEntry = Omit<LogEntry, "id" | "createdAt" | "isSettlement" | "isPending"> & {
+type NewLogEntry = Omit<
+  LogEntry,
+  "id" | "createdAt" | "isSettlement" | "isPending" | "isHeld" | "heldReason"
+> & {
   // The currency convertedAmount was computed in (the group's currency when
   // the form was submitted). Lets create_log rescale it if the group's
   // currency changes before a queued entry syncs.
@@ -98,6 +106,12 @@ type PendingLog = {
   memberIds: (string | null)[];
   payerIncluded: boolean;
   createdAt: number;
+  // Set when create_log turned it down with PT402: someone on it (maybe you)
+  // isn't unlocked. Kept rather than dropped like other rejections, since
+  // that can change — a seat handed out, a plan bought — and it's retried
+  // whenever the queue syncs. heldReason is the server's own explanation.
+  heldForUnlock?: boolean;
+  heldReason?: string;
 };
 
 function pendingToEntry(log: PendingLog, userId: string): LogEntry {
@@ -114,6 +128,8 @@ function pendingToEntry(log: PendingLog, userId: string): LogEntry {
     isSettlement: false,
     createdAt: log.createdAt,
     isPending: true,
+    isHeld: !!log.heldForUnlock,
+    heldReason: log.heldReason,
   };
 }
 
@@ -135,8 +151,12 @@ type LogsContextValue = {
   settleDebt: (params: SettleDebtParams) => Promise<{ error?: string }>;
   deleteLog: (logId: string) => Promise<{ error?: string }>;
   refresh: () => Promise<void>;
-  // Entries still waiting to reach the server (see PendingLog).
+  // Entries still waiting to reach the server (see PendingLog), held ones
+  // included.
   pendingCount: number;
+  // Tries the queue right away — e.g. after a purchase or a handed-out seat,
+  // which may be what a held entry was waiting for.
+  syncPending: () => void;
 };
 
 const LogsContext = createContext<LogsContextValue | undefined>(undefined);
@@ -199,6 +219,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
     if (!userId || isFlushingRef.current || pendingRef.current.length === 0) return;
     isFlushingRef.current = true;
     const rejected: { log: PendingLog; message: string }[] = [];
+    const newlyHeld: { log: PendingLog; message: string }[] = [];
     let syncedAny = false;
 
     try {
@@ -237,6 +258,22 @@ export function LogsProvider({ children }: { children: ReactNode }) {
         // everything after it queued for the next attempt, in order.
         if (error && isRetryableStatus(status)) break;
 
+        // Someone on it isn't unlocked (see check_entry_access in
+        // schema.sql). Unlike a real rejection that can change, so it stays
+        // queued, marked, rather than being thrown away — and the entries
+        // after it still go ahead.
+        if (error?.code === "PT402") {
+          if (!log.heldForUnlock) newlyHeld.push({ log, message: error.message });
+          savePending(
+            pendingRef.current.map((item) =>
+              item.id === log.id
+                ? { ...item, heldForUnlock: true, heldReason: error.message }
+                : item
+            )
+          );
+          continue;
+        }
+
         savePending(pendingRef.current.filter((item) => item.id !== log.id));
         if (error) {
           // The server actually said no — e.g. you were removed from the
@@ -262,15 +299,29 @@ export function LogsProvider({ children }: { children: ReactNode }) {
 
     if (syncedAny) await refresh();
 
+    const describe = ({ log, message }: { log: PendingLog; message: string }) => {
+      const groupName = groupsRef.current.find((group) => group.id === log.groupId)?.name;
+      const label = log.details ? `"${log.details}"` : `${log.amount} ${log.currency}`;
+      return `${label}${groupName ? ` in ${groupName}` : ""}: ${message}`;
+    };
+
     if (rejected.length > 0) {
-      const lines = rejected.map(({ log, message }) => {
-        const groupName = groupsRef.current.find((group) => group.id === log.groupId)?.name;
-        const label = log.details ? `"${log.details}"` : `${log.amount} ${log.currency}`;
-        return `${label}${groupName ? ` in ${groupName}` : ""}: ${message}`;
-      });
       Alert.alert(
         rejected.length === 1 ? "An entry couldn't be saved" : "Some entries couldn't be saved",
-        lines.join("\n\n")
+        rejected.map(describe).join("\n\n")
+      );
+    }
+
+    // Only when an entry first gets held, not on every retry that still
+    // can't go through.
+    if (newlyHeld.length > 0) {
+      Alert.alert(
+        newlyHeld.length === 1 ? "An entry needs an unlock" : "Some entries need an unlock",
+        `${newlyHeld.map(describe).join("\n\n")}\n\n${
+          newlyHeld.length === 1
+            ? "It's kept on this device and syncs once everyone on it is unlocked. You can also edit or delete it."
+            : "They're kept on this device and sync once everyone on them is unlocked. You can also edit or delete them."
+        }`
       );
     }
   }, [userId, savePending, refresh]);
@@ -311,7 +362,13 @@ export function LogsProvider({ children }: { children: ReactNode }) {
     };
   }, [userId, refresh, flushPending]);
 
-  useSyncTriggers(flushPending, pendingLogs.length > 0);
+  // Held entries still go out on every other trigger, but don't keep the
+  // 30-second retry running on their own: they're waiting on someone being
+  // unlocked, not on the connection.
+  useSyncTriggers(
+    flushPending,
+    pendingLogs.some((log) => !log.heldForUnlock)
+  );
 
   const logs = useMemo(() => {
     if (!userId || pendingLogs.length === 0) return serverLogs;
@@ -368,10 +425,15 @@ export function LogsProvider({ children }: { children: ReactNode }) {
                   details: entry.details,
                   memberIds: entry.memberIds,
                   payerIncluded: entry.payerIncluded,
+                  // An edit (e.g. taking a locked person off it) may be
+                  // exactly what a held entry was waiting for.
+                  heldForUnlock: false,
+                  heldReason: undefined,
                 }
               : log
           )
         );
+        flushPending();
         return {};
       }
 
@@ -396,7 +458,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
       await refresh();
       return {};
     },
-    [savePending, refresh]
+    [savePending, refresh, flushPending]
   );
 
   const settleDebt = useCallback(
@@ -471,6 +533,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
         deleteLog,
         refresh,
         pendingCount: pendingLogs.length,
+        syncPending: flushPending,
       }}
     >
       {children}

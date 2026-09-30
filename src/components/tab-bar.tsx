@@ -1,6 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import type { MaterialTopTabBarProps } from "expo-router/js-top-tabs";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import Animated, {
   Easing,
@@ -29,6 +29,9 @@ const INACTIVE_COLOR = "rgba(32, 138, 239, 0.45)";
 export function TabBar({ state, navigation, onActiveChange }: TabBarProps) {
   const insets = useSafeAreaInsets();
   const activeRouteName = state.routes[state.index].name;
+  // Bumped per tab when it's tapped while already active, so its icon
+  // replays its animation even though the tap itself changes nothing.
+  const [replays, setReplays] = useState<Record<string, number>>({});
 
   useEffect(() => {
     onActiveChange(activeRouteName);
@@ -42,9 +45,15 @@ export function TabBar({ state, navigation, onActiveChange }: TabBarProps) {
           <Pressable
             key={tab.name}
             style={styles.tab}
-            onPress={() => navigation.navigate(tab.name)}
+            onPress={() => {
+              if (isActive) {
+                setReplays((prev) => ({ ...prev, [tab.name]: (prev[tab.name] ?? 0) + 1 }));
+              } else {
+                navigation.navigate(tab.name);
+              }
+            }}
           >
-            <TabIcon tab={tab} isActive={isActive} />
+            <TabIcon tab={tab} isActive={isActive} replay={replays[tab.name] ?? 0} />
             <Text style={[styles.label, { color: isActive ? ACTIVE_COLOR : INACTIVE_COLOR }]}>
               {tab.label}
             </Text>
@@ -59,8 +68,16 @@ export function TabBar({ state, navigation, onActiveChange }: TabBarProps) {
 // off `isActive` rather than the press handler so a swipe between pages
 // triggers it exactly like a tap does — both just change the navigator's
 // active index. Skipped on first mount so the initial tab doesn't animate
-// on app launch.
-function TabIcon({ tab, isActive }: { tab: TabConfig; isActive: boolean }) {
+// on app launch. `replay` changing replays it on the already-active tab.
+function TabIcon({
+  tab,
+  isActive,
+  replay,
+}: {
+  tab: TabConfig;
+  isActive: boolean;
+  replay: number;
+}) {
   const translateY = useSharedValue(0);
   const rotate = useSharedValue(0);
   const scale = useSharedValue(1);
@@ -83,6 +100,8 @@ function TabIcon({ tab, isActive }: { tab: TabConfig; isActive: boolean }) {
         translateY.value = withSequence(
           withTiming(-7, { duration: 130, easing: Easing.out(Easing.quad) }),
           withTiming(0, { duration: 170, easing: Easing.in(Easing.quad) }),
+          withTiming(-3, { duration: 90, easing: Easing.out(Easing.quad) }),
+          withTiming(0, { duration: 110, easing: Easing.in(Easing.quad) }),
         );
         break;
       case "wiggle":
@@ -94,17 +113,15 @@ function TabIcon({ tab, isActive }: { tab: TabConfig; isActive: boolean }) {
         );
         break;
       case "spin":
-        // A full turn, reset to 0 first so repeat visits spin again rather
-        // than animating from 360 to 360. The gear looks identical at 0°
-        // and 360°, so the reset is invisible.
-        rotate.value = 0;
-        rotate.value = withTiming(360, {
+        // A full turn on top of wherever it is now, so a re-tap mid-spin
+        // carries on smoothly instead of snapping back to 0°.
+        rotate.value = withTiming(rotate.value + 360, {
           duration: 750,
           easing: Easing.out(Easing.cubic),
         });
         break;
     }
-  }, [isActive, tab.animation, translateY, rotate, scale]);
+  }, [isActive, replay, tab.animation, translateY, rotate, scale]);
 
   const animatedStyle = useAnimatedStyle(() => ({
     transform: [
