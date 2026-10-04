@@ -18,19 +18,19 @@ import {
   type PlanPeriod,
 } from "@/constants/plans";
 import type { GroupPlan } from "@/hooks/use-group-access";
-import { formatAccessDate } from "@/utils/access";
+import { formatAccessDate, formatPlanEnd } from "@/utils/access";
 
 const DAY_MS = 86_400_000;
 
 // Overshoots its target once, slightly, and settles — a hop, not a wobble.
-const HOP_ANIMATION = { duration: 320, easing: Easing.out(Easing.back(1.4)) };
+export const HOP_ANIMATION = { duration: 320, easing: Easing.out(Easing.back(1.4)) };
 
-type ChoiceOption<T> = { key: T; label: string; detail?: string };
+export type ChoiceOption<T> = { key: T; label: string; detail?: string };
 
 // A row of equal boxes, one picked. The picked box's blue border is a single
 // outline that hops sideways over to the next pick instead of each box
 // switching its own border.
-function ChoiceRow<T extends string | number>({
+export function ChoiceRow<T extends string | number>({
   options,
   selected,
   onSelect,
@@ -130,10 +130,15 @@ export function PlanUpgradeCard({
   const targetPeriod: PlanPeriod | null = lengthen ? "two_weeks" : null;
   const endsAt = lengthen ? lengthenedEndsAt : plan.endsAt;
   const isChange = seatCount !== plan.seatCount || lengthen;
+  // Only the difference between the new plan and what the current one cost,
+  // rounded to whole cents (the subtraction can leave float dust).
   const price = currentPeriod
     ? Math.max(
-        planPrice(targetPeriod ?? currentPeriod.key, seatCount) -
-          planPrice(currentPeriod.key, plan.seatCount),
+        Math.round(
+          (planPrice(targetPeriod ?? currentPeriod.key, seatCount) -
+            planPrice(currentPeriod.key, plan.seatCount)) *
+            100
+        ) / 100,
         0
       )
     : null;
@@ -150,7 +155,13 @@ export function PlanUpgradeCard({
       <View style={styles.header}>
         <Text style={styles.title}>Upgrade plan</Text>
         <Text style={styles.summary}>
-          Up to {seatCount} people, {plan.willRenew ? "renews" : "until"} {formatAccessDate(endsAt)}
+          Up to {seatCount} people,{" "}
+          {formatPlanEnd(
+            endsAt,
+            plan.willRenew,
+            lengthen ? 14 : plan.durationDays,
+            `${plan.willRenew ? "renews" : "until"} ${formatAccessDate(endsAt)}`
+          )}
         </Text>
       </View>
 

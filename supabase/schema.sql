@@ -109,6 +109,25 @@ alter table public.group_members add column if not exists is_admin boolean not n
 -- first. Only ever written through set_group_pinned below.
 alter table public.group_members add column if not exists pinned_at timestamptz;
 
+-- The group's sponsor: whoever set up its group pass (set_up_plan), or
+-- whoever took over when the sponsor before them left (leave_group). At most
+-- one per group, always an admin as well (so every admin check covers them),
+-- and on top of that they can't be removed (kick_member) and can demote
+-- admins (demote_admin). Kept after the plan ends; setting up a new pass for
+-- the group moves it to whoever set that one up. Cleared on leaving, like
+-- is_admin, and never handed back on rejoining.
+alter table public.group_members add column if not exists is_sponsor boolean not null default false;
+alter table public.group_members drop constraint if exists group_members_sponsor_is_admin;
+alter table public.group_members add constraint group_members_sponsor_is_admin
+  check (not is_sponsor or is_admin);
+create unique index if not exists group_members_one_sponsor_idx
+  on public.group_members (group_id) where is_sponsor;
+-- Set once someone leaves while sponsor, so leave_group never hands the role
+-- back to them after a rejoin (rejoining keeps the old joined_at, which would
+-- otherwise make them first in line). Setting up a new pass for the group
+-- still makes them its sponsor again.
+alter table public.group_members add column if not exists left_as_sponsor boolean not null default false;
+
 -- Backfill for groups that already existed before is_admin was added: make
 -- each group's original creator an admin of their own group, so existing
 -- groups don't suddenly become uneditable by everyone.
@@ -180,8 +199,9 @@ create table if not exists public.log_members (
 --
 -- actor_id is who did it: the creator, the joiner/leaver, the admin who
 -- removed/promoted someone, the sponsor who bought a plan or whoever handed
--- out one of its seats, or for admin_auto_promoted, the admin whose leaving
--- caused it. target_id is who it was done to (null for kinds with no
+-- out one of its seats, the sponsor who demoted an admin, or for
+-- admin_auto_promoted / sponsor_handed_over, the admin / sponsor whose
+-- leaving caused it. target_id is who it was done to (null for kinds with no
 -- target). Both are "on delete set null" for the same reason as
 -- logs.paid_by: a deleted account's history stays, just anonymized.
 --
@@ -209,8 +229,11 @@ alter table public.group_events add constraint group_events_kind_check
     'member_kicked',
     'admin_promoted',
     'admin_auto_promoted',
+    'admin_demoted',
+    'sponsor_handed_over',
     'plan_started',
-    'plan_seat_given'
+    'plan_seat_given',
+    'plan_seat_removed'
   ));
 
 create index if not exists group_events_group_id_created_at_idx
@@ -339,25 +362,28 @@ alter table public.group_members add constraint group_members_user_id_fkey
 -- Single row (the check pins its key to true). paywall_enabled starts off,
 -- which leaves everyone unlocked until it's switched on by hand — and is the
 -- way to switch the paywall back off if billing ever breaks.
--- free_entries_per_user mirrors FREE_ENTRIES_PER_USER in
+-- free_entries_per_group mirrors FREE_ENTRIES_PER_GROUP in
 -- src/constants/limits.ts, which the client only falls back to before it has
 -- ever reached the server.
 create table if not exists public.billing_settings (
   id boolean primary key default true check (id),
   paywall_enabled boolean not null default false,
-  free_entries_per_user integer not null default 5 check (free_entries_per_user >= 0)
+  free_entries_per_group integer not null default 15 check (free_entries_per_group >= 0)
 );
 
--- The free allowance used to be per group (free_entries_per_group, counted by
--- groups.logged_entries).
+-- The free allowance was briefly 5 per person in each group
+-- (free_entries_per_user). Every group now shares one pool of 15, and every
+-- group starts it fresh (see free_entry_usage).
 do $$
 begin
   if exists (
     select 1 from information_schema.columns
     where table_schema = 'public' and table_name = 'billing_settings'
-      and column_name = 'free_entries_per_group'
+      and column_name = 'free_entries_per_user'
   ) then
-    alter table public.billing_settings rename column free_entries_per_group to free_entries_per_user;
+    alter table public.billing_settings rename column free_entries_per_user to free_entries_per_group;
+    alter table public.billing_settings alter column free_entries_per_group set default 15;
+    update public.billing_settings set free_entries_per_group = 15;
   end if;
 end $$;
 
@@ -380,32 +406,55 @@ create table if not exists public.billing_testers (
 -- ends_at either way. will_renew is only ever true for a subscription that
 -- hasn't been cancelled. store_transaction_id makes granting a store
 -- purchase safe to repeat.
+-- A Trip Pass is bought before it's set up: until its sponsor picks when it
+-- starts (and, for a group size, which group it's for) through set_up_plan,
+-- starts_at/ends_at are null, it has no seats and doesn't count down.
+-- duration is how long it runs once started. A subscription is always
+-- "Just me" and starts the moment it's bought.
 create table if not exists public.plans (
   id uuid primary key default gen_random_uuid(),
   sponsor_id uuid references public.profiles (id) on delete set null,
   group_id uuid references public.groups (id) on delete set null,
   kind text not null check (kind in ('trip_pass', 'subscription')),
   seat_count integer not null check (seat_count > 0),
-  starts_at timestamptz not null default now(),
-  ends_at timestamptz not null,
+  starts_at timestamptz,
+  ends_at timestamptz,
+  duration interval not null,
   will_renew boolean not null default false,
   source text not null check (source in ('test', 'comp', 'store')),
   product_id text,
   store_transaction_id text unique,
   created_at timestamptz not null default now(),
-  check (ends_at > starts_at)
+  check (ends_at > starts_at),
+  constraint plans_set_up_check check ((starts_at is null) = (ends_at is null))
 );
+
+-- Every plan used to start the moment it was bought.
+alter table public.plans add column if not exists duration interval;
+update public.plans set duration = ends_at - starts_at where duration is null;
+alter table public.plans alter column duration set not null;
+alter table public.plans alter column starts_at drop default;
+alter table public.plans alter column starts_at drop not null;
+alter table public.plans alter column ends_at drop not null;
+alter table public.plans drop constraint if exists plans_set_up_check;
+alter table public.plans add constraint plans_set_up_check
+  check ((starts_at is null) = (ends_at is null));
 
 create index if not exists plans_group_id_idx on public.plans (group_id);
 create index if not exists plans_sponsor_id_idx on public.plans (sponsor_id);
 
--- A seat stays with its holder for the whole plan, no matter what: leaving
--- or being removed from the group doesn't free it (they stay unlocked, in
--- any group), and neither does deleting their account — user_id just becomes
--- null, and the seat stays taken. So a sponsor can never pass one seat
--- around to cover more people than they paid for. Nothing releases a seat
--- today; released_at is kept for when something will (e.g. a refund), and
--- every check already counts only unreleased seats.
+-- Until a pass starts, its manager can take a seat back and give it to
+-- someone else (remove_plan_seat) — it hasn't unlocked anyone yet — and
+-- leaving or being removed from the group takes it back by itself
+-- (free_pending_plan_seat), as does deleting the account (delete_account).
+-- Once it has started, a seat stays with its holder for the whole plan, no
+-- matter what: leaving or being removed from the group doesn't free it (they
+-- stay unlocked, in any group), and neither does deleting their account —
+-- user_id just becomes null, and the seat stays taken. So a sponsor can never
+-- pass one seat around to cover more people than they paid for. Nothing
+-- releases a started plan's seat today; released_at is kept for when
+-- something will (e.g. a refund), and every check already counts only
+-- unreleased seats.
 create table if not exists public.plan_seats (
   id uuid primary key default gen_random_uuid(),
   plan_id uuid not null references public.plans (id) on delete cascade,
@@ -426,31 +475,26 @@ create index if not exists plan_seats_user_id_idx on public.plan_seats (user_id)
 
 alter table public.groups drop column if exists logged_entries;
 
--- How many of their free entries each person has used in each group (see
--- check_entry_access). Only ever counts up, so deleting an entry doesn't hand
--- a free one back. No row yet means none used. No client access at all, or
--- anyone could hand themselves fresh free entries.
--- (Briefly counted per person across all groups, with no group_id; that
--- version is dropped rather than migrated, since its counts can't be split by
--- group.)
+-- How many of its free entries each group has used, shared by all its
+-- members (see check_entry_access). Only ever counts up, so deleting an entry
+-- doesn't hand a free one back. No row yet means none used. No client access
+-- at all, or anyone could hand their group fresh free entries.
+-- (Was counted per person, first across all groups, then in each group; both
+-- versions had a user_id and are dropped rather than migrated, so every group
+-- starts its shared pool fresh.)
 do $$
 begin
   if exists (
-    select 1 from information_schema.tables
-    where table_schema = 'public' and table_name = 'free_entry_usage'
-  ) and not exists (
     select 1 from information_schema.columns
-    where table_schema = 'public' and table_name = 'free_entry_usage' and column_name = 'group_id'
+    where table_schema = 'public' and table_name = 'free_entry_usage' and column_name = 'user_id'
   ) then
     drop table public.free_entry_usage;
   end if;
 end $$;
 
 create table if not exists public.free_entry_usage (
-  user_id uuid not null references public.profiles (id) on delete cascade,
-  group_id uuid not null references public.groups (id) on delete cascade,
-  used integer not null default 0 check (used >= 0),
-  primary key (user_id, group_id)
+  group_id uuid primary key references public.groups (id) on delete cascade,
+  used integer not null default 0 check (used >= 0)
 );
 
 -- ---------------------------------------------------------------------------
@@ -491,6 +535,22 @@ as $$
       and user_id = auth.uid()
       and left_at is null
       and is_admin = true
+  );
+$$;
+
+create or replace function public.is_group_sponsor(target_group_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from public.group_members
+    where group_id = target_group_id
+      and user_id = auth.uid()
+      and left_at is null
+      and is_sponsor = true
   );
 $$;
 
@@ -536,11 +596,41 @@ as $$
     and p.ends_at > p_at;
 $$;
 
--- Who hands out a group plan's seats: its sponsor while they're still active
--- in its group, otherwise that group's admins, so a sponsor leaving, being
--- removed or deleting their account mid-trip doesn't strand the seats
--- everyone else's unlock depends on. A "Just me" plan has no one to hand
--- seats to.
+-- Whether p_user_id will be unlocked at p_at, a moment that may still be
+-- ahead (when a pass is set up to start): unlocked_until, plus a running
+-- subscription of theirs that renews, which counts as covering any later
+-- date. A subscription is treated as if it's never cancelled; whoever
+-- cancels one later takes that on themselves. Callers renew lapsed test
+-- subscriptions first, so a running one hasn't lapsed just for want of a
+-- read. Not callable by clients, same as unlocked_until.
+create or replace function public.unlocked_on(p_user_id uuid, p_at timestamptz)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select public.unlocked_until(p_user_id, p_at) is not null
+    or exists (
+      select 1
+      from public.plan_seats s
+      join public.plans p on p.id = s.plan_id
+      where s.user_id = p_user_id
+        and s.released_at is null
+        and p.kind = 'subscription'
+        and p.will_renew
+        and p.starts_at <= now()
+        and p.ends_at > now()
+        and p.starts_at <= p_at
+    );
+$$;
+
+-- Who hands out a group plan's seats: the group's sponsor (group_members.
+-- is_sponsor) — whoever set the pass up, or whoever took over from them when
+-- they left (leave_group), so a sponsor leaving or deleting their account
+-- mid-trip doesn't strand the seats everyone else's unlock depends on, and
+-- rejoining doesn't hand it back. Only if the group somehow has no sponsor,
+-- its admins. A "Just me" plan has no one to hand seats to.
 create or replace function public.can_manage_plan(p_plan_id uuid)
 returns boolean
 language sql
@@ -552,29 +642,85 @@ as $$
     select 1 from public.plans p
     where p.id = p_plan_id
       and p.group_id is not null
-      and public.is_group_member(p.group_id)
       and (
-        p.sponsor_id = auth.uid()
+        public.is_group_sponsor(p.group_id)
         or (
           public.is_group_admin(p.group_id)
           and not exists (
             select 1 from public.group_members gm
-            where gm.group_id = p.group_id
-              and gm.user_id = p.sponsor_id
-              and gm.left_at is null
+            where gm.group_id = p.group_id and gm.is_sponsor
           )
         )
       )
   );
 $$;
 
+-- Takes p_user_id's seat back on p_group_id's pass that hasn't started yet,
+-- called when they leave the group (leave_group) or are removed from it
+-- (kick_member) — a seat that never unlocked them shouldn't stay held for
+-- someone who may never come back. Its manager can give it to someone else,
+-- or back to them if they rejoin, before or after the start
+-- (assign_plan_seats). Records plan_seat_removed with p_actor_id (the
+-- leaver themselves, or whoever removed them). Returns that pass, or null if
+-- the group has none still to start. Seats on a pass that has started stay
+-- with their holder (see plan_seats). Not callable by clients (see the grants
+-- section).
+create or replace function public.free_pending_plan_seat(
+  p_group_id uuid,
+  p_user_id uuid,
+  p_actor_id uuid
+)
+returns public.plans
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  pending_plan public.plans;
+begin
+  select * into pending_plan
+  from public.plans
+  where group_id = p_group_id and starts_at > now()
+  for update;
+
+  if not found then
+    return null;
+  end if;
+
+  delete from public.plan_seats
+  where plan_id = pending_plan.id and user_id = p_user_id and released_at is null;
+
+  if found then
+    insert into public.group_events (group_id, kind, actor_id, target_id, details)
+    values (
+      p_group_id, 'plan_seat_removed', p_actor_id, p_user_id,
+      jsonb_build_object(
+        'plan_id', pending_plan.id,
+        'seat_count', pending_plan.seat_count,
+        'seats_used', (
+          select count(*) from public.plan_seats
+          where plan_id = pending_plan.id and released_at is null
+        ),
+        'starts_at', pending_plan.starts_at,
+        'ends_at', pending_plan.ends_at
+      )
+    );
+  end if;
+
+  return pending_plan;
+end;
+$$;
+
 -- Lets an entry being added or edited through, or raises PT402. It goes
--- through when the caller and every person in p_member_ids is unlocked at
--- p_at; otherwise it uses up one of the caller's free entries in p_group_id
--- (everyone gets billing_settings.free_entries_per_user in each group,
+-- through when the caller and every person in p_member_ids are unlocked at
+-- p_at, or failing that all are now; otherwise it uses up one of p_group_id's
+-- free entries (each group shares billing_settings.free_entries_per_group,
 -- counted in free_entry_usage), and only once those are gone is it refused.
--- Only the caller's own free entries count, so a locked person can use theirs
--- on an entry split with anyone.
+-- Checking now as well is what lets an entry the paywall held back (see
+-- use-logs.tsx) through once everyone on it is unlocked: p_at is when it was
+-- typed, which a plan bought or a seat given afterwards doesn't cover.
+-- While the group has free entries, anyone can add one split with anyone;
+-- after that, only unlocked people can, among themselves.
 -- Skipped entirely while the paywall is off. PT402 is what the client's
 -- offline queue looks for to hold an entry rather than drop it (see
 -- use-logs.tsx), and PostgREST answers it with HTTP 402. A null in
@@ -598,44 +744,53 @@ declare
   used_count integer;
   locked_names text[];
   name_list text;
+  check_at timestamptz;
 begin
   select * into settings from public.billing_settings;
   if not coalesce(settings.paywall_enabled, false) then
     return;
   end if;
 
-  caller_unlocked := public.unlocked_until(auth.uid(), p_at) is not null;
+  perform public.renew_test_subscriptions();
 
-  select array_agg(coalesce(pr.name, 'Someone') order by pr.name)
-  into locked_names
-  from (
-    select distinct member_id
-    from unnest(p_member_ids) as member_id
-    where member_id is not null and member_id <> auth.uid()
-  ) people
-  left join public.profiles pr on pr.id = people.member_id
-  where public.unlocked_until(people.member_id, p_at) is null;
+  -- p_at first, then now (the same moment for an entry made just now). The
+  -- refusal below explains what the last check found.
+  foreach check_at in array
+    case when p_at < now() then array[p_at, now()] else array[p_at] end
+  loop
+    caller_unlocked := public.unlocked_until(auth.uid(), check_at) is not null;
 
-  if caller_unlocked and locked_names is null then
-    return;
-  end if;
+    select array_agg(coalesce(pr.name, 'Someone') order by pr.name)
+    into locked_names
+    from (
+      select distinct member_id
+      from unnest(p_member_ids) as member_id
+      where member_id is not null and member_id <> auth.uid()
+    ) people
+    left join public.profiles pr on pr.id = people.member_id
+    where public.unlocked_until(people.member_id, check_at) is null;
 
-  -- Locked until this commits, so two entries racing for someone's last
+    if caller_unlocked and locked_names is null then
+      return;
+    end if;
+  end loop;
+
+  -- Locked until this commits, so two entries racing for the group's last
   -- free entry can't both get it.
-  insert into public.free_entry_usage (user_id, group_id) values (auth.uid(), p_group_id)
-  on conflict (user_id, group_id) do nothing;
+  insert into public.free_entry_usage (group_id) values (p_group_id)
+  on conflict (group_id) do nothing;
   select used into used_count from public.free_entry_usage
-  where user_id = auth.uid() and group_id = p_group_id
+  where group_id = p_group_id
   for update;
 
-  if used_count < settings.free_entries_per_user then
+  if used_count < settings.free_entries_per_group then
     update public.free_entry_usage set used = used + 1
-    where user_id = auth.uid() and group_id = p_group_id;
+    where group_id = p_group_id;
     return;
   end if;
 
   if not caller_unlocked then
-    raise exception 'You''ve used your free entries in this group, so you need an unlock to add or edit entries.'
+    raise exception 'This group''s free entries are used up, so you need an unlock to add or edit entries.'
       using errcode = 'PT402';
   end if;
 
@@ -1104,11 +1259,23 @@ grant execute on function public.get_group_preview(uuid) to authenticated;
 -- them back out as a plain member rather than silently restoring admin
 -- rights from a stale flag on the old row.
 --
--- Records a member_left event, plus an admin_auto_promoted one (actor = the
--- leaver, target = the new admin) when the hand-off above happens. Only an
--- active member can leave: calling this for a group you're not active in
--- does nothing, rather than recording a second "left" or running the
--- hand-off/delete checks on someone else's behalf.
+-- The sponsor role is handed off the same way, first: if the leaver was the
+-- group's sponsor, it goes to the longest-standing remaining admin, or the
+-- longest-standing remaining member if there's no other admin (who then
+-- becomes an admin too, since a sponsor always is one). The leaver's
+-- is_sponsor is cleared like is_admin, so they don't get it back on a
+-- rejoin — the app warns them before they leave.
+--
+-- A seat the leaver holds on the group's pass that hasn't started yet is
+-- taken back (free_pending_plan_seat); if they were the sponsor, the new one
+-- gets a seat in their place when they need one.
+--
+-- Records a member_left event, plus a sponsor_handed_over / an
+-- admin_auto_promoted one (actor = the leaver, target = the new sponsor /
+-- admin) when a hand-off above happens. Only an active member can leave:
+-- calling this for a group you're not active in does nothing, rather than
+-- recording a second "left" or running the hand-off/delete checks on
+-- someone else's behalf.
 create or replace function public.leave_group(p_group_id uuid)
 returns void
 language plpgsql
@@ -1118,16 +1285,28 @@ as $$
 declare
   remaining_active_count integer;
   next_admin_id uuid;
+  next_sponsor_id uuid;
+  was_sponsor boolean;
+  pending_plan public.plans;
 begin
-  update public.group_members
-  set left_at = now(), is_admin = false, pinned_at = null
+  -- Locked, so a concurrent leave can't read the role before this clears it.
+  select is_sponsor into was_sponsor
+  from public.group_members
   where group_id = p_group_id
     and user_id = auth.uid()
-    and left_at is null;
+    and left_at is null
+  for update;
 
   if not found then
     return;
   end if;
+
+  update public.group_members
+  set left_at = now(), is_admin = false, is_sponsor = false, pinned_at = null,
+    left_as_sponsor = left_as_sponsor or was_sponsor
+  where group_id = p_group_id
+    and user_id = auth.uid()
+    and left_at is null;
 
   select count(*) into remaining_active_count
   from public.group_members
@@ -1141,6 +1320,62 @@ begin
 
   insert into public.group_events (group_id, kind, actor_id)
   values (p_group_id, 'member_left', auth.uid());
+
+  -- Their seat on a pass that hasn't started goes back to whoever manages it.
+  pending_plan := public.free_pending_plan_seat(p_group_id, auth.uid(), auth.uid());
+
+  if was_sponsor then
+    select user_id into next_sponsor_id
+    from public.group_members
+    where group_id = p_group_id and left_at is null and not left_as_sponsor
+    order by is_admin desc, joined_at asc
+    limit 1;
+
+    -- Nobody left who hasn't given the role up before: the group goes
+    -- without a sponsor, and its admins manage the plan (can_manage_plan).
+    if next_sponsor_id is not null then
+      update public.group_members
+      set is_sponsor = true, is_admin = true
+      where group_id = p_group_id and user_id = next_sponsor_id;
+
+      insert into public.group_events (group_id, kind, actor_id, target_id)
+      values (p_group_id, 'sponsor_handed_over', auth.uid(), next_sponsor_id);
+    end if;
+
+    -- On a pass that hasn't started yet, the duty to hold a seat passes on
+    -- with the role: the new sponsor gets one (likely the leaver's, just
+    -- freed above) unless something else unlocks them when it starts (the
+    -- same rule as set_up_plan) or the pass is full — then it's up to them
+    -- to make room (remove_plan_seat won't take their own).
+    if pending_plan.id is not null then
+      perform public.renew_test_subscriptions();
+      if next_sponsor_id is not null
+        and not exists (
+          select 1 from public.plan_seats
+          where plan_id = pending_plan.id and user_id = next_sponsor_id and released_at is null
+        )
+        and not public.unlocked_on(next_sponsor_id, pending_plan.starts_at)
+        and (
+          select count(*) from public.plan_seats
+          where plan_id = pending_plan.id and released_at is null
+        ) < pending_plan.seat_count then
+        insert into public.plan_seats (plan_id, user_id) values (pending_plan.id, next_sponsor_id);
+        insert into public.group_events (group_id, kind, actor_id, target_id, details)
+        values (
+          p_group_id, 'plan_seat_given', auth.uid(), next_sponsor_id,
+          jsonb_build_object(
+            'plan_id', pending_plan.id,
+            'seat_count', pending_plan.seat_count,
+            'seats_used', (
+              select count(*) from public.plan_seats
+              where plan_id = pending_plan.id and released_at is null
+            ),
+            'ends_at', pending_plan.ends_at
+          )
+        );
+      end if;
+    end if;
+  end if;
 
   if not exists (
     select 1 from public.group_members
@@ -1222,6 +1457,11 @@ grant execute on function public.promote_to_admin(uuid, uuid) to authenticated;
 -- Same conditional-update shape as promote_to_admin, for the same reason:
 -- two admins removing the same person at once record one member_kicked
 -- event, and the second gets the "not an active member" error.
+--
+-- The group's sponsor can't be removed by anyone (the update skips them),
+-- so the sponsor role never needs a hand-off here. A seat the removed member
+-- holds on the group's pass that hasn't started yet is taken back
+-- (free_pending_plan_seat), same as when they leave.
 create or replace function public.kick_member(p_group_id uuid, p_user_id uuid)
 returns void
 language plpgsql
@@ -1239,18 +1479,71 @@ begin
 
   update public.group_members
   set left_at = now(), is_admin = false, pinned_at = null
-  where group_id = p_group_id and user_id = p_user_id and left_at is null;
+  where group_id = p_group_id and user_id = p_user_id and left_at is null
+    and is_sponsor = false;
 
   if not found then
+    if exists (
+      select 1 from public.group_members
+      where group_id = p_group_id and user_id = p_user_id and is_sponsor
+    ) then
+      raise exception 'The group''s sponsor can''t be removed';
+    end if;
     raise exception 'That person is not an active member of this group';
   end if;
 
   insert into public.group_events (group_id, kind, actor_id, target_id)
   values (p_group_id, 'member_kicked', auth.uid(), p_user_id);
+
+  perform public.free_pending_plan_seat(p_group_id, p_user_id, auth.uid());
 end;
 $$;
 
 grant execute on function public.kick_member(uuid, uuid) to authenticated;
+
+-- Takes admin away from another active member, sponsor-only. The sponsor
+-- stays an admin themselves (it's part of the role), so the group always
+-- keeps at least one. Same conditional-update shape as promote_to_admin:
+-- demoting someone who isn't an admin is a no-op, and two demotions at once
+-- record one admin_demoted event.
+create or replace function public.demote_admin(p_group_id uuid, p_user_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_group_sponsor(p_group_id) then
+    raise exception 'Only the group''s sponsor can demote an admin';
+  end if;
+
+  update public.group_members
+  set is_admin = false
+  where group_id = p_group_id
+    and user_id = p_user_id
+    and left_at is null
+    and is_admin = true
+    and is_sponsor = false;
+
+  if not found then
+    if p_user_id = auth.uid() then
+      raise exception 'The sponsor is always an admin';
+    end if;
+    if exists (
+      select 1 from public.group_members
+      where group_id = p_group_id and user_id = p_user_id and left_at is null
+    ) then
+      return;
+    end if;
+    raise exception 'That person is not an active member of this group';
+  end if;
+
+  insert into public.group_events (group_id, kind, actor_id, target_id)
+  values (p_group_id, 'admin_demoted', auth.uid(), p_user_id);
+end;
+$$;
+
+grant execute on function public.demote_admin(uuid, uuid) to authenticated;
 
 -- Pins/unpins a group on the caller's own group list, capped at 3 pinned
 -- groups (mirrors MAX_PINNED_GROUPS in src/constants/limits.ts). An RPC
@@ -1340,9 +1633,13 @@ grant execute on function public.join_group(uuid) to authenticated;
 -- log_members.user_id are all "on delete set null" (see migration above)
 -- specifically so this can never retroactively change another member's
 -- historical balance; the client renders a null paid_by/member as
--- "Deleted user" instead. Their plan seats go with their profile (freeing
--- them up for the sponsor to hand out again), while plans they sponsored keep
--- running for everyone else (plans.sponsor_id is "on delete set null").
+-- "Deleted user" instead. Their seats on passes that haven't started yet
+-- are freed for someone else (they never unlocked anyone, and a deleted
+-- account's seat can't be taken back by hand: remove_plan_seat has no one
+-- to name); seats on started plans stay taken, just anonymized
+-- (plan_seats.user_id is "on delete set null", see plan_seats), and plans
+-- they sponsored keep running for everyone else (plans.sponsor_id is "on
+-- delete set null").
 create or replace function public.delete_account()
 returns void
 language plpgsql
@@ -1359,30 +1656,36 @@ begin
     perform public.leave_group(target_group_id);
   end loop;
 
+  delete from public.plan_seats s
+  using public.plans p
+  where s.plan_id = p.id
+    and s.user_id = auth.uid()
+    and s.released_at is null
+    and p.starts_at > now();
+
   delete from auth.users where id = auth.uid();
 end;
 $$;
 
 grant execute on function public.delete_account() to authenticated;
 
--- Creates a plan and its seats in one transaction. Not callable by clients
--- (see the grants section): today its only caller is test_purchase_plan,
--- later whatever grants a verified store purchase, which
--- p_store_transaction_id makes safe to repeat. A group plan is refused while
--- its group already has a running one (one sponsor per group), and its first
--- seats go to p_member_ids — the people the sponsor picked before paying. A
--- "Just me" plan's one seat always goes to the sponsor. Records plan_started
--- for a group plan; the seats it starts with don't get plan_seat_given events
--- of their own.
+-- Creates a bought plan. Not callable by clients (see the grants section):
+-- today its only caller is test_purchase_plan, later whatever grants a
+-- verified store purchase, which p_store_transaction_id makes safe to
+-- repeat. A subscription is always "Just me" and starts right away, with its
+-- one seat for the sponsor. A Trip Pass (any size) starts out not set up —
+-- no group, no start, no seats — until its sponsor sets it up (set_up_plan).
+-- (Used to take the group and its first seat holders, and start at once.)
+drop function if exists public.create_plan(
+  uuid, uuid, text, integer, interval, boolean, text, uuid[], text, text
+);
 create or replace function public.create_plan(
   p_sponsor_id uuid,
-  p_group_id uuid,
   p_kind text,
   p_seat_count integer,
   p_duration interval,
   p_will_renew boolean,
   p_source text,
-  p_member_ids uuid[] default '{}',
   p_product_id text default null,
   p_store_transaction_id text default null
 )
@@ -1393,7 +1696,6 @@ set search_path = public
 as $$
 declare
   new_plan public.plans;
-  member_id uuid;
 begin
   if p_store_transaction_id is not null then
     select * into new_plan from public.plans where store_transaction_id = p_store_transaction_id;
@@ -1402,56 +1704,154 @@ begin
     end if;
   end if;
 
-  if p_group_id is null then
+  if p_kind = 'subscription' then
     if p_seat_count <> 1 then
-      raise exception 'A "Just me" plan has exactly one seat';
-    end if;
-  else
-    -- Locked until this commits, so two members buying a plan for the same
-    -- group at once can't both become its sponsor.
-    perform 1 from public.groups where id = p_group_id for update;
-
-    if not exists (
-      select 1 from public.group_members
-      where group_id = p_group_id and user_id = p_sponsor_id and left_at is null
-    ) then
-      raise exception 'Only an active member can buy a plan for this group';
+      raise exception 'A subscription is just for yourself';
     end if;
 
-    if exists (
-      select 1 from public.plans where group_id = p_group_id and ends_at > now()
-    ) then
-      raise exception 'This group already has a sponsor';
-    end if;
+    insert into public.plans (
+      sponsor_id, kind, seat_count, starts_at, ends_at, duration, will_renew, source,
+      product_id, store_transaction_id
+    )
+    values (
+      p_sponsor_id, p_kind, 1, now(), now() + p_duration, p_duration, p_will_renew, p_source,
+      p_product_id, p_store_transaction_id
+    )
+    returning * into new_plan;
 
-    if (
-      select count(distinct m) from unnest(p_member_ids) as m where m is not null
-    ) > p_seat_count then
-      raise exception 'More people picked than the plan has seats';
-    end if;
-
-    -- The sponsor can only skip their own seat while another plan already
-    -- unlocks them (the app warns when that one ends first, but allows it).
-    if not (p_sponsor_id = any(p_member_ids))
-      and public.unlocked_until(p_sponsor_id) is null then
-      raise exception 'You need a seat on your own plan';
-    end if;
-  end if;
-
-  insert into public.plans (
-    sponsor_id, group_id, kind, seat_count, ends_at, will_renew, source, product_id,
-    store_transaction_id
-  )
-  values (
-    p_sponsor_id, p_group_id, p_kind, p_seat_count, now() + p_duration, p_will_renew, p_source,
-    p_product_id, p_store_transaction_id
-  )
-  returning * into new_plan;
-
-  if p_group_id is null then
     insert into public.plan_seats (plan_id, user_id) values (new_plan.id, p_sponsor_id);
     return new_plan;
   end if;
+
+  insert into public.plans (
+    sponsor_id, kind, seat_count, duration, will_renew, source, product_id, store_transaction_id
+  )
+  values (
+    p_sponsor_id, p_kind, p_seat_count, p_duration, p_will_renew, p_source, p_product_id,
+    p_store_transaction_id
+  )
+  returning * into new_plan;
+
+  return new_plan;
+end;
+$$;
+
+-- Where a bought Trip Pass's start may go: now at the earliest (an earlier
+-- one, e.g. the start of today, just means now), and within a year.
+create or replace function public.plan_start_from(p_starts_at timestamptz)
+returns timestamptz
+language plpgsql
+stable
+as $$
+declare
+  plan_start timestamptz := greatest(coalesce(p_starts_at, now()), now());
+begin
+  if plan_start > now() + interval '1 year' then
+    raise exception 'Pick a start within the next year';
+  end if;
+  return plan_start;
+end;
+$$;
+
+-- Sets up a bought Trip Pass: when it starts (null for right away) and, for
+-- a group size, which group it's for and who gets its first seats. Only its
+-- sponsor, once. A group can only have one plan that hasn't ended (running
+-- or still to start), so it never has two sponsors; the group row is locked
+-- first so two passes can't be set up for it at once. Records plan_started
+-- for a group pass, which also makes its sponsor the group's sponsor
+-- (group_members.is_sponsor); the seats it starts with don't get plan_seat_given
+-- events of their own. A "Just me" pass's one seat always goes to the
+-- sponsor.
+create or replace function public.set_up_plan(
+  p_plan_id uuid,
+  p_group_id uuid,
+  p_starts_at timestamptz,
+  p_member_ids uuid[] default '{}'
+)
+returns public.plans
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_plan public.plans;
+  plan_start timestamptz;
+  member_id uuid;
+begin
+  select * into target_plan from public.plans where id = p_plan_id for update;
+
+  if not found or target_plan.sponsor_id is distinct from auth.uid() then
+    raise exception 'Only the person who bought this pass can set it up';
+  end if;
+
+  if target_plan.starts_at is not null then
+    raise exception 'This pass is already set up';
+  end if;
+
+  plan_start := public.plan_start_from(p_starts_at);
+
+  if target_plan.seat_count = 1 then
+    if p_group_id is not null then
+      raise exception 'A "Just me" pass isn''t for one group';
+    end if;
+
+    update public.plans
+    set starts_at = plan_start, ends_at = plan_start + duration
+    where id = p_plan_id
+    returning * into target_plan;
+
+    insert into public.plan_seats (plan_id, user_id) values (p_plan_id, auth.uid());
+    return target_plan;
+  end if;
+
+  if p_group_id is null then
+    raise exception 'Pick a group for this pass';
+  end if;
+
+  perform 1 from public.groups where id = p_group_id for update;
+
+  if not public.is_group_member(p_group_id) then
+    raise exception 'Only an active member can set up a pass for this group';
+  end if;
+
+  if exists (
+    select 1 from public.plans where group_id = p_group_id and ends_at > now()
+  ) then
+    raise exception 'This group already has a plan';
+  end if;
+
+  if (
+    select count(distinct m) from unnest(p_member_ids) as m where m is not null
+  ) > target_plan.seat_count then
+    raise exception 'More people picked than the pass has seats';
+  end if;
+
+  -- The sponsor can only skip their own seat while another plan unlocks
+  -- them when this one starts (the app warns when that one ends first, but
+  -- allows it) — a renewing subscription always does (unlocked_on).
+  -- Coalesced: a null in p_member_ids would otherwise make the "picked
+  -- themselves" test null and skip this check.
+  perform public.renew_test_subscriptions();
+  if not coalesce(auth.uid() = any(p_member_ids), false)
+    and not public.unlocked_on(auth.uid(), plan_start) then
+    raise exception 'You need a seat on your own pass';
+  end if;
+
+  update public.plans
+  set group_id = p_group_id, starts_at = plan_start, ends_at = plan_start + duration
+  where id = p_plan_id
+  returning * into target_plan;
+
+  -- Setting up a pass makes you the group's sponsor (see
+  -- group_members.is_sponsor). Whoever had it from an earlier plan stays an
+  -- admin. Cleared first: there's at most one sponsor per group.
+  update public.group_members
+  set is_sponsor = false
+  where group_id = p_group_id and is_sponsor and user_id is distinct from auth.uid();
+
+  update public.group_members
+  set is_sponsor = true, is_admin = true, left_as_sponsor = false
+  where group_id = p_group_id and user_id = auth.uid();
 
   for member_id in
     select distinct m from unnest(p_member_ids) as m where m is not null
@@ -1462,30 +1862,97 @@ begin
     ) then
       raise exception 'That person is not an active member of this group';
     end if;
-    insert into public.plan_seats (plan_id, user_id) values (new_plan.id, member_id);
+    insert into public.plan_seats (plan_id, user_id) values (p_plan_id, member_id);
   end loop;
 
   -- After the seats, so seat_holders lists them.
   insert into public.group_events (group_id, kind, actor_id, details)
   values (
-    p_group_id, 'plan_started', p_sponsor_id,
+    p_group_id, 'plan_started', auth.uid(),
     jsonb_build_object(
-      'plan_id', new_plan.id,
-      'kind', new_plan.kind,
-      'seat_count', new_plan.seat_count,
-      'ends_at', new_plan.ends_at,
-      'will_renew', new_plan.will_renew,
+      'plan_id', target_plan.id,
+      'kind', target_plan.kind,
+      'seat_count', target_plan.seat_count,
+      'starts_at', target_plan.starts_at,
+      'ends_at', target_plan.ends_at,
+      'will_renew', target_plan.will_renew,
       'seat_holders', coalesce(
         (select jsonb_agg(user_id) from public.plan_seats
-         where plan_id = new_plan.id and user_id is not null),
+         where plan_id = target_plan.id and user_id is not null),
         '[]'::jsonb
       )
     )
   );
 
-  return new_plan;
+  return target_plan;
 end;
 $$;
+
+grant execute on function public.set_up_plan(uuid, uuid, timestamptz, uuid[]) to authenticated;
+
+-- Moves a set-up Trip Pass's start (null for right away) until it has
+-- started, keeping its length and seats. A "Just me" pass by its sponsor, a
+-- group pass by whoever hands out its seats (can_manage_plan).
+create or replace function public.reschedule_plan(p_plan_id uuid, p_starts_at timestamptz)
+returns public.plans
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_plan public.plans;
+  plan_start timestamptz;
+  group_sponsor_id uuid;
+begin
+  select * into target_plan from public.plans where id = p_plan_id for update;
+
+  if not found
+    or (target_plan.group_id is null and target_plan.sponsor_id is distinct from auth.uid())
+    or (target_plan.group_id is not null and not public.can_manage_plan(p_plan_id)) then
+    raise exception 'Only whoever manages this pass can change its start';
+  end if;
+
+  if target_plan.starts_at is null then
+    raise exception 'Set this pass up first';
+  end if;
+
+  if target_plan.starts_at <= now() then
+    raise exception 'This pass has already started';
+  end if;
+
+  plan_start := public.plan_start_from(p_starts_at);
+
+  -- The same rule as set_up_plan: the group's sponsor (whoever took over if
+  -- the buyer left — see leave_group), without a seat on it, needs another
+  -- plan unlocking them on the new start (unlocked_on). A group without a
+  -- sponsor has no one it applies to.
+  select user_id into group_sponsor_id
+  from public.group_members
+  where group_id = target_plan.group_id and is_sponsor and left_at is null;
+
+  perform public.renew_test_subscriptions();
+  if group_sponsor_id is not null
+    and not exists (
+      select 1 from public.plan_seats
+      where plan_id = p_plan_id and user_id = group_sponsor_id and released_at is null
+    )
+    and not public.unlocked_on(group_sponsor_id, plan_start) then
+    if group_sponsor_id = auth.uid() then
+      raise exception 'Nothing else unlocks you by then, so give yourself a seat on this pass first';
+    end if;
+    raise exception 'Nothing else unlocks its sponsor by then, so they need a seat on this pass first';
+  end if;
+
+  update public.plans
+  set starts_at = plan_start, ends_at = plan_start + duration
+  where id = p_plan_id
+  returning * into target_plan;
+
+  return target_plan;
+end;
+$$;
+
+grant execute on function public.reschedule_plan(uuid, timestamptz) to authenticated;
 
 -- Adds seats to a running group plan, ending when it does: how a sponsor
 -- makes room for someone who joined late. Not callable by clients, same as
@@ -1531,16 +1998,15 @@ $$;
 
 -- Stand-ins for real store purchases until payments exist: free, and only
 -- for callers who pass can_test_purchase. p_period is one of PLAN_PERIODS and
--- p_seat_count one of PLAN_SIZES in src/constants/plans.ts ('week' and
--- 'two_weeks' make a Trip Pass, 'month' and 'year' a subscription; 1 seat
--- with no group is "Just me", 4/8/15 are group sizes). A test subscription
--- never renews, since there's no store behind it to charge.
-create or replace function public.test_purchase_plan(
-  p_group_id uuid,
-  p_period text,
-  p_seat_count integer,
-  p_member_ids uuid[] default '{}'
-)
+-- p_seat_count one of the sizes in src/constants/plans.ts ('week' and
+-- 'two_weeks' make a Trip Pass of 1 ("Just me"), 4, 8 or 15 seats, set up
+-- afterwards through set_up_plan; 'month' and 'year' a subscription, always
+-- 1 seat). A test subscription renews (for free, see
+-- renew_test_subscriptions) until it's cancelled through
+-- test_set_plan_renewal, like a store one will.
+-- (Used to take the group and its first seat holders too.)
+drop function if exists public.test_purchase_plan(uuid, text, integer, uuid[]);
+create or replace function public.test_purchase_plan(p_period text, p_seat_count integer)
 returns public.plans
 language plpgsql
 security definer
@@ -1567,19 +2033,149 @@ begin
     raise exception 'Unknown plan length';
   end if;
 
-  if (p_group_id is null and p_seat_count <> 1)
-    or (p_group_id is not null and p_seat_count not in (4, 8, 15)) then
+  if p_seat_count not in (1, 4, 8, 15) or (plan_kind = 'subscription' and p_seat_count <> 1) then
     raise exception 'Unknown plan size';
   end if;
 
+  -- One running subscription at a time (cancelled ones included, until they
+  -- run out): a monthly one can only be upgraded to yearly, through
+  -- test_upgrade_subscription. Locked on the caller's profile so two
+  -- purchases at once can't both get past this.
+  if plan_kind = 'subscription' then
+    perform 1 from public.profiles where id = auth.uid() for update;
+    -- Renewed first, like every other read of subscriptions: a lapsed one
+    -- that's still set to renew counts too.
+    perform public.renew_test_subscriptions();
+    if exists (
+      select 1 from public.plans
+      where sponsor_id = auth.uid()
+        and kind = 'subscription'
+        and starts_at <= now()
+        and ends_at > now()
+    ) then
+      raise exception 'You already have a subscription';
+    end if;
+  end if;
+
   return public.create_plan(
-    auth.uid(), p_group_id, plan_kind, p_seat_count, plan_duration, false, 'test',
-    coalesce(p_member_ids, '{}')
+    auth.uid(), plan_kind, p_seat_count, plan_duration, plan_kind = 'subscription', 'test'
   );
 end;
 $$;
 
-grant execute on function public.test_purchase_plan(uuid, text, integer, uuid[]) to authenticated;
+grant execute on function public.test_purchase_plan(text, integer) to authenticated;
+
+-- Test subscriptions renew themselves, for free, the way a store one will
+-- through its webhook: each lapsed one still set to renew gets as many
+-- terms added as it missed (one at a time, so a month term keeps landing on
+-- the same day the way generate_series in get_my_access's billing_dates
+-- counts them) — but only while its sponsor could still make test
+-- purchases, so switching those off lets them run out. There's no
+-- scheduler, so whatever reads or checks access (get_my_access,
+-- get_group_access, check_entry_access) runs this first, and nothing ever
+-- sees one lapse.
+create or replace function public.renew_test_subscriptions()
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  loop
+    update public.plans p
+    set ends_at = p.ends_at + p.duration
+    where p.source = 'test'
+      and p.kind = 'subscription'
+      and p.will_renew
+      and p.ends_at <= now()
+      and (
+        (select free_test_purchases from public.billing_settings)
+        or exists (select 1 from public.billing_testers t where t.user_id = p.sponsor_id)
+      );
+    exit when not found;
+  end loop;
+end;
+$$;
+
+create index if not exists plans_renewing_idx on public.plans (ends_at) where will_renew;
+
+-- Cancelling a running test subscription (it runs to the end of the term
+-- it's in, then ends), or taking that back before it runs out — what the
+-- store's own subscription settings will do for a real one, whose webhook
+-- then sets will_renew. Only its sponsor can.
+create or replace function public.test_set_plan_renewal(p_plan_id uuid, p_will_renew boolean)
+returns public.plans
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_plan public.plans;
+begin
+  -- Turned back on, it'd only renew while test purchases are allowed.
+  if p_will_renew and not public.can_test_purchase() then
+    raise exception 'Purchases aren''t available yet';
+  end if;
+
+  perform public.renew_test_subscriptions();
+
+  update public.plans
+  set will_renew = p_will_renew
+  where id = p_plan_id
+    and sponsor_id = auth.uid()
+    and kind = 'subscription'
+    and source = 'test'
+    and starts_at <= now()
+    and ends_at > now()
+  returning * into target_plan;
+
+  if not found then
+    raise exception 'This subscription has ended or isn''t yours';
+  end if;
+
+  return target_plan;
+end;
+$$;
+
+grant execute on function public.test_set_plan_renewal(uuid, boolean) to authenticated;
+
+-- Upgrading a running monthly test subscription (cancelled or not) to
+-- yearly: the monthly one ends now and a renewing yearly one starts in its
+-- place, so each keeps its own billing history (a store upgrade will refund
+-- the rest of the month the same way). There's no way back to monthly.
+-- Only its sponsor can.
+create or replace function public.test_upgrade_subscription(p_plan_id uuid)
+returns public.plans
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.can_test_purchase() then
+    raise exception 'Purchases aren''t available yet';
+  end if;
+
+  perform public.renew_test_subscriptions();
+
+  update public.plans
+  set ends_at = now(), will_renew = false
+  where id = p_plan_id
+    and sponsor_id = auth.uid()
+    and kind = 'subscription'
+    and source = 'test'
+    and duration = interval '1 month'
+    and starts_at <= now()
+    and ends_at > now();
+
+  if not found then
+    raise exception 'Only a running monthly subscription can be upgraded';
+  end if;
+
+  return public.create_plan(auth.uid(), 'subscription', 1, interval '1 year', true, 'test');
+end;
+$$;
+
+grant execute on function public.test_upgrade_subscription(uuid) to authenticated;
 
 create or replace function public.test_add_plan_seats(p_plan_id uuid, p_count integer)
 returns public.plans
@@ -1654,7 +2250,8 @@ begin
   end if;
 
   update public.plans
-  set seat_count = p_seat_count, ends_at = new_ends_at
+  set seat_count = p_seat_count, ends_at = new_ends_at,
+    duration = new_ends_at - current_plan.starts_at
   where id = p_plan_id
   returning * into current_plan;
 
@@ -1757,6 +2354,75 @@ $$;
 
 grant execute on function public.assign_plan_seats(uuid, uuid[]) to authenticated;
 
+-- Takes a seat back from p_user_id on a group pass that hasn't started yet,
+-- so its manager can give it to someone else (assign_plan_seats). Once the
+-- pass has started, its seats are locked in (see plan_seats). The seat never
+-- unlocked anyone, so its row is simply deleted. The group sponsor's own seat
+-- can only go while another plan unlocks them when this one starts (a
+-- renewing subscription always does) — the same rule as set_up_plan, held by
+-- whoever has the role now, not the buyer once they've left. (Leaving or
+-- being removed from the group takes a seat back by itself:
+-- free_pending_plan_seat.) Records plan_seat_removed.
+create or replace function public.remove_plan_seat(p_plan_id uuid, p_user_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  target_plan public.plans;
+begin
+  select * into target_plan from public.plans where id = p_plan_id for update;
+
+  if not found or not public.can_manage_plan(p_plan_id) then
+    raise exception 'Only this group''s sponsor can change its seats';
+  end if;
+
+  if target_plan.starts_at is null or target_plan.starts_at <= now() then
+    raise exception 'Seats are locked in once the pass has started';
+  end if;
+
+  delete from public.plan_seats
+  where plan_id = p_plan_id and user_id = p_user_id and released_at is null;
+
+  if not found then
+    raise exception 'That person doesn''t have a seat on this pass';
+  end if;
+
+  perform public.renew_test_subscriptions();
+  if exists (
+      select 1 from public.group_members
+      where group_id = target_plan.group_id
+        and user_id = p_user_id
+        and is_sponsor
+        and left_at is null
+    )
+    and not public.unlocked_on(p_user_id, target_plan.starts_at) then
+    if p_user_id = auth.uid() then
+      raise exception 'Nothing else unlocks you by then, so you need a seat on this pass';
+    end if;
+    raise exception 'Nothing else unlocks the group''s sponsor by then, so they need a seat on this pass';
+  end if;
+
+  insert into public.group_events (group_id, kind, actor_id, target_id, details)
+  values (
+    target_plan.group_id, 'plan_seat_removed', auth.uid(), p_user_id,
+    jsonb_build_object(
+      'plan_id', p_plan_id,
+      'seat_count', target_plan.seat_count,
+      'seats_used', (
+        select count(*) from public.plan_seats
+        where plan_id = p_plan_id and released_at is null
+      ),
+      'starts_at', target_plan.starts_at,
+      'ends_at', target_plan.ends_at
+    )
+  );
+end;
+$$;
+
+grant execute on function public.remove_plan_seat(uuid, uuid) to authenticated;
+
 -- Fills in details for plan events recorded before it existed, as closely
 -- as the plan tables allow: a plan_started matches the plan its sponsor
 -- bought in that group within a few seconds of it, whose starting seats are
@@ -1804,21 +2470,33 @@ where e.kind = 'plan_seat_given' and e.details is null
 drop function if exists public.move_plan_seat(uuid, uuid, uuid);
 
 -- The caller's own access: the paywall switch and free allowance, the plan
--- currently unlocking them (the one that lasts longest, if several do), every
--- running plan they sponsor or hold a seat on, and whether they can make test
--- purchases. The only way a client reads any of this (the tables themselves
--- aren't readable).
+-- currently unlocking them (the one that lasts longest, if several do — a
+-- renewing subscription counting as lasting forever), every
+-- running plan they sponsor or hold a seat on, every Trip Pass of theirs that
+-- hasn't started yet, whether they've ever had a plan, and whether they can
+-- make test purchases. The only way a client reads any of this (the tables
+-- themselves aren't readable). Not stable: it renews lapsed test
+-- subscriptions first.
 create or replace function public.get_my_access()
 returns jsonb
-language sql
+language plpgsql
 security definer
 set search_path = public
-stable
+volatile
 as $$
+declare
+  result jsonb;
+begin
+  perform public.renew_test_subscriptions();
+
   select jsonb_build_object(
     'paywall_enabled', s.paywall_enabled,
-    'free_entries_per_user', s.free_entries_per_user,
+    'free_entries_per_group', s.free_entries_per_group,
     'can_test_purchase', public.can_test_purchase(),
+    -- Has ever bought a plan or held a seat on one (ended ones included):
+    -- the paywall only explains plans to people who haven't.
+    'has_had_plan', exists (select 1 from public.plans where sponsor_id = auth.uid())
+      or exists (select 1 from public.plan_seats where user_id = auth.uid()),
     'covering_plan', (
       select jsonb_build_object(
         'id', p.id,
@@ -1827,7 +2505,8 @@ as $$
         'sponsor_id', p.sponsor_id,
         'sponsor_name', pr.name,
         'ends_at', p.ends_at,
-        'will_renew', p.will_renew
+        'will_renew', p.will_renew,
+        'duration_days', round(extract(epoch from p.duration) / 86400)
       )
       from public.plan_seats ps
       join public.plans p on p.id = ps.plan_id
@@ -1836,7 +2515,9 @@ as $$
         and ps.released_at is null
         and p.starts_at <= now()
         and p.ends_at > now()
-      order by p.ends_at desc
+      -- A renewing subscription first: it counts as never running out, so
+      -- it outlasts any pass.
+      order by p.will_renew desc, p.ends_at desc
       limit 1
     ),
     'active_plans', coalesce((
@@ -1857,8 +2538,17 @@ as $$
             select count(*) from public.plan_seats x
             where x.plan_id = p.id and x.released_at is null
           ),
+          'starts_at', p.starts_at,
           'ends_at', p.ends_at,
-          'will_renew', p.will_renew
+          'will_renew', p.will_renew,
+          'duration_days', round(extract(epoch from p.duration) / 86400),
+          'source', p.source,
+          -- When a subscription has been charged: the start of every term
+          -- so far (renewals add one term at a time, the way this counts).
+          'billing_dates', case when p.kind = 'subscription' then (
+            select jsonb_agg(d order by d)
+            from generate_series(p.starts_at, p.ends_at - interval '1 second', p.duration) d
+          ) end
         )
         order by p.ends_at desc
       )
@@ -1874,24 +2564,116 @@ as $$
             where x.plan_id = p.id and x.user_id = auth.uid() and x.released_at is null
           )
         )
+    ), '[]'::jsonb),
+    -- Trip Passes that haven't started: bought but not set up yet (only the
+    -- sponsor's own; starts_at null, listed first), or set up to start
+    -- later — including group passes the caller manages without a seat (an
+    -- admin once the sponsor has left), so they can move its start too.
+    'upcoming_plans', coalesce((
+      select jsonb_agg(
+        jsonb_build_object(
+          'id', p.id,
+          'kind', p.kind,
+          'group_id', p.group_id,
+          'group_name', g.name,
+          'sponsor_id', p.sponsor_id,
+          'sponsor_name', pr.name,
+          'has_seat', exists (
+            select 1 from public.plan_seats x
+            where x.plan_id = p.id and x.user_id = auth.uid() and x.released_at is null
+          ),
+          'seat_count', p.seat_count,
+          'seats_used', (
+            select count(*) from public.plan_seats x
+            where x.plan_id = p.id and x.released_at is null
+          ),
+          'starts_at', p.starts_at,
+          'ends_at', p.ends_at,
+          'duration_days', round(extract(epoch from p.duration) / 86400)
+        )
+        order by p.starts_at nulls first, p.created_at
+      )
+      from public.plans p
+      left join public.groups g on g.id = p.group_id
+      left join public.profiles pr on pr.id = p.sponsor_id
+      where (p.starts_at is null or p.starts_at > now())
+        and (
+          p.sponsor_id = auth.uid()
+          or exists (
+            select 1 from public.plan_seats x
+            where x.plan_id = p.id and x.user_id = auth.uid() and x.released_at is null
+          )
+          or public.can_manage_plan(p.id)
+        )
+    ), '[]'::jsonb),
+    -- Plans that have ended which the caller sponsored or held a seat on,
+    -- most recently ended first, for the hidden "Former plans" list.
+    'past_plans', coalesce((
+      select jsonb_agg(
+        jsonb_build_object(
+          'id', p.id,
+          'kind', p.kind,
+          'group_id', p.group_id,
+          'group_name', g.name,
+          'sponsor_id', p.sponsor_id,
+          'sponsor_name', pr.name,
+          'seat_count', p.seat_count,
+          'starts_at', p.starts_at,
+          'ends_at', p.ends_at,
+          'duration_days', round(extract(epoch from p.duration) / 86400)
+        )
+        order by p.ends_at desc
+      )
+      from (
+        select * from public.plans p
+        where p.ends_at <= now()
+          and (
+            p.sponsor_id = auth.uid()
+            or exists (
+              select 1 from public.plan_seats x
+              where x.plan_id = p.id and x.user_id = auth.uid()
+            )
+          )
+        order by p.ends_at desc
+        limit 50
+      ) p
+      left join public.groups g on g.id = p.group_id
+      left join public.profiles pr on pr.id = p.sponsor_id
+    ), '[]'::jsonb),
+    -- The caller's groups that already have a plan that hasn't ended
+    -- (running or still to start), so setting up a group pass can show them
+    -- as taken: a group only has one at a time (set_up_plan).
+    'groups_with_plans', coalesce((
+      select jsonb_agg(
+        jsonb_build_object('group_id', p.group_id, 'starts_at', p.starts_at, 'ends_at', p.ends_at)
+      )
+      from public.plans p
+      where p.ends_at > now()
+        and p.group_id is not null
+        and public.is_group_member(p.group_id)
     ), '[]'::jsonb)
   )
+  into result
   from public.billing_settings s;
+
+  return result;
+end;
 $$;
 
 grant execute on function public.get_my_access() to authenticated;
 
 -- One group's access picture, for its active members: free entries left,
--- its running plan (if any), and for every member — including ones who left,
+-- its plan (if any — running, or set up to start later), and for every member — including ones who left,
 -- since an entry being edited can still include them — when their unlock
 -- runs out, whether it renews, and whether they hold one of this group's
 -- seats.
+-- (Not stable: it renews lapsed test subscriptions first.)
 create or replace function public.get_group_access(p_group_id uuid)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public
-stable
+volatile
 as $$
 declare
   settings public.billing_settings;
@@ -1902,19 +2684,23 @@ begin
     raise exception 'Not a member of this group';
   end if;
 
+  perform public.renew_test_subscriptions();
+
   select * into settings from public.billing_settings;
   select coalesce((
     select used from public.free_entry_usage
-    where user_id = auth.uid() and group_id = p_group_id
+    where group_id = p_group_id
   ), 0)
   into used_count;
+  -- Running, or set up to start later: a group has at most one that hasn't
+  -- ended (set_up_plan). Its seat holders are only unlocked once it starts.
   select * into running from public.plans
-  where group_id = p_group_id and starts_at <= now() and ends_at > now();
+  where group_id = p_group_id and ends_at > now();
 
   return jsonb_build_object(
     'paywall_enabled', coalesce(settings.paywall_enabled, false),
-    -- The viewer's own in this group: free entries are per person, per group.
-    'free_entries_left', greatest(coalesce(settings.free_entries_per_user, 0) - used_count, 0),
+    -- The group's own: everyone in it shares one pool.
+    'free_entries_left', greatest(coalesce(settings.free_entries_per_group, 0) - used_count, 0),
     'plan', case when running.id is null then null else jsonb_build_object(
       'id', running.id,
       'kind', running.kind,
@@ -1933,6 +2719,7 @@ begin
       'starts_at', running.starts_at,
       'ends_at', running.ends_at,
       'will_renew', running.will_renew,
+      'duration_days', round(extract(epoch from running.duration) / 86400),
       'can_manage', public.can_manage_plan(running.id)
     ) end,
     'members', coalesce((
@@ -1940,6 +2727,9 @@ begin
         'user_id', gm.user_id,
         'unlocked_until', cover.ends_at,
         'will_renew', coalesce(cover.will_renew, false),
+        -- How long the plan unlocking them runs, for how early its end gets
+        -- pointed out.
+        'unlock_days', round(extract(epoch from cover.duration) / 86400),
         'has_seat', running.id is not null and exists (
           select 1 from public.plan_seats s
           where s.plan_id = running.id and s.user_id = gm.user_id and s.released_at is null
@@ -1947,14 +2737,16 @@ begin
       ))
       from public.group_members gm
       left join lateral (
-        select p.ends_at, p.will_renew
+        select p.ends_at, p.will_renew, p.duration
         from public.plan_seats s
         join public.plans p on p.id = s.plan_id
         where s.user_id = gm.user_id
           and s.released_at is null
           and p.starts_at <= now()
           and p.ends_at > now()
-        order by p.ends_at desc
+        -- Same as get_my_access's covering_plan: a renewing subscription
+        -- first, since it counts as never running out.
+        order by p.will_renew desc, p.ends_at desc
         limit 1
       ) cover on true
       where gm.group_id = p_group_id and gm.user_id is not null
@@ -1964,6 +2756,44 @@ end;
 $$;
 
 grant execute on function public.get_group_access(uuid) to authenticated;
+
+-- Backfill for groups whose pass was set up before group_members.is_sponsor
+-- existed: their latest pass's sponsor if they're still in the group,
+-- otherwise whoever leave_group would have handed it to. Only touches
+-- groups without a sponsor, which after this can't happen again for a group
+-- that's had a pass, so re-running the file changes nothing.
+update public.group_members gm
+set is_sponsor = true, is_admin = true
+from (
+  select distinct on (group_id) group_id, sponsor_id
+  from public.plans
+  where group_id is not null and starts_at is not null
+  order by group_id, starts_at desc
+) latest
+where gm.group_id = latest.group_id
+  and gm.user_id = latest.sponsor_id
+  and gm.left_at is null
+  and not gm.left_as_sponsor
+  and not exists (
+    select 1 from public.group_members s where s.group_id = gm.group_id and s.is_sponsor
+  );
+
+update public.group_members gm
+set is_sponsor = true, is_admin = true
+where gm.id in (
+  select distinct on (m.group_id) m.id
+  from public.group_members m
+  where m.left_at is null
+    and not m.left_as_sponsor
+    and exists (
+      select 1 from public.plans p
+      where p.group_id = m.group_id and p.starts_at is not null
+    )
+    and not exists (
+      select 1 from public.group_members s where s.group_id = m.group_id and s.is_sponsor
+    )
+  order by m.group_id, m.is_admin desc, m.joined_at asc
+);
 
 -- ---------------------------------------------------------------------------
 -- Grants
@@ -1976,7 +2806,6 @@ grant execute on function public.get_group_access(uuid) to authenticated;
 grant usage on schema public to authenticated;
 
 grant select, insert, update on public.profiles to authenticated;
-grant select, insert, update, delete on public.group_members to authenticated;
 grant select, insert, update on public.exchange_rates to authenticated;
 -- Supabase's default privileges grant every new public table in full to
 -- anon and authenticated. These are taken back to exactly what clients need
@@ -1991,7 +2820,15 @@ grant select, insert, update on public.exchange_rates to authenticated;
 --     written directly (updateGroup in use-groups.tsx). Column grants only work once the table-wide ones are gone,
 --     and revoking a table privilege also revokes its column privileges, so
 --     this order is what keeps re-running the file safe.
+--   group_members: read-only to clients. Every membership change goes
+--     through an RPC (join_group, leave_group, kick_member,
+--     promote_to_admin, demote_admin, set_group_pinned, set_up_plan), which
+--     is where the admin/sponsor rules live; a direct update would let an
+--     admin strip the sponsor's role or remove them.
 --   The plan tables: no client access at all (see "Plans" above).
+revoke all on public.group_members from anon, authenticated;
+grant select on public.group_members to authenticated;
+
 revoke all on public.group_events from anon, authenticated;
 grant select on public.group_events to authenticated;
 
@@ -2010,19 +2847,23 @@ revoke all on public.billing_settings, public.billing_testers, public.plans, pub
   from anon, authenticated;
 
 -- Internal plan functions, only ever called from inside the security
--- definer functions above (which run as their owner). unlocked_until answers
--- for any user, and create_plan/add_plan_seats/upgrade_plan hand out plans
+-- definer functions above (which run as their owner). unlocked_until and
+-- unlocked_on answer for any user, and create_plan/add_plan_seats/upgrade_plan hand out plans
 -- for free, so
 -- clients can't call any of them directly. Supabase's default privileges
 -- grant every new function to anon and authenticated by name, which is why
 -- revoking from public alone wouldn't be enough.
 revoke all on function public.unlocked_until(uuid, timestamptz) from public, anon, authenticated;
+revoke all on function public.unlocked_on(uuid, timestamptz) from public, anon, authenticated;
 revoke all on function public.can_manage_plan(uuid) from public, anon, authenticated;
+revoke all on function public.free_pending_plan_seat(uuid, uuid, uuid)
+  from public, anon, authenticated;
 revoke all on function public.can_test_purchase() from public, anon, authenticated;
+revoke all on function public.renew_test_subscriptions() from public, anon, authenticated;
 revoke all on function public.check_entry_access(uuid, uuid[], timestamptz)
   from public, anon, authenticated;
 revoke all on function public.create_plan(
-  uuid, uuid, text, integer, interval, boolean, text, uuid[], text, text
+  uuid, text, integer, interval, boolean, text, text, text
 ) from public, anon, authenticated;
 revoke all on function public.add_plan_seats(uuid, integer) from public, anon, authenticated;
 revoke all on function public.upgrade_plan(uuid, integer, text) from public, anon, authenticated;
@@ -2078,28 +2919,15 @@ create policy "groups_update" on public.groups
   for update using (public.is_group_admin(id));
 
 -- group_members: see membership rows (active and departed) for your own
--- groups. The insert/delete policies below are no longer exercised by the
--- app itself (join_group/leave_group above go through security definer RPCs
--- instead, so writes stay scoped to exactly those two operations), but are
--- left in place rather than removed.
+-- groups. Clients can't write them at all (see the grants section), so
+-- there are no insert/update/delete policies.
 drop policy if exists "group_members_select" on public.group_members;
 create policy "group_members_select" on public.group_members
   for select using (public.is_group_member(group_id));
 
 drop policy if exists "group_members_insert" on public.group_members;
-create policy "group_members_insert" on public.group_members
-  for insert with check (user_id = auth.uid());
-
 drop policy if exists "group_members_delete" on public.group_members;
-create policy "group_members_delete" on public.group_members
-  for delete using (user_id = auth.uid());
-
--- Not exercised by the app (promote_to_admin/leave_group's auto-promote go
--- through security definer RPCs), kept for the same defense-in-depth
--- reasoning as the other unused policies in this file.
 drop policy if exists "group_members_update" on public.group_members;
-create policy "group_members_update" on public.group_members
-  for update using (public.is_group_admin(group_id));
 
 -- logs: any member of the group can read its entries. Adding one only goes
 -- through create_log/settle_debt (see the grants section for why there's no
@@ -2111,8 +2939,8 @@ create policy "logs_select" on public.logs
 drop policy if exists "logs_insert" on public.logs;
 
 -- Not exercised by the app (delete_log above goes through a security
--- definer RPC), kept for the same defense-in-depth reasoning as the unused
--- group_members insert/delete policies elsewhere in this file.
+-- definer RPC), kept for the same defense-in-depth reasoning as the other
+-- unused policies in this file.
 drop policy if exists "logs_delete" on public.logs;
 create policy "logs_delete" on public.logs
   for delete using (paid_by = auth.uid());

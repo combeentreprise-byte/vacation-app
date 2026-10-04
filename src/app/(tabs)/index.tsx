@@ -25,10 +25,13 @@ import { CrossfadeLabel } from "@/components/crossfade-label";
 import { GroupHero } from "@/components/hero-motive";
 import { type LeaveGroupRequest, LeaveGroupPopup } from "@/components/leave-group-popup";
 import { PinIcon } from "@/components/pin-icon";
+import { PressableScale } from "@/components/press-feedback";
 import { Colors } from "@/constants/colors";
 import { MAX_PINNED_GROUPS } from "@/constants/limits";
+import { useAccess } from "@/hooks/use-access";
 import { type Group, useGroups } from "@/hooks/use-groups";
 import { supabase } from "@/lib/supabase";
+import { isNotStartedYet } from "@/utils/access";
 
 const LEAVE_SLOT_WIDTH = 44;
 // Every group card is a fixed slice of the screen rather than sized to its
@@ -41,6 +44,7 @@ const MANAGE_ANIMATION = { duration: 280, easing: Easing.out(Easing.cubic) };
 
 export default function GroupScreen() {
   const { groups, isLoaded, removeGroup, setGroupPinned } = useGroups();
+  const { access } = useAccess();
   const [isManaging, setIsManaging] = useState(false);
   // Driven on the UI thread (Reanimated) so the slide stays smooth even while
   // toggling Manage mode re-renders every row on the JS thread.
@@ -141,7 +145,18 @@ export default function GroupScreen() {
         .is("left_at", null);
       count = result.count ?? 1;
     }
-    setLeaveTarget({ group, anchor, isLastMember: count <= 1 });
+    // Leaving before the group's pass starts gives up your seat on it
+    // (free_pending_plan_seat), so the confirmation says so.
+    const pendingSeat = access.upcomingPlans.find(
+      (plan) => plan.groupId === group.id && plan.hasSeat && isNotStartedYet(plan.startsAt)
+    );
+    setLeaveTarget({
+      group,
+      anchor,
+      isLastMember: count <= 1,
+      isSponsor: group.isSponsor,
+      seatStartsAt: pendingSeat?.startsAt ?? null,
+    });
   };
 
   const handleConfirmLeave = () => {
@@ -161,14 +176,17 @@ export default function GroupScreen() {
 
   if (groups.length === 0) {
     return (
-      <View style={styles.container}>
-        <Pressable onPress={handleCreate} hitSlop={12}>
-          <Ionicons name="add" size={28} color={Colors.muted} />
-        </Pressable>
-        <Pressable onPress={handleCreate}>
-          <Text style={styles.createText}>Be part of a group</Text>
-        </Pressable>
-      </View>
+      <>
+        <View style={styles.container}>
+          <Pressable onPress={handleCreate} hitSlop={12}>
+            <Ionicons name="add" size={28} color={Colors.muted} />
+          </Pressable>
+          <Pressable onPress={handleCreate}>
+            <Text style={styles.createText}>Create a group</Text>
+          </Pressable>
+        </View>
+        <PaywallButton />
+      </>
     );
   }
 
@@ -245,7 +263,25 @@ export default function GroupScreen() {
         onClose={() => setLeaveTarget(null)}
         onConfirm={handleConfirmLeave}
       />
+      <PaywallButton />
     </>
+  );
+}
+
+// Development-only shortcut to the paywall, floating over the group list.
+// The real app will open it on its own at the right moments; until then this
+// keeps it a tap away without it popping up mid-work.
+function PaywallButton() {
+  if (!__DEV__) return null;
+  return (
+    <PressableScale
+      style={styles.paywallButton}
+      onPress={() => router.push({ pathname: "/paywall", params: { full: "1" } })}
+      accessibilityRole="button"
+      accessibilityLabel="Open paywall"
+    >
+      <Ionicons name="diamond-outline" size={22} color={Colors.accentText} />
+    </PressableScale>
   );
 }
 
@@ -281,6 +317,22 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     gap: 8,
+  },
+  paywallButton: {
+    position: "absolute",
+    right: 20,
+    bottom: 20,
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: Colors.accent,
+    shadowColor: "#000000",
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 5,
   },
   createText: {
     color: Colors.muted,

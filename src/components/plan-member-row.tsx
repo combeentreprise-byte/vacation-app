@@ -12,8 +12,8 @@ const STATUS_COLORS: Record<PlanMemberStatusTone, string> = {
   warning: Colors.warning,
 };
 
-// One person in a plan's member list (the seat picker in unlock.tsx and the
-// group plan screen): who they are, where they stand — has a seat, unlocked
+// One person in a plan's member list (the seat picker in plan-setup.tsx and
+// the group plan screen): who they are, where they stand — has a seat, unlocked
 // until when, locked — and whatever control goes on the right (a checkbox,
 // a "Give seat" button). The whole row is the tap target when onPress is set.
 export function PlanMemberRow({

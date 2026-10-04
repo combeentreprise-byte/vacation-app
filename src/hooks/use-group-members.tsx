@@ -12,6 +12,9 @@ export type GroupMember = {
   avatarUrl: string | null;
   isActive: boolean;
   isAdmin: boolean;
+  // The group's sponsor (group_members.is_sponsor in schema.sql): always an
+  // admin too, can't be kicked, and can demote admins.
+  isSponsor: boolean;
 };
 
 type MemberProfile = { name: string; avatar_url: string | null };
@@ -24,6 +27,7 @@ type MemberRow = {
   user_id: string | null;
   left_at: string | null;
   is_admin: boolean;
+  is_sponsor: boolean;
   profiles: MemberProfile | MemberProfile[] | null;
 };
 
@@ -36,6 +40,7 @@ function mapMember(row: MemberRow): GroupMember | null {
     avatarUrl: profile?.avatar_url ?? null,
     isActive: row.left_at === null,
     isAdmin: row.is_admin,
+    isSponsor: row.is_sponsor,
   };
 }
 
@@ -55,6 +60,7 @@ function mapMembers(rows: MemberRow[]): GroupMember[] {
       avatarUrl: null,
       isActive: false,
       isAdmin: false,
+      isSponsor: false,
     });
   }
 
@@ -77,7 +83,7 @@ export function useGroupMembers(groupId: string | undefined) {
 
     const { data, error } = await supabase
       .from("group_members")
-      .select("user_id, left_at, is_admin, profiles(name, avatar_url)")
+      .select("user_id, left_at, is_admin, is_sponsor, profiles(name, avatar_url)")
       .eq("group_id", groupId);
 
     if (error) {

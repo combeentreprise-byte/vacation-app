@@ -23,6 +23,9 @@ export type Group = {
   createdAt: number;
   // The viewer's own pin (group_members.pinned_at), not a group-wide one.
   pinnedAt: number | null;
+  // Whether the viewer is this group's sponsor, for the leave warning that
+  // they won't get the role back (see leave_group in schema.sql).
+  isSponsor: boolean;
 };
 
 type GroupRow = {
@@ -37,9 +40,9 @@ type GroupRow = {
 };
 
 // The groups query embeds the viewer's own group_members row (filtered to
-// their user_id, so exactly one) to pick up their pin.
+// their user_id, so exactly one) to pick up their pin and sponsor role.
 type GroupWithPinRow = GroupRow & {
-  me: { pinned_at: string | null }[];
+  me: { pinned_at: string | null; is_sponsor: boolean }[];
 };
 
 // Pinned groups first (most recently pinned on top), then everything else
@@ -65,6 +68,7 @@ function mapGroup(row: GroupWithPinRow): Group {
     photoUrl: row.photo_url,
     createdAt: new Date(row.created_at).getTime(),
     pinnedAt: pinnedAt === null ? null : new Date(pinnedAt).getTime(),
+    isSponsor: row.me[0]?.is_sponsor ?? false,
   };
 }
 
@@ -92,6 +96,7 @@ type GroupsContextValue = {
   joinGroup: (groupId: string) => Promise<{ error?: string }>;
   promoteToAdmin: (groupId: string, userId: string) => Promise<{ error?: string }>;
   kickMember: (groupId: string, userId: string) => Promise<{ error?: string }>;
+  demoteAdmin: (groupId: string, userId: string) => Promise<{ error?: string }>;
 };
 
 const GroupsContext = createContext<GroupsContextValue | undefined>(undefined);
@@ -111,7 +116,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
     const { data, error } = await supabase
       .from("groups")
-      .select("*, me:group_members!inner(pinned_at)")
+      .select("*, me:group_members!inner(pinned_at, is_sponsor)")
       .eq("me.user_id", userId);
 
     if (error) {
@@ -322,6 +327,20 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     return {};
   }, []);
 
+  const demoteAdmin = useCallback(async (groupId: string, userId: string) => {
+    const { error } = await supabase.rpc("demote_admin", {
+      p_group_id: groupId,
+      p_user_id: userId,
+    });
+
+    if (error) {
+      console.warn("Failed to demote admin", error);
+      return { error: error.message };
+    }
+
+    return {};
+  }, []);
+
   return (
     <GroupsContext.Provider
       value={{
@@ -335,6 +354,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         joinGroup,
         promoteToAdmin,
         kickMember,
+        demoteAdmin,
       }}
     >
       {children}

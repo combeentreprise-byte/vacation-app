@@ -8,7 +8,7 @@ import Animated, {
 } from "react-native-reanimated";
 
 export const EXPAND_DURATION_MS = 260;
-const EXPAND_ANIMATION = { duration: EXPAND_DURATION_MS, easing: Easing.inOut(Easing.quad) };
+export const EXPAND_ANIMATION = { duration: EXPAND_DURATION_MS, easing: Easing.inOut(Easing.quad) };
 
 // Content that opens by growing to its natural height and closes by
 // shrinking away (clipped, no fade), pushing whatever sits below it along

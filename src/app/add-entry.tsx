@@ -8,9 +8,11 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  type StyleProp,
   StyleSheet,
   Text,
   View,
+  type ViewStyle,
 } from "react-native";
 import Animated, {
   Easing,
@@ -36,12 +38,17 @@ import { useGroupMembers } from "@/hooks/use-group-members";
 import { useGroups } from "@/hooks/use-groups";
 import { useLineLimit } from "@/hooks/use-line-limit";
 import { useLogs } from "@/hooks/use-logs";
+import { useOpenUnlock } from "@/hooks/use-open-unlock";
 import { useProfile } from "@/hooks/use-profile";
 import { useRefreshOnRefocus } from "@/hooks/use-refresh-on-refocus";
 import { entriesNeedUnlock, freeEntriesLeft, isMemberUnlocked, joinNames } from "@/utils/access";
 import { getExchangeRate } from "@/utils/exchange-rates";
 
 const MEMBER_GRID_GAP = 10;
+const MEMBER_TILE_PADDING = 8;
+const MEMBER_TILE_BORDER = 1;
+// How much narrower a tile's name has to be than the tile itself.
+const MEMBER_TILE_HORIZONTAL_INSET = 2 * (MEMBER_TILE_PADDING + MEMBER_TILE_BORDER);
 const TILE_SELECT_ANIMATION = { duration: 320, easing: Easing.inOut(Easing.quad) };
 const UNSELECTED_AVATAR_OPACITY = 0.4;
 // "Select all" / "Deselect all" ripples through the tiles one after another
@@ -58,6 +65,28 @@ const TILE_POP_GROW = { duration: 110, easing: Easing.out(Easing.quad) };
 const TILE_POP_SETTLE = { duration: 180, easing: Easing.inOut(Easing.quad) };
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
+function chunk<T>(items: T[], size: number): T[][] {
+  const rows: T[][] = [];
+  for (let i = 0; i < items.length; i += size) rows.push(items.slice(i, i + size));
+  return rows;
+}
+
+// Packs tiles of the given widths (already sorted shortest first) into rows
+// of at most two, pairing a tile with the next one whenever both fit the row.
+function packWideRows<T extends { width: number }>(tiles: T[], rowWidth: number): T[][] {
+  const rows: T[][] = [];
+  for (let i = 0; i < tiles.length; i++) {
+    const next = tiles[i + 1];
+    if (next && tiles[i].width + MEMBER_GRID_GAP + next.width <= rowWidth) {
+      rows.push([tiles[i], next]);
+      i++;
+    } else {
+      rows.push([tiles[i]]);
+    }
+  }
+  return rows;
+}
+
 function MemberTile({
   name,
   label = name,
@@ -66,8 +95,7 @@ function MemberTile({
   locked = false,
   animationDelay = 0,
   onToggle,
-  minWidth,
-  onLayout,
+  style,
 }: {
   name: string;
   // Shown under the avatar when it should differ from `name` (e.g. "You"),
@@ -83,8 +111,7 @@ function MemberTile({
   // while a "Select all" / "Deselect all" cascade is playing.
   animationDelay?: number;
   onToggle: () => void;
-  minWidth: number;
-  onLayout?: (event: LayoutChangeEvent) => void;
+  style?: StyleProp<ViewStyle>;
 }) {
   // Eases between selected/unselected (on the UI thread) rather than
   // snapping, so "Select all" / "Deselect all" flipping every tile at once
@@ -124,9 +151,8 @@ function MemberTile({
   }));
   return (
     <AnimatedPressable
-      style={[styles.memberTile, { minWidth }, tileStyle]}
+      style={[styles.memberTile, style, tileStyle]}
       onPress={onToggle}
-      onLayout={onLayout}
       accessibilityRole="checkbox"
       accessibilityState={{ checked: selected, disabled: locked && !selected }}
       accessibilityHint={locked ? "Not unlocked" : undefined}
@@ -197,30 +223,24 @@ export default function AddEntryScreen() {
       (id) => id === null || !members.some((member) => member.id === id)
     ) ?? [];
 
-  // Once your free entries in this group are used up (everyone gets their own
-  // in each group), everyone on an entry has to be unlocked — you (always its
-  // payer) and everyone it's split with — the same rule create_log/update_log
+  // Once the group's free entries are used up (one pool everyone in it
+  // shares), everyone on an entry has to be unlocked — you (always its payer)
+  // and everyone it's split with — the same rule create_log/update_log
   // enforce server-side (check_entry_access in schema.sql), checked here
-  // first so it's clear before submitting. Entries of yours in the group
-  // still waiting to sync count against the free ones too. (A held entry was
-  // turned down, so it doesn't.)
+  // first so it's clear before submitting. Edits use one too. This device's
+  // entries in the group still waiting to sync count against the free ones
+  // (other than the one being edited, and held ones, which were turned down).
   const { access: groupAccess, refresh: refreshGroupAccess } = useGroupAccess(groupId);
-  // Back from /unlock (its "Unlock to add entries" button), this form's copy
+  // Back from the paywall (its "Unlock to add entries" button), this form's copy
   // of the group's access predates the purchase.
   useRefreshOnRefocus(refreshGroupAccess);
-  const pendingInGroup = isEditMode
-    ? 0
-    : logs.filter((log) => log.groupId === groupId && log.isPending && !log.isHeld).length;
+  const pendingInGroup = logs.filter(
+    (log) => log.groupId === groupId && log.isPending && !log.isHeld && log.id !== logId
+  ).length;
   const needsUnlock = entriesNeedUnlock(groupAccess, pendingInGroup);
   const isLocked = (id: string) => needsUnlock && !isMemberUnlocked(groupAccess, id);
   const viewerLocked = !!session && isLocked(session.user.id);
-  // Not worth mentioning to someone who's unlocked: they don't need them.
-  const freeLeft =
-    groupAccess?.paywallEnabled &&
-    !isEditMode &&
-    !isMemberUnlocked(groupAccess, session?.user.id ?? "")
-      ? freeEntriesLeft(groupAccess, pendingInGroup)
-      : 0;
+  const openUnlock = useOpenUnlock();
   const memberName = (id: string) =>
     allMembers.find((member) => member.id === id)?.name ?? "Someone";
   // Only non-null ids: a deleted account's slot has no one left to unlock
@@ -286,24 +306,37 @@ export default function AddEntryScreen() {
 
   // "Select all" covers yourself too, since you appear as a tile alongside
   // everyone else.
-  // Tiles are a fixed third of the row wide, but grow with a name that
-  // doesn't fit — and those wider tiles are moved after all the standard
-  // ones, so the uniform three-per-row grid stays intact up top. Whether a
-  // tile is wide is only known once it's laid out, so the grid stays
-  // invisible until every tile has reported its width (a tile's width only
-  // depends on its name, so the reorder can't change it and loop).
+  // Tiles are a third of the row wide, laid out in explicit rows of three
+  // (not a wrapping row of third-wide tiles — float rounding can make three
+  // of those overflow the row and wrap two per row). A name that doesn't fit
+  // a third gets a tile exactly as wide as the name needs (capped at the full
+  // row), placed after all the standard rows so the uniform grid stays intact
+  // up top — shortest first, two to a row wherever two fit. Names are
+  // measured off-screen at their natural one-line width, so the grid stays
+  // invisible until every one has reported it.
   const [gridWidth, setGridWidth] = useState(0);
-  const [tileWidths, setTileWidths] = useState<Record<string, number>>({});
+  const [nameWidths, setNameWidths] = useState<Record<string, number>>({});
   const defaultTileWidth = Math.max(0, (gridWidth - 2 * MEMBER_GRID_GAP) / 3);
-  const isWideTile = (id: string) => tileWidths[id] > defaultTileWidth + 1;
-  const orderedMembers = [...members].sort(
-    (a, b) => Number(isWideTile(a.id)) - Number(isWideTile(b.id))
-  );
+  // +1 of slack so sub-pixel rounding never cuts a name that just fits.
+  const neededTileWidth = (id: string) =>
+    Math.ceil(nameWidths[id] ?? 0) + 1 + MEMBER_TILE_HORIZONTAL_INSET;
+  const isWideTile = (id: string) => neededTileWidth(id) > defaultTileWidth;
+  const standardMembers = members.filter((member) => !isWideTile(member.id));
+  const wideTiles = members
+    .filter((member) => isWideTile(member.id))
+    .map((member) => ({ member, width: Math.min(gridWidth, neededTileWidth(member.id)) }))
+    .sort(
+      (a, b) =>
+        a.width - b.width ||
+        (nameWidths[a.member.id] ?? 0) - (nameWidths[b.member.id] ?? 0)
+    );
+  const wideRows = packWideRows(wideTiles, gridWidth);
+  const orderedMembers = [...standardMembers, ...wideTiles.map((tile) => tile.member)];
   const isGridMeasured =
-    gridWidth > 0 && members.every((member) => tileWidths[member.id] !== undefined);
-  const handleTileLayout = (id: string) => (event: LayoutChangeEvent) => {
+    gridWidth > 0 && members.every((member) => nameWidths[member.id] !== undefined);
+  const handleNameLayout = (id: string) => (event: LayoutChangeEvent) => {
     const { width } = event.nativeEvent.layout;
-    setTileWidths((current) => (current[id] === width ? current : { ...current, [id]: width }));
+    setNameWidths((current) => (current[id] === width ? current : { ...current, [id]: width }));
   };
 
   // Locked members can't be picked, so "Select all" means everyone who can be.
@@ -370,6 +403,14 @@ export default function AddEntryScreen() {
   const lockedSelectedIds = Object.keys(selectedIds).filter(
     (id) => selectedIds[id] && isLocked(id)
   );
+  // Saving this uses one of the group's free entries unless everyone on it
+  // is unlocked, so the count shows whenever someone on it isn't — including
+  // to an unlocked person splitting with a locked one.
+  const usesFreeEntry =
+    !isMemberUnlocked(groupAccess, session?.user.id ?? "") ||
+    Object.keys(selectedIds).some((id) => selectedIds[id] && !isMemberUnlocked(groupAccess, id));
+  const freeEntriesShown =
+    groupAccess?.paywallEnabled && usesFreeEntry ? freeEntriesLeft(groupAccess, pendingInGroup) : 0;
   const canSubmit =
     amount.trim().length > 0 &&
     !Number.isNaN(amountValue) &&
@@ -383,8 +424,8 @@ export default function AddEntryScreen() {
   const lockedSelectedNames = lockedSelectedIds.map(memberName);
   const accessNote = viewerLocked
     ? isEditMode
-      ? "Your free entries in this group are used up, so editing one needs an unlock. Settling up and deleting your own entries stay free."
-      : "Your free entries in this group are used up, so adding one needs an unlock. Settling up and deleting your own entries stay free."
+      ? "This group's free entries are used up, so editing one needs an unlock. Settling up and deleting your own entries stay free."
+      : "This group's free entries are used up, so adding one needs an unlock. Settling up and deleting your own entries stay free."
     : lockedPreservedIds.length > 0
       ? `${joinNames(lockedPreservedIds.map(memberName))} left the group and ${lockedPreservedIds.length === 1 ? "isn't" : "aren't"} unlocked, so this entry can't be changed anymore. You can still delete it.`
       : lockedSelectedNames.length > 0
@@ -542,32 +583,73 @@ export default function AddEntryScreen() {
               />
             </PressableScale>
           </View>
-          <View
-            style={[styles.memberGrid, !isGridMeasured && styles.memberGridHidden]}
-            onLayout={(event) => setGridWidth(event.nativeEvent.layout.width)}
-          >
-            <MemberTile
-              name={profile.name}
-              label="You"
-              avatarUrl={profile.avatarUrl}
-              selected={includeMyself}
-              animationDelay={cascadeDelays[SELF_TILE_ID]}
-              onToggle={toggleMyself}
-              minWidth={defaultTileWidth}
-            />
-            {orderedMembers.map((member) => (
-              <MemberTile
-                key={member.id}
-                name={member.name}
-                avatarUrl={member.avatarUrl}
-                selected={!!selectedIds[member.id]}
-                locked={isLocked(member.id)}
-                animationDelay={cascadeDelays[member.id]}
-                onToggle={() => toggleMember(member.id)}
-                minWidth={defaultTileWidth}
-                onLayout={handleTileLayout(member.id)}
-              />
-            ))}
+          <View onLayout={(event) => setGridWidth(event.nativeEvent.layout.width)}>
+            <View style={styles.nameMeasurerClip} pointerEvents="none" aria-hidden>
+              <View style={styles.nameMeasurer}>
+                {members.map((member) => (
+                  <Text
+                    key={member.id}
+                    style={styles.memberTileName}
+                    onLayout={handleNameLayout(member.id)}
+                  >
+                    {member.name}
+                  </Text>
+                ))}
+              </View>
+            </View>
+            <View style={[styles.memberGrid, !isGridMeasured && styles.memberGridHidden]}>
+              {chunk(
+                [
+                  <MemberTile
+                    key={SELF_TILE_ID}
+                    name={profile.name}
+                    label="You"
+                    avatarUrl={profile.avatarUrl}
+                    selected={includeMyself}
+                    animationDelay={cascadeDelays[SELF_TILE_ID]}
+                    onToggle={toggleMyself}
+                    style={styles.memberTileStandard}
+                  />,
+                  ...standardMembers.map((member) => (
+                    <MemberTile
+                      key={member.id}
+                      name={member.name}
+                      avatarUrl={member.avatarUrl}
+                      selected={!!selectedIds[member.id]}
+                      locked={isLocked(member.id)}
+                      animationDelay={cascadeDelays[member.id]}
+                      onToggle={() => toggleMember(member.id)}
+                      style={styles.memberTileStandard}
+                    />
+                  )),
+                ],
+                3
+              ).map((row, index) => (
+                <View key={index} style={styles.memberRow}>
+                  {row}
+                  {/* Fillers keep a short last row's tiles a third wide. */}
+                  {Array.from({ length: 3 - row.length }, (_, i) => (
+                    <View key={`filler-${i}`} style={styles.memberTileStandard} />
+                  ))}
+                </View>
+              ))}
+              {wideRows.map((row) => (
+                <View key={row[0].member.id} style={styles.memberRow}>
+                  {row.map(({ member, width }) => (
+                    <MemberTile
+                      key={member.id}
+                      name={member.name}
+                      avatarUrl={member.avatarUrl}
+                      selected={!!selectedIds[member.id]}
+                      locked={isLocked(member.id)}
+                      animationDelay={cascadeDelays[member.id]}
+                      onToggle={() => toggleMember(member.id)}
+                      style={{ width }}
+                    />
+                  ))}
+                </View>
+              ))}
+            </View>
           </View>
         </View>
 
@@ -576,9 +658,10 @@ export default function AddEntryScreen() {
             <Ionicons name="lock-closed-outline" size={16} color={Colors.muted} />
             <Text style={styles.accessNoteText}>{accessNote}</Text>
           </View>
-        ) : freeLeft > 0 ? (
+        ) : freeEntriesShown > 0 ? (
           <Text style={styles.freeEntriesHint}>
-            You have {freeLeft === 1 ? "1 free entry" : `${freeLeft} free entries`} left in this group
+            {freeEntriesShown === 1 ? "1 free entry" : `${freeEntriesShown} free entries`} left in
+            this group
           </Text>
         ) : null}
 
@@ -586,7 +669,7 @@ export default function AddEntryScreen() {
           <PressableScale
             style={styles.submitButton}
             pressedScale={0.98}
-            onPress={() => router.push({ pathname: "/unlock", params: { groupId } })}
+            onPress={() => openUnlock({ groupId })}
           >
             <Text style={styles.submitButtonText}>
               {isEditMode ? "Unlock to edit entries" : "Unlock to add entries"}
@@ -714,24 +797,43 @@ const styles = StyleSheet.create({
     color: Colors.accent,
   },
   memberGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
     gap: MEMBER_GRID_GAP,
   },
   memberGridHidden: {
     opacity: 0,
   },
-  // Width comes from the minWidth prop (a third of the row) or the name,
-  // whichever is larger — capped at the full row for the longest names.
+  memberRow: {
+    flexDirection: "row",
+    gap: MEMBER_GRID_GAP,
+  },
+  // Lays every name out on one line at its natural width, out of sight, to
+  // tell which ones need a wide tile and how wide. The inner view is far
+  // wider than any name so nothing wraps; the zero-height clip keeps it from
+  // widening the page.
+  nameMeasurerClip: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    height: 0,
+    overflow: "hidden",
+    opacity: 0,
+  },
+  nameMeasurer: {
+    width: 10000,
+    alignItems: "flex-start",
+  },
   memberTile: {
-    maxWidth: "100%",
     alignItems: "center",
     gap: 8,
     paddingVertical: 12,
-    paddingHorizontal: 8,
-    borderWidth: 1,
+    paddingHorizontal: MEMBER_TILE_PADDING,
+    borderWidth: MEMBER_TILE_BORDER,
     borderColor: Colors.border,
     borderRadius: 12,
+  },
+  memberTileStandard: {
+    flex: 1,
+    flexBasis: 0,
   },
   memberAvatar: {
     width: 48,

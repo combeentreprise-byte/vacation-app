@@ -7,14 +7,15 @@ import {
   type ReactNode,
 } from "react";
 
-import { FREE_ENTRIES_PER_USER } from "@/constants/limits";
-import type { PlanKind } from "@/constants/plans";
+import { FREE_ENTRIES_PER_GROUP } from "@/constants/limits";
+import type { PlanKind, PlanSource } from "@/constants/plans";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/lib/supabase";
 import { readUserData, writeUserData } from "@/utils/offline-storage";
 
 // The plan whose seat currently unlocks the viewer — the longest-lasting
-// one, if several do.
+// one, if several do, with a renewing subscription counting as never
+// running out.
 export type CoveringPlan = {
   id: string;
   kind: PlanKind;
@@ -25,6 +26,9 @@ export type CoveringPlan = {
   sponsorName: string | null;
   endsAt: number;
   willRenew: boolean;
+  // How long it runs (a subscription's term), for how early its end gets
+  // pointed out. Null in a copy saved on the device before this existed.
+  durationDays: number | null;
 };
 
 // A running plan the viewer sponsors, holds a seat on, or both.
@@ -40,8 +44,64 @@ export type ActivePlan = {
   hasSeat: boolean;
   seatCount: number;
   seatsUsed: number;
+  // Null in a copy saved on the device before this existed (as is source;
+  // billingDates is missing there).
+  startsAt: number | null;
   endsAt: number;
   willRenew: boolean;
+  // How long it runs (a subscription's term), for how early its end gets
+  // pointed out. Null in a copy saved on the device before this existed.
+  durationDays: number | null;
+  source: PlanSource | null;
+  // A subscription's charges so far — the start of every term, oldest
+  // first. Empty for a Trip Pass.
+  billingDates?: number[];
+};
+
+// A Trip Pass of the viewer's that hasn't started: bought but not set up yet
+// (startsAt null — only ever the viewer's own), or set up to start later.
+export type UpcomingPlan = {
+  id: string;
+  kind: PlanKind;
+  // Null for "Just me", and for a group pass that isn't set up yet.
+  groupId: string | null;
+  groupName: string | null;
+  sponsorId: string | null;
+  sponsorName: string | null;
+  hasSeat: boolean;
+  seatCount: number;
+  seatsUsed: number;
+  startsAt: number | null;
+  endsAt: number | null;
+  // How long it runs once started.
+  durationDays: number;
+};
+
+// A plan that has ended which the viewer sponsored or held a seat on.
+export type PastPlan = {
+  id: string;
+  kind: PlanKind;
+  groupId: string | null;
+  groupName: string | null;
+  sponsorId: string | null;
+  sponsorName: string | null;
+  seatCount: number;
+  startsAt: number;
+  endsAt: number;
+  durationDays: number;
+};
+
+type PastPlanRow = {
+  id: string;
+  kind: PlanKind;
+  group_id: string | null;
+  group_name: string | null;
+  sponsor_id: string | null;
+  sponsor_name: string | null;
+  seat_count: number;
+  starts_at: string;
+  ends_at: string;
+  duration_days: number;
 };
 
 export type MyAccess = {
@@ -49,12 +109,24 @@ export type MyAccess = {
   // entries, and none of the plan UI shows (except to those who can make
   // test purchases).
   paywallEnabled: boolean;
-  freeEntriesPerUser: number;
+  // Free entries each group shares before entries need everyone unlocked.
+  freeEntriesPerGroup: number;
   // Can make free test purchases, until real store purchases exist.
   canTestPurchase: boolean;
+  // Has ever bought a plan or held a seat on one (ended ones included). The
+  // paywall only explains plans to people who haven't.
+  hasHadPlan: boolean;
   coveringPlan: CoveringPlan | null;
   // Longest-lasting first.
   activePlans: ActivePlan[];
+  // Not set up first, then soonest to start.
+  upcomingPlans: UpcomingPlan[];
+  // Ended, most recently first (the last 50).
+  pastPlans: PastPlan[];
+  // The viewer's groups that already have a plan that hasn't ended (running
+  // or still to start). A group can only have one at a time, so a pass being
+  // set up can't go to these.
+  groupsWithPlans: { groupId: string; startsAt: number; endsAt: number }[];
 };
 
 type CoveringPlanRow = {
@@ -65,6 +137,7 @@ type CoveringPlanRow = {
   sponsor_name: string | null;
   ends_at: string;
   will_renew: boolean;
+  duration_days?: number;
 };
 
 type ActivePlanRow = {
@@ -77,24 +150,49 @@ type ActivePlanRow = {
   has_seat: boolean;
   seat_count: number;
   seats_used: number;
+  starts_at?: string;
   ends_at: string;
   will_renew: boolean;
+  duration_days?: number;
+  source?: PlanSource;
+  billing_dates?: string[] | null;
+};
+
+type UpcomingPlanRow = {
+  id: string;
+  kind: PlanKind;
+  group_id: string | null;
+  group_name: string | null;
+  sponsor_id: string | null;
+  sponsor_name: string | null;
+  has_seat: boolean;
+  seat_count: number;
+  seats_used: number;
+  starts_at: string | null;
+  ends_at: string | null;
+  duration_days: number;
 };
 
 type MyAccessRow = {
   paywall_enabled: boolean;
-  free_entries_per_user: number;
+  free_entries_per_group: number;
   can_test_purchase: boolean;
+  has_had_plan: boolean;
   covering_plan: CoveringPlanRow | null;
   active_plans: ActivePlanRow[];
+  upcoming_plans: UpcomingPlanRow[];
+  // Missing from a copy saved on the device before this existed.
+  past_plans?: PastPlanRow[];
+  groups_with_plans: { group_id: string; starts_at: string; ends_at: string }[];
 };
 
 function mapAccess(row: MyAccessRow): MyAccess {
   const covering = row.covering_plan;
   return {
     paywallEnabled: row.paywall_enabled,
-    freeEntriesPerUser: row.free_entries_per_user,
+    freeEntriesPerGroup: row.free_entries_per_group,
     canTestPurchase: row.can_test_purchase,
+    hasHadPlan: row.has_had_plan,
     coveringPlan: covering
       ? {
           id: covering.id,
@@ -104,6 +202,7 @@ function mapAccess(row: MyAccessRow): MyAccess {
           sponsorName: covering.sponsor_name,
           endsAt: new Date(covering.ends_at).getTime(),
           willRenew: covering.will_renew,
+          durationDays: covering.duration_days ?? null,
         }
       : null,
     activePlans: row.active_plans.map((plan) => ({
@@ -116,8 +215,43 @@ function mapAccess(row: MyAccessRow): MyAccess {
       hasSeat: plan.has_seat,
       seatCount: plan.seat_count,
       seatsUsed: plan.seats_used,
+      startsAt: plan.starts_at ? new Date(plan.starts_at).getTime() : null,
       endsAt: new Date(plan.ends_at).getTime(),
       willRenew: plan.will_renew,
+      durationDays: plan.duration_days ?? null,
+      source: plan.source ?? null,
+      billingDates: (plan.billing_dates ?? []).map((date) => new Date(date).getTime()),
+    })),
+    upcomingPlans: row.upcoming_plans.map((plan) => ({
+      id: plan.id,
+      kind: plan.kind,
+      groupId: plan.group_id,
+      groupName: plan.group_name,
+      sponsorId: plan.sponsor_id,
+      sponsorName: plan.sponsor_name,
+      hasSeat: plan.has_seat,
+      seatCount: plan.seat_count,
+      seatsUsed: plan.seats_used,
+      startsAt: plan.starts_at ? new Date(plan.starts_at).getTime() : null,
+      endsAt: plan.ends_at ? new Date(plan.ends_at).getTime() : null,
+      durationDays: plan.duration_days,
+    })),
+    pastPlans: (row.past_plans ?? []).map((plan) => ({
+      id: plan.id,
+      kind: plan.kind,
+      groupId: plan.group_id,
+      groupName: plan.group_name,
+      sponsorId: plan.sponsor_id,
+      sponsorName: plan.sponsor_name,
+      seatCount: plan.seat_count,
+      startsAt: new Date(plan.starts_at).getTime(),
+      endsAt: new Date(plan.ends_at).getTime(),
+      durationDays: plan.duration_days,
+    })),
+    groupsWithPlans: row.groups_with_plans.map((item) => ({
+      groupId: item.group_id,
+      startsAt: new Date(item.starts_at).getTime(),
+      endsAt: new Date(item.ends_at).getTime(),
     })),
   };
 }
@@ -126,10 +260,14 @@ function mapAccess(row: MyAccessRow): MyAccess {
 // is ever blocked on a guess — the server decides either way.
 const INITIAL_ACCESS: MyAccess = {
   paywallEnabled: false,
-  freeEntriesPerUser: FREE_ENTRIES_PER_USER,
+  freeEntriesPerGroup: FREE_ENTRIES_PER_GROUP,
   canTestPurchase: false,
+  hasHadPlan: false,
   coveringPlan: null,
   activePlans: [],
+  upcomingPlans: [],
+  pastPlans: [],
+  groupsWithPlans: [],
 };
 
 type AccessContextValue = {

@@ -35,11 +35,11 @@ import { PressableScale } from "@/components/press-feedback";
 import { Colors } from "@/constants/colors";
 import { PASSWORD_MAX_LENGTH, PROFILE_NAME_MAX_LENGTH } from "@/constants/limits";
 import { planKindLabel } from "@/constants/plans";
-import { useAccess } from "@/hooks/use-access";
+import { type UpcomingPlan, useAccess } from "@/hooks/use-access";
 import { useAuth } from "@/hooks/use-auth";
 import { useLogs } from "@/hooks/use-logs";
 import { useProfile } from "@/hooks/use-profile";
-import { formatAccessDate } from "@/utils/access";
+import { formatAccessDate, formatPlanEnd } from "@/utils/access";
 
 type IoniconName = ComponentProps<typeof Ionicons>["name"];
 
@@ -333,8 +333,9 @@ function SettingsAccordionRow({
 }
 
 // Sits on its own above the settings rows (it's the one thing here that
-// isn't a setting) as a light accent-tinted card, and opens your running
-// plans (/plans), or /unlock to buy one when you have none. Refreshed
+// isn't a setting) as a light accent-tinted card, and opens your plans
+// (/plans, including Trip Passes still to set up or starting later), or
+// the paywall to buy one when you have none. Refreshed
 // whenever the tab comes back into view, since a seat can be handed to you
 // from someone else's phone.
 function PlanCard() {
@@ -347,26 +348,53 @@ function PlanCard() {
   );
 
   const plan = access.coveringPlan;
-  const planCount = access.activePlans.length;
+  const planCount = access.activePlans.length + access.upcomingPlans.length;
+  const plansToSetUp = access.upcomingPlans.filter(
+    (item) => item.startsAt === null && item.sponsorId === session?.user.id
+  );
+  const toSetUp = plansToSetUp.length;
   const whose = plan
     ? plan.sponsorId === session?.user.id
       ? "Your"
       : `${plan.sponsorName ?? "Someone"}'s`
     : "";
   const title = plan
-    ? `${plan.willRenew ? "Renews" : "Unlocked until"} ${formatAccessDate(plan.endsAt)}`
-    : "No plan yet";
+    ? formatPlanEnd(
+        plan.endsAt,
+        plan.willRenew,
+        plan.durationDays,
+        `${plan.willRenew ? "Renews" : "Unlocked until"} ${formatAccessDate(plan.endsAt)}`
+      )
+    : toSetUp > 0
+      ? toSetUp === 1
+        ? "Your Trip Pass is ready"
+        : `${toSetUp} Trip Passes are ready`
+      : access.upcomingPlans.length > 0
+        ? "Your plan hasn't started yet"
+        : planCount > 0
+          ? // What's left: running plans of yours with no seat for you.
+            `Your ${planCount === 1 ? "plan doesn't" : "plans don't"} unlock you`
+          : "No plan yet";
   const subtitle = plan
     ? `${whose} ${planKindLabel(plan.kind)}${planCount > 1 ? ` · ${planCount} plans` : ""}`
-    : access.paywallEnabled
-      ? "Unlock to add entries in your groups"
-      : "Test purchases available";
+    : toSetUp > 0
+      ? `Set ${toSetUp === 1 ? "it" : "them"} up now`
+      : planCount > 0
+        ? "See your plans"
+        : access.paywallEnabled
+          ? "Unlock to add entries in your groups"
+          : "Test purchases available";
 
   return (
     <PressableScale
       style={styles.planCard}
       pressedScale={0.98}
-      onPress={() => router.push(planCount > 0 ? "/plans" : "/unlock")}
+      onPress={() =>
+        // A single pass waiting to be set up opens straight into setting it up.
+        !plan && planCount === 1 && toSetUp === 1
+          ? router.push({ pathname: "/plan-setup", params: { planId: plansToSetUp[0].id } })
+          : router.push(planCount > 0 ? "/plans" : "/paywall")
+      }
     >
       <View style={styles.planCardIcon}>
         <Ionicons name="ticket-outline" size={22} color={Colors.accent} />
@@ -566,14 +594,44 @@ function SignOutDropdown({ onCancel }: { onCancel: () => void }) {
   );
 }
 
+// What deleting the account does to Trip Passes the viewer bought that
+// haven't started (delete_account frees their seats on those): one not set
+// up yet, or a "Just me" one, is simply lost; a group pass still goes ahead
+// for the group, just without them. Null when there's nothing to warn about.
+function describeForfeitedPasses(
+  upcomingPlans: UpcomingPlan[],
+  userId: string | undefined
+): string | null {
+  const own = upcomingPlans.filter((plan) => plan.sponsorId === userId);
+  const lost = own.filter((plan) => plan.startsAt === null || plan.groupId === null);
+  const groupPasses = own.filter((plan) => plan.startsAt !== null && plan.groupId !== null);
+  const parts: string[] = [];
+  if (lost.length > 0) {
+    parts.push(
+      lost.length === 1
+        ? "You'll lose a Trip Pass you bought that hasn't started yet."
+        : `You'll lose ${lost.length} Trip Passes you bought that haven't started yet.`
+    );
+  }
+  if (groupPasses.length > 0) {
+    const names = groupPasses.map((plan) => plan.groupName ?? "your group").join(", ");
+    parts.push(
+      `Your group ${groupPasses.length === 1 ? "pass" : "passes"} for ${names} will still start for the group, but without a seat for you.`
+    );
+  }
+  return parts.length > 0 ? parts.join(" ") : null;
+}
+
 function DangerZoneDropdown() {
-  const { deleteAccount } = useAuth();
+  const { deleteAccount, session } = useAuth();
+  const { access } = useAccess();
   const [isDeleting, setIsDeleting] = useState(false);
+  const passWarning = describeForfeitedPasses(access.upcomingPlans, session?.user.id);
 
   const handleDelete = () => {
     Alert.alert(
       "Delete your account?",
-      "Your profile is permanently erased. Groups you created or expenses you paid for will show as \"Deleted user\" to other members. This can't be undone.",
+      `Your profile is permanently erased. Groups you created or expenses you paid for will show as "Deleted user" to other members.${passWarning ? ` ${passWarning}` : ""} This can't be undone.`,
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -604,6 +662,7 @@ function DangerZoneDropdown() {
         for stay visible to other members, attributed to &quot;Deleted
         user&quot; instead of your name.
       </Text>
+      {passWarning ? <Text style={styles.dangerWarning}>{passWarning}</Text> : null}
 
       <Pressable
         style={[styles.dangerButton, isDeleting && styles.submitButtonDisabled]}
@@ -1373,6 +1432,13 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
     color: Colors.muted,
+    marginBottom: 4,
+  },
+  dangerWarning: {
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: "600",
+    color: Colors.danger,
     marginBottom: 4,
   },
   buttonPair: {

@@ -53,7 +53,11 @@ function RootNavigator() {
             options={{ presentation: "modal", animation: "slide_from_bottom" }}
           />
           <Stack.Screen
-            name="unlock"
+            name="paywall"
+            options={{ presentation: "fullScreenModal", animation: "slide_from_bottom" }}
+          />
+          <Stack.Screen
+            name="plan-setup"
             options={{ presentation: "modal", animation: "slide_from_bottom" }}
           />
           <Stack.Screen
@@ -62,6 +66,10 @@ function RootNavigator() {
           />
           <Stack.Screen
             name="plans"
+            options={{ presentation: "modal", animation: "slide_from_bottom" }}
+          />
+          <Stack.Screen
+            name="subscription"
             options={{ presentation: "modal", animation: "slide_from_bottom" }}
           />
           <Stack.Screen name="join/[id]" />

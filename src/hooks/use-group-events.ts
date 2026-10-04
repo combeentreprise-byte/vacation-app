@@ -12,8 +12,11 @@ const GROUP_EVENT_KINDS = [
   "member_kicked",
   "admin_promoted",
   "admin_auto_promoted",
+  "admin_demoted",
+  "sponsor_handed_over",
   "plan_started",
   "plan_seat_given",
+  "plan_seat_removed",
 ] as const;
 
 export type GroupEventKind = (typeof GROUP_EVENT_KINDS)[number];
@@ -24,8 +27,11 @@ export type PlanEventDetails = {
   planId: string;
   seatCount: number;
   endsAt: number;
-  // plan_started only: whether it renews, and who got the seats it started
-  // with (they get no plan_seat_given events of their own).
+  // plan_started only: when it starts (missing from ones recorded before a
+  // pass could start later, which started when they were recorded), whether
+  // it renews, and who got the seats it started with (they get no
+  // plan_seat_given events of their own).
+  startsAt?: number;
   willRenew?: boolean;
   seatHolders?: string[];
   // plan_seat_given only: taken seats, counting the one just given.
@@ -39,12 +45,13 @@ export type GroupEvent = {
   id: string;
   groupId: string;
   kind: GroupEventKind;
-  // Who did it — for admin_auto_promoted, the admin whose leaving caused it.
+  // Who did it — for admin_auto_promoted / sponsor_handed_over, the admin /
+  // sponsor whose leaving caused it.
   // Null once that person has deleted their account, same as LogEntry.paidBy.
   actorId: string | null;
   // Who it was done to (member_kicked, admin_promoted, admin_auto_promoted,
-  // plan_seat_given); null for the other kinds, or once that person has
-  // deleted their account.
+  // admin_demoted, sponsor_handed_over, plan_seat_given, plan_seat_removed);
+  // null for the other kinds, or once that person has deleted their account.
   targetId: string | null;
   // Plan events only; null for other kinds (and in a copy saved on the
   // device before this existed).
@@ -61,6 +68,7 @@ type GroupEventRow = {
   details: {
     plan_id: string;
     seat_count: number;
+    starts_at?: string;
     ends_at: string;
     will_renew?: boolean;
     seat_holders?: string[];
@@ -89,6 +97,9 @@ function mapEvents(rows: GroupEventRow[]): GroupEvent[] {
               ? {
                   planId: row.details.plan_id,
                   seatCount: row.details.seat_count,
+                  startsAt: row.details.starts_at
+                    ? new Date(row.details.starts_at).getTime()
+                    : undefined,
                   endsAt: new Date(row.details.ends_at).getTime(),
                   willRenew: row.details.will_renew,
                   seatHolders: row.details.seat_holders,

@@ -6,7 +6,9 @@ import { supabase } from "@/lib/supabase";
 import { requestErrorMessage } from "@/utils/network";
 import { readUserData, writeUserData } from "@/utils/offline-storage";
 
-// The group plan running right now, if any (at most one per group).
+// The group's plan that hasn't ended, if any (at most one per group):
+// running, or set up to start later (startsAt still ahead — its seat holders
+// aren't unlocked by it until then).
 export type GroupPlan = {
   id: string;
   kind: PlanKind;
@@ -23,25 +25,36 @@ export type GroupPlan = {
   startsAt: number | null;
   endsAt: number;
   willRenew: boolean;
+  // How long it runs. Null in a copy saved on the device before this
+  // existed.
+  durationDays: number | null;
   // Whether the viewer hands out its seats: its sponsor, or the group's
   // admins once the sponsor is no longer in the group.
   canManage: boolean;
+  // Members holding one of its seats (from `members`). Missing from a copy
+  // saved on the device before this existed.
+  seatHolderIds?: string[];
 };
 
 export type MemberAccess = {
   // When their unlock runs out (from any plan, not just this group's), or
-  // null if they aren't unlocked.
+  // null if they aren't unlocked. A renewing subscription wins over a
+  // longer pass: it counts as never running out (isCoveredAt).
   unlockedUntil: number | null;
   willRenew: boolean;
+  // How long the plan unlocking them runs, or null (not unlocked, or a copy
+  // saved on the device before this existed).
+  unlockDays: number | null;
   // Holds one of this group's plan seats.
   hasSeat: boolean;
 };
 
 export type GroupAccess = {
   paywallEnabled: boolean;
-  // The viewer's own free entries left in this group (everyone gets their
-  // own in each group), as far as the server knows — entries still queued on
-  // this device aren't counted yet (see freeEntriesLeft in utils/access.ts).
+  // The group's free entries left, shared by everyone in it, as far as the
+  // server knows — entries still queued on this device aren't counted yet
+  // (see freeEntriesLeft in utils/access.ts), and other members may have
+  // used some since this was fetched.
   freeEntriesLeft: number;
   plan: GroupPlan | null;
   // Keyed by user id; includes members who left.
@@ -61,12 +74,14 @@ type GroupAccessRow = {
     starts_at?: string;
     ends_at: string;
     will_renew: boolean;
+    duration_days?: number;
     can_manage: boolean;
   } | null;
   members: {
     user_id: string;
     unlocked_until: string | null;
     will_renew: boolean;
+    unlock_days?: number | null;
     has_seat: boolean;
   }[];
 };
@@ -87,7 +102,11 @@ function mapGroupAccess(row: GroupAccessRow): GroupAccess {
           startsAt: row.plan.starts_at ? new Date(row.plan.starts_at).getTime() : null,
           endsAt: new Date(row.plan.ends_at).getTime(),
           willRenew: row.plan.will_renew,
+          durationDays: row.plan.duration_days ?? null,
           canManage: row.plan.can_manage,
+          seatHolderIds: row.members
+            .filter((member) => member.has_seat)
+            .map((member) => member.user_id),
         }
       : null,
     members: Object.fromEntries(
@@ -96,6 +115,7 @@ function mapGroupAccess(row: GroupAccessRow): GroupAccess {
         {
           unlockedUntil: member.unlocked_until ? new Date(member.unlocked_until).getTime() : null,
           willRenew: member.will_renew,
+          unlockDays: member.unlock_days ?? null,
           hasSeat: member.has_seat,
         },
       ])
@@ -173,5 +193,23 @@ export function useGroupAccess(groupId: string | undefined) {
     [refresh]
   );
 
-  return { access, isLoaded, refresh, assignSeats };
+  // Only before the pass starts — after that its seats are locked in.
+  // remove_plan_seat enforces that and every other rule server-side.
+  const removeSeat = useCallback(
+    async (planId: string, memberId: string) => {
+      const { error, status } = await supabase.rpc("remove_plan_seat", {
+        p_plan_id: planId,
+        p_user_id: memberId,
+      });
+      if (error) {
+        console.warn("Failed to remove seat", error);
+        return { error: requestErrorMessage(error.message, status) };
+      }
+      await refresh();
+      return {};
+    },
+    [refresh]
+  );
+
+  return { access, isLoaded, refresh, assignSeats, removeSeat };
 }

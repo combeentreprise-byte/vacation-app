@@ -60,6 +60,11 @@ type GroupActionsMenuProps = {
   canEdit: boolean;
   // Switches the confirmation copy to warn that leaving deletes the group.
   isLastMember: boolean;
+  // Adds that the sponsor role passes on for good (see leave_group).
+  isSponsor: boolean;
+  // Adds that leaving gives up the viewer's seat on the group's pass
+  // starting then (see LeaveGroupConfirmationBody).
+  seatStartsAt: number | null;
 };
 
 export function GroupActionsMenu({
@@ -72,6 +77,8 @@ export function GroupActionsMenu({
   onClosed,
   canEdit,
   isLastMember,
+  isSponsor,
+  seatStartsAt,
 }: GroupActionsMenuProps) {
   const { isMounted, progress } = usePopupAnimation(
     !!anchor,
@@ -284,6 +291,8 @@ export function GroupActionsMenu({
                   <View style={styles.details} onLayout={onDetailsLayout}>
                     <LeaveGroupConfirmationBody
                       isLastMember={isLastMember}
+                      isSponsor={isSponsor}
+                      seatStartsAt={seatStartsAt}
                       onCancel={() => setIsConfirmingLeave(false)}
                       onConfirm={onLeave}
                     />

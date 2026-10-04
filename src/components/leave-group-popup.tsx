@@ -18,7 +18,13 @@ const ANCHOR_GAP_X = 20;
 // roughly with the icon it came from.
 const TITLE_OFFSET_Y = 26;
 
-export type LeaveGroupRequest = { anchor: MenuAnchor; isLastMember: boolean };
+export type LeaveGroupRequest = {
+  anchor: MenuAnchor;
+  isLastMember: boolean;
+  isSponsor: boolean;
+  // See LeaveGroupConfirmationBody.
+  seatStartsAt: number | null;
+};
 
 // The group list's leave confirmation: a popup that opens just to the right
 // of the tapped leave icon, over the group's card. Same content as the
@@ -82,6 +88,8 @@ export function LeaveGroupPopup({
             </View>
             <LeaveGroupConfirmationBody
               isLastMember={displayRequest.isLastMember}
+              isSponsor={displayRequest.isSponsor}
+              seatStartsAt={displayRequest.seatStartsAt}
               onCancel={onClose}
               onConfirm={onConfirm}
             />

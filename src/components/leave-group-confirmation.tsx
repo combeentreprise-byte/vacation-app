@@ -1,12 +1,17 @@
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { Colors } from "@/constants/colors";
+import { formatAccessDate } from "@/utils/access";
 
 // Shared by every leave-group confirmation popup (the group screen's
 // GroupActionsMenu and the group list's LeaveGroupPopup), so the wording and
 // buttons can't drift apart between the two. `isLastMember` switches to the
 // copy warning that leaving deletes the group — leave_group itself
 // (schema.sql) decides that server-side, so this only picks the warning.
+// `isSponsor` adds that the sponsor role passes to someone else for good, and
+// `seatStartsAt` (the start of the group's pass, when the leaver holds a
+// seat on it and it hasn't started) that leaving gives that seat up
+// (free_pending_plan_seat in schema.sql).
 
 export const LEAVE_CONFIRMATION_WIDTH = 280;
 // Horizontal inset of the title and message, matching the menu rows'.
@@ -19,19 +24,30 @@ export function leaveConfirmationTitle(isLastMember: boolean) {
 // Everything below the title: the message and the Cancel / confirm buttons.
 export function LeaveGroupConfirmationBody({
   isLastMember,
+  isSponsor = false,
+  seatStartsAt = null,
   onCancel,
   onConfirm,
 }: {
   isLastMember: boolean;
+  isSponsor?: boolean;
+  seatStartsAt?: number | null;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
+  const seatDate = seatStartsAt !== null ? formatAccessDate(seatStartsAt) : null;
   return (
     <ConfirmationBody
       message={
         isLastMember
           ? "You're the last member of this group. Leaving will permanently delete the group and all its logs and balances — this can't be undone."
-          : "Are you sure you want to leave this group?"
+          : isSponsor
+            ? `You're this group's sponsor. If you leave, another member becomes the sponsor, and you won't get it back even if you rejoin.${
+                seatDate ? ` You'll also give up your seat on its pass starting ${seatDate}.` : ""
+              }`
+            : seatDate
+              ? `You have a seat on this group's pass starting ${seatDate}. If you leave, you give it up — rejoining won't bring it back, only the sponsor can give it to you again.`
+              : "Are you sure you want to leave this group?"
       }
       confirmLabel={isLastMember ? "Delete" : "Leave"}
       destructive
@@ -48,6 +64,7 @@ export function LeaveGroupConfirmationBody({
 export function ConfirmationBody({
   message,
   confirmLabel,
+  cancelLabel = "Cancel",
   destructive = false,
   disabled = false,
   messageInset = LEAVE_CONFIRMATION_PADDING_X,
@@ -58,6 +75,8 @@ export function ConfirmationBody({
 }: {
   message: string;
   confirmLabel: string;
+  // For when "Cancel" itself would be ambiguous ("Cancel subscription").
+  cancelLabel?: string;
   destructive?: boolean;
   disabled?: boolean;
   messageInset?: number;
@@ -81,7 +100,7 @@ export function ConfirmationBody({
           onPress={onCancel}
           disabled={disabled}
         >
-          <Text style={styles.cancelButtonText}>Cancel</Text>
+          <Text style={styles.cancelButtonText}>{cancelLabel}</Text>
         </Pressable>
         <Pressable
           style={[

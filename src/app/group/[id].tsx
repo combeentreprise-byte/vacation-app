@@ -63,13 +63,16 @@ import {
 import { type GroupMember, useGroupMembers } from "@/hooks/use-group-members";
 import { useGroups } from "@/hooks/use-groups";
 import { type LogEntry, useLogs } from "@/hooks/use-logs";
+import { useOpenUnlock } from "@/hooks/use-open-unlock";
 import { useProfile } from "@/hooks/use-profile";
 import { useRefreshOnRefocus } from "@/hooks/use-refresh-on-refocus";
 import {
   entriesNeedUnlock,
   formatAccessDate,
+  formatPlanEnd,
   freeEntriesLeft,
   isMemberUnlocked,
+  isNotStartedYet,
   joinNames,
   unlockEndsEarly,
 } from "@/utils/access";
@@ -190,7 +193,9 @@ function capitalize(text: string) {
 // What GroupAccessLine says: where the group stands (its plan, free entries
 // left, or locked), plus the one thing most worth acting on, if any — for
 // the sponsor, someone without a seat; for anyone, an unlock running out
-// early or people who can't be on entries.
+// early or people who can't be on entries. A plan that hasn't started yet
+// doesn't unlock anyone, so until then the group stands as it would without
+// it, and the line says when it starts.
 function describeGroupAccess(
   groupAccess: GroupAccess,
   // Everyone, the viewer and members who left included.
@@ -203,7 +208,9 @@ function describeGroupAccess(
   tone: AccessTone;
   prompt: { text: string; tone: AccessTone } | null;
 } {
-  const plan = groupAccess.plan;
+  const upcoming =
+    groupAccess.plan && isNotStartedYet(groupAccess.plan.startsAt) ? groupAccess.plan : null;
+  const plan = upcoming ? null : groupAccess.plan;
   const freeLeft = freeEntriesLeft(groupAccess, pendingInGroup);
   const needsUnlock = entriesNeedUnlock(groupAccess, pendingInGroup);
   const viewerUnlocked = isMemberUnlocked(groupAccess, viewerId);
@@ -222,7 +229,12 @@ function describeGroupAccess(
     main = {
       icon: "lock-open-outline",
       tone: "success",
-      text: `Unlocked by ${nameOf(plan.sponsorId)} · ${plan.willRenew ? "renews" : "until"} ${formatAccessDate(plan.endsAt)}${
+      text: `Unlocked by ${nameOf(plan.sponsorId)} · ${formatPlanEnd(
+        plan.endsAt,
+        plan.willRenew,
+        plan.durationDays,
+        `${plan.willRenew ? "renews" : "until"} ${formatAccessDate(plan.endsAt)}`
+      )}${
         seatsFree > 0 ? ` · ${seatsFree} ${seatsFree === 1 ? "seat" : "seats"} free` : ""
       }`,
     };
@@ -233,7 +245,7 @@ function describeGroupAccess(
     main = {
       icon: "gift-outline",
       tone: "muted",
-      text: `You have ${freeLeft} free ${freeLeft === 1 ? "entry" : "entries"} left in this group`,
+      text: `${freeLeft} free ${freeLeft === 1 ? "entry" : "entries"} left in this group`,
     };
   } else if (!viewerUnlocked) {
     main = { icon: "lock-closed-outline", tone: "muted", text: "Entries are locked · Unlock" };
@@ -241,7 +253,18 @@ function describeGroupAccess(
     main = {
       icon: "lock-open-outline",
       tone: "success",
-      text: `You're unlocked until ${formatAccessDate(groupAccess.members[viewerId]?.unlockedUntil as number)}`,
+      text: (() => {
+        const own = groupAccess.members[viewerId];
+        const until = own?.unlockedUntil as number;
+        return formatPlanEnd(
+          until,
+          !!own?.willRenew,
+          own?.unlockDays,
+          own?.willRenew
+            ? `You're unlocked · renews ${formatAccessDate(until)}`
+            : `You're unlocked until ${formatAccessDate(until)}`
+        );
+      })(),
     };
   }
 
@@ -250,18 +273,20 @@ function describeGroupAccess(
   );
   let prompt: { text: string; tone: AccessTone } | null = null;
   if (plan?.canManage && locked.length > 0) {
-    const canGive =
-      plan.seatCount > plan.seatsUsed ||
-      members.some((member) => !member.isActive && groupAccess.members[member.id]?.hasSeat);
+    // A seat stays with its holder even after they leave the group (and
+    // seatsUsed still counts it), so only seats never given out are free.
+    const canGive = plan.seatCount > plan.seatsUsed;
     prompt = {
       text: `${areLocked} · ${canGive ? "Give a seat" : "No seats left"}`,
       tone: "warning",
     };
   } else if (needsUnlock && !viewerUnlocked && plan) {
-    const sponsorIsActive = active.some((member) => member.id === plan.sponsorId);
+    // Whoever hands out the seats (can_manage_plan in schema.sql), which
+    // after the buyer left is whoever took over as sponsor, not them.
+    const groupSponsor = active.find((member) => member.isSponsor);
     prompt = {
       text: `You don't have a seat · Ask ${
-        sponsorIsActive ? nameOf(plan.sponsorId) : "an admin"
+        groupSponsor ? nameOf(groupSponsor.id) : "an admin"
       } or unlock yourself`,
       tone: "warning",
     };
@@ -278,12 +303,18 @@ function describeGroupAccess(
   } else if (needsUnlock && viewerUnlocked && locked.length > 0) {
     prompt = { text: `${areLocked}, so they can't be on entries yet`, tone: "muted" };
   }
+  if (upcoming) {
+    prompt = {
+      text: `Trip Pass from ${nameOf(upcoming.sponsorId)} starts ${formatAccessDate(upcoming.startsAt as number)}`,
+      tone: "muted",
+    };
+  }
 
   return { ...main, prompt };
 }
 
 // Where the group stands with the paywall, under its currency. Opens the
-// group plan screen, or /unlock while there's no plan yet.
+// group plan screen, or the paywall while there's no plan yet.
 function GroupAccessLine({
   groupAccess,
   members,
@@ -334,8 +365,8 @@ function AdminBadge({ size }: { size: number }) {
   );
 }
 
-// Marks whoever sponsors the group's running plan. Sits on the avatar's
-// opposite corner from AdminBadge, since a sponsor is often an admin too.
+// Marks the group's sponsor (GroupMember.isSponsor). Shown in place of
+// AdminBadge: a sponsor is always an admin too, so the star covers both.
 function SponsorBadge({ size }: { size: number }) {
   const iconSize = (size - 2 * ADMIN_BADGE_BORDER_WIDTH) * 0.65;
   return (
@@ -540,9 +571,16 @@ function describeMemberAccess(
     return { text: "Locked", tone: "locked" };
   }
   const memberAccess = groupAccess.members[member.id];
-  if (unlockEndsEarly(memberAccess, groupAccess.plan?.endsAt ?? null)) {
+  const plan = groupAccess.plan;
+  const runningEndsAt = plan && !isNotStartedYet(plan.startsAt) ? plan.endsAt : null;
+  if (unlockEndsEarly(memberAccess, runningEndsAt)) {
     return {
-      text: `Unlocked until ${formatAccessDate(memberAccess.unlockedUntil as number)}`,
+      text: formatPlanEnd(
+        memberAccess.unlockedUntil as number,
+        memberAccess.willRenew,
+        memberAccess.unlockDays,
+        `Unlocked until ${formatAccessDate(memberAccess.unlockedUntil as number)}`
+      ),
       tone: "warning",
     };
   }
@@ -594,13 +632,19 @@ function MemberRow({
             style={styles.avatar}
             textStyle={styles.avatarText}
           />
-          {member.isAdmin ? <AdminBadge size={18} /> : null}
-          {isSponsor ? <SponsorBadge size={18} /> : null}
+          {isSponsor ? <SponsorBadge size={18} /> : member.isAdmin ? <AdminBadge size={18} /> : null}
         </View>
         <View style={styles.memberNameColumn}>
           <Text style={styles.memberName}>{member.name}</Text>
-          <Text style={styles.leftLabel}>You</Text>
-          {accessLabel ? <MemberAccessNote label={accessLabel} /> : null}
+          <View style={styles.memberSubtitleRow}>
+            <Text style={styles.leftLabel}>You</Text>
+            {accessLabel ? (
+              <>
+                <Text style={styles.leftLabel}>·</Text>
+                <MemberAccessNote label={accessLabel} />
+              </>
+            ) : null}
+          </View>
         </View>
       </View>
     );
@@ -615,8 +659,7 @@ function MemberRow({
           style={[styles.avatar, !member.isActive && styles.avatarInactive]}
           textStyle={styles.avatarText}
         />
-        {member.isAdmin ? <AdminBadge size={18} /> : null}
-        {isSponsor ? <SponsorBadge size={18} /> : null}
+        {isSponsor ? <SponsorBadge size={18} /> : member.isAdmin ? <AdminBadge size={18} /> : null}
       </View>
       <View style={styles.memberNameColumn}>
         <Text style={[styles.memberName, !member.isActive && styles.memberNameInactive]}>
@@ -644,7 +687,7 @@ function MemberRow({
   );
 }
 
-type MemberAction = "promote" | "kick" | "settle";
+type MemberAction = "promote" | "demote" | "kick" | "settle";
 
 const MEMBER_MORPH_DURATION_MS = 260;
 const MEMBER_ROW_ICON_SIZE = 20;
@@ -755,21 +798,28 @@ function MemberDetailOverlay({
   debt,
   currency,
   viewerIsAdmin,
+  viewerIsSponsor,
   sponsorId,
   onClose,
   onSettle,
   onPromote,
+  onDemote,
   onKick,
 }: {
   member: GroupMember | null;
   debt: number;
   currency: string;
   viewerIsAdmin: boolean;
-  // The running group plan's sponsor, for their SponsorBadge.
+  // The sponsor can also demote admins, which turns the promote row into a
+  // "Demote admin" one for an admin.
+  viewerIsSponsor: boolean;
+  // The group's sponsor: their SponsorBadge, and they can't be kicked or
+  // demoted.
   sponsorId: string | null;
   onClose: () => void;
   onSettle: () => Promise<void>;
   onPromote: () => Promise<void>;
+  onDemote: () => Promise<void>;
   onKick: () => Promise<void>;
 }) {
   const { isMounted, progress } = usePopupAnimation(!!member);
@@ -861,7 +911,9 @@ function MemberDetailOverlay({
 
   const handleConfirm = async () => {
     if (!confirmAction) return;
-    const run = { promote: onPromote, kick: onKick, settle: onSettle }[confirmAction];
+    const run = { promote: onPromote, demote: onDemote, kick: onKick, settle: onSettle }[
+      confirmAction
+    ];
     setIsBusy(true);
     // On success the parent closes the popup; on failure it reports the
     // error and the confirmation stays up so it can be retried or cancelled.
@@ -877,14 +929,24 @@ function MemberDetailOverlay({
   // (a departed member reuses the same "Left group" wording as the Members
   // list, rather than letting the press-and-hold run and fail with an alert).
   const canPromote = viewerIsAdmin && !targetIsAdmin && targetIsActive;
+  const targetIsSponsor = !!displayMember && displayMember.id === sponsorId;
+  // For the sponsor, the same row demotes an admin instead (never the
+  // sponsor themselves, who's always one — demote_admin in schema.sql).
+  const canDemote = viewerIsSponsor && targetIsAdmin && !targetIsSponsor && targetIsActive;
+  const promoteAction: MemberAction = canDemote ? "demote" : "promote";
   const promoteLabel = !targetIsActive
     ? "Left group"
-    : targetIsAdmin
-      ? "Already an admin"
-      : "Promote to admin";
+    : canDemote
+      ? "Demote admin"
+      : targetIsSponsor
+        ? "Group sponsor"
+        : targetIsAdmin
+          ? "Already an admin"
+          : "Promote to admin";
   // Kicking someone who's already left doesn't mean anything, so that's
-  // grayed out too, not just "you're not an admin".
-  const canKick = viewerIsAdmin && targetIsActive;
+  // grayed out too, not just "you're not an admin". Nobody can kick the
+  // sponsor (kick_member in schema.sql).
+  const canKick = viewerIsAdmin && targetIsActive && !targetIsSponsor;
   // The "Deleted user" placeholder represents one or more erased accounts
   // merged together (see DELETED_USER_ID in balances.ts) â€” there's no real
   // account left to record a settlement against, so this is grayed out
@@ -899,8 +961,20 @@ function MemberDetailOverlay({
   > = {
     promote: {
       title: `Promote ${name}?`,
-      message: "They'll be able to edit the group and promote or remove members. This can't be undone.",
+      message: `They'll be able to edit the group and promote or remove members. ${
+        viewerIsSponsor
+          ? "You can demote them again later."
+          : sponsorId
+            ? "Only the group's sponsor can undo this."
+            : "This can't be undone."
+      }`,
       confirmLabel: "Promote",
+    },
+    demote: {
+      title: `Demote ${name}?`,
+      message: "They'll stay in the group as a regular member, without admin rights.",
+      confirmLabel: "Demote",
+      destructive: true,
     },
     kick: {
       title: `Remove ${name}?`,
@@ -952,8 +1026,11 @@ function MemberDetailOverlay({
                       style={[styles.avatarLarge, !displayMember.isActive && styles.avatarInactive]}
                       textStyle={styles.avatarLargeText}
                     />
-                    {displayMember.isAdmin ? <AdminBadge size={28} /> : null}
-                    {displayMember.id === sponsorId ? <SponsorBadge size={28} /> : null}
+                    {displayMember.id === sponsorId ? (
+                      <SponsorBadge size={28} />
+                    ) : displayMember.isAdmin ? (
+                      <AdminBadge size={28} />
+                    ) : null}
                   </View>
                   <Text style={styles.memberDetailName}>{displayMember.name}</Text>
                   {isSettled ? (
@@ -976,23 +1053,31 @@ function MemberDetailOverlay({
                   onLayout={onRowsLayout}
                 >
                   <MemberActionRow
-                    action="promote"
-                    isChosen={confirmAction === "promote"}
+                    action={promoteAction}
+                    isChosen={confirmAction === promoteAction}
                     morph={morph}
                     chosen={chosen}
                     isConfirming={isConfirming}
-                    disabled={!canPromote}
+                    disabled={!canPromote && !canDemote}
                     icon={
                       <Ionicons
-                        name={targetIsAdmin ? "shield-outline" : "arrow-up-circle-outline"}
+                        name={
+                          canDemote
+                            ? "arrow-down-circle-outline"
+                            : targetIsSponsor
+                              ? "star-outline"
+                              : targetIsAdmin
+                                ? "shield-outline"
+                                : "arrow-up-circle-outline"
+                        }
                         size={MEMBER_ROW_ICON_SIZE}
-                        color={Colors.text}
+                        color={canDemote ? Colors.danger : Colors.text}
                       />
                     }
                     label={promoteLabel}
-                    title={confirmation.promote.title}
-                    labelColor={Colors.text}
-                    onPress={() => startConfirm("promote")}
+                    title={confirmation[promoteAction].title}
+                    labelColor={canDemote ? Colors.danger : Colors.text}
+                    onPress={() => startConfirm(promoteAction)}
                   />
                   <MemberActionRow
                     action="kick"
@@ -1008,7 +1093,9 @@ function MemberDetailOverlay({
                         color={Colors.danger}
                       />
                     }
-                    label="Kick group member"
+                    label={
+                      targetIsSponsor && targetIsActive ? "Sponsor can't be kicked" : "Kick group member"
+                    }
                     title={confirmation.kick.title}
                     labelColor={Colors.danger}
                     onPress={() => startConfirm("kick")}
@@ -1080,6 +1167,7 @@ function MembersPane({
   balances,
   groupAccess,
   needsUnlock,
+  sponsorId,
   onSelectMember,
   onScroll,
   onContentHeightChange,
@@ -1094,6 +1182,8 @@ function MembersPane({
   // For each row's lock / unlock-ending note (see describeMemberAccess).
   groupAccess: GroupAccess | null;
   needsUnlock: boolean;
+  // The group's sponsor, for their SponsorBadge.
+  sponsorId: string | null;
   onSelectMember: (member: GroupMember) => void;
   // Left undefined while too short to collapse â€” see isMembersCollapsible in
   // GroupDetailScreen for why.
@@ -1136,7 +1226,7 @@ function MembersPane({
             debt={0}
             currency={currency}
             accessLabel={describeMemberAccess(item, groupAccess, needsUnlock)}
-            isSponsor={item.id === groupAccess?.plan?.sponsorId}
+            isSponsor={item.id === sponsorId}
             isViewer
           />
         ) : (
@@ -1145,7 +1235,7 @@ function MembersPane({
             debt={balances[item.id] ?? 0}
             currency={currency}
             accessLabel={describeMemberAccess(item, groupAccess, needsUnlock)}
-            isSponsor={item.id === groupAccess?.plan?.sponsorId}
+            isSponsor={item.id === sponsorId}
             onPress={() => onSelectMember(item)}
           />
         )
@@ -1238,8 +1328,8 @@ function resolveEventTargetName(
 }
 
 // Kept short enough to fit one line at phone width with typical names —
-// EventRow truncates rather than wraps. admin_auto_promoted doesn't name
-// who left: that member_left event is always the entry right below it.
+// EventRow truncates rather than wraps. admin_auto_promoted and
+// sponsor_handed_over don't name who left: that member_left event is always the entry right below it.
 function formatEventText(event: GroupEvent, members: GroupMember[], currentUserId: string) {
   const actor = resolvePayerName(event.actorId, members, currentUserId);
   switch (event.kind) {
@@ -1255,10 +1345,24 @@ function formatEventText(event: GroupEvent, members: GroupMember[], currentUserI
       return `${actor} made ${resolveEventTargetName(event.targetId, members, currentUserId)} an admin`;
     case "admin_auto_promoted":
       return `${resolvePayerName(event.targetId, members, currentUserId)} became an admin`;
+    case "admin_demoted":
+      return `${actor} removed ${resolveEventTargetName(event.targetId, members, currentUserId)} as admin`;
+    case "sponsor_handed_over":
+      return `${resolvePayerName(event.targetId, members, currentUserId)} became the sponsor`;
     case "plan_started":
       return `${actor} unlocked the group`;
     case "plan_seat_given":
       return `${actor} gave ${resolveEventTargetName(event.targetId, members, currentUserId)} a seat`;
+    case "plan_seat_removed":
+      // Their own: someone leaving before the start (free_pending_plan_seat).
+      if (event.targetId !== null && event.targetId === event.actorId) {
+        return `${actor} gave up ${event.actorId === currentUserId ? "your" : "their"} seat before the pass started`;
+      }
+      return `${actor} took back ${
+        event.targetId === currentUserId
+          ? "your"
+          : `${resolveEventTargetName(event.targetId, members, currentUserId)}'s`
+      } seat before the pass started`;
   }
 }
 
@@ -1270,8 +1374,12 @@ const EVENT_ICONS: Record<GroupEventKind, keyof typeof Ionicons.glyphMap> = {
   member_kicked: "person-remove-outline",
   admin_promoted: "shield-outline",
   admin_auto_promoted: "shield-outline",
+  admin_demoted: "arrow-down-circle-outline",
+  // Same star as SponsorBadge.
+  sponsor_handed_over: "star-outline",
   plan_started: "lock-open-outline",
   plan_seat_given: "ticket-outline",
+  plan_seat_removed: "remove-circle-outline",
 };
 const EVENT_ICON_SIZE = 14;
 const PLAN_EVENT_ICON_CIRCLE = 28;
@@ -1287,12 +1395,19 @@ function pluralSeats(count: number) {
   return `${count} ${count === 1 ? "seat" : "seats"}`;
 }
 
-// "It expires in 12 days, on 5.10.2026." Uses the group's running plan when
-// the event is about it, so an upgrade or renewal since shows up here too;
-// otherwise the plan as it was recorded.
+// "It expires in 12 days, on 5.10.2026.", or for a pass set up to start
+// later, "It starts in 3 days, on 5.10.2026, and runs until 12.10.2026."
+// Uses the group's plan when the event is about it, so an upgrade, renewal
+// or moved start since shows up here too; otherwise the plan as it was
+// recorded.
 function formatPlanExpiry(details: PlanEventDetails, runningPlan: GroupPlan | null) {
   const live = runningPlan?.id === details.planId ? runningPlan : null;
   const endsAt = live?.endsAt ?? details.endsAt;
+  const startsAt = live?.startsAt ?? details.startsAt ?? null;
+  if (isNotStartedYet(startsAt)) {
+    const daysToStart = Math.ceil(((startsAt as number) - Date.now()) / 86_400_000);
+    return `It starts in ${daysToStart} ${daysToStart === 1 ? "day" : "days"}, on ${formatPlanEventDate(startsAt as number)}, and runs until ${formatPlanEventDate(endsAt)}.`;
+  }
   const willRenew = live?.willRenew ?? details.willRenew ?? false;
   const date = formatPlanEventDate(endsAt);
   const msLeft = endsAt - Date.now();
@@ -1301,19 +1416,26 @@ function formatPlanExpiry(details: PlanEventDetails, runningPlan: GroupPlan | nu
   return `It ${willRenew ? "renews" : "expires"} in ${days} ${days === 1 ? "day" : "days"}, on ${date}.`;
 }
 
-// "You and Ben already have a seat. 2 seats left to give out."
+// "You and Ben already have a seat. 2 seats left to give out." While the
+// pass hasn't started its seats can still change hands, so then it's who
+// holds one now rather than who got one when it was set up.
 function formatPlanStartSeats(
   details: PlanEventDetails,
   members: GroupMember[],
-  currentUserId: string
+  currentUserId: string,
+  groupPlan: GroupPlan | null
 ) {
-  const holders = details.seatHolders ?? [];
+  const live =
+    groupPlan?.id === details.planId && isNotStartedYet(groupPlan.startsAt) ? groupPlan : null;
+  const holders = live?.seatHolderIds ?? details.seatHolders ?? [];
   const names = holders.map((id) =>
     id === currentUserId
       ? "you"
       : (members.find((member) => member.id === id)?.name ?? "Deleted user")
   );
-  const left = details.seatCount - holders.length;
+  // Live, the plan's own count: seats can be added before it starts, and
+  // seatsUsed also counts any held by deleted accounts (not in holders).
+  const left = live ? live.seatCount - live.seatsUsed : details.seatCount - holders.length;
   const leftText = left > 0 ? `${pluralSeats(left)} left to give out.` : "Every seat is taken.";
   if (names.length === 0) return leftText;
   const who = capitalize(joinNames(names));
@@ -1382,7 +1504,7 @@ function PlanEventCard({
   const lines = isStart
     ? [
         formatPlanExpiry(details, groupPlan),
-        formatPlanStartSeats(details, members, currentUserId),
+        formatPlanStartSeats(details, members, currentUserId, groupPlan),
       ]
     : [seatsLeft > 0 ? `${pluralSeats(seatsLeft)} left to give out.` : "That was the last seat."];
 
@@ -1653,7 +1775,7 @@ function LogDetailOverlay({
   viewerName: string;
   viewerAvatarUrl: string | null;
   viewerIsAdmin: boolean;
-  // The running group plan's sponsor, for their SponsorBadge.
+  // The group's sponsor, for their SponsorBadge.
   sponsorId: string | null;
   groupCurrency: string;
   onClose: () => void;
@@ -1759,8 +1881,11 @@ function LogDetailOverlay({
                             style={[styles.avatar, !member.isActive && styles.avatarInactive]}
                             textStyle={styles.avatarText}
                           />
-                          {member.isAdmin ? <AdminBadge size={18} /> : null}
-                          {member.id === sponsorId ? <SponsorBadge size={18} /> : null}
+                          {member.id === sponsorId ? (
+                            <SponsorBadge size={18} />
+                          ) : member.isAdmin ? (
+                            <AdminBadge size={18} />
+                          ) : null}
                         </View>
                         <Text style={styles.memberName}>{member.name}</Text>
                       </>
@@ -2179,7 +2304,7 @@ export default function GroupDetailScreen() {
   const navigation = useNavigation<StackScreenNavigation>();
   const { session } = useAuth();
   const { profile } = useProfile();
-  const { groups, removeGroup, promoteToAdmin, kickMember } = useGroups();
+  const { groups, removeGroup, promoteToAdmin, kickMember, demoteAdmin } = useGroups();
   const group = groups.find((item) => item.id === id);
   const insets = useSafeAreaInsets();
   const { height: windowHeight, width: windowWidth } = useWindowDimensions();
@@ -2485,12 +2610,14 @@ export default function GroupDetailScreen() {
   const { members: allMembers, refresh: refreshMembers } = useGroupMembers(group?.id);
   const { events, refresh: refreshEvents } = useGroupEvents(group?.id);
   const { plansVisible } = useAccess();
+  const openUnlock = useOpenUnlock();
   const { access: groupAccess, refresh: refreshGroupAccess } = useGroupAccess(group?.id);
   // Coming back from the unlock or plan screens (or anywhere) may mean a new
   // plan or seat.
   useRefreshOnRefocus(refreshGroupAccess);
   // This device's own entries in the group still waiting to sync, which may
-  // use up free entries once they do (held ones were turned down, so don't).
+  // use up the group's free entries once they do (held ones were turned
+  // down, so don't).
   const pendingInGroup = logs.filter(
     (log) => log.groupId === group?.id && log.isPending && !log.isHeld
   ).length;
@@ -2512,6 +2639,17 @@ export default function GroupDetailScreen() {
   const members = allMembers.filter((member) => member.id !== session?.user.id);
   const viewerMember = allMembers.find((member) => member.id === session?.user.id);
   const viewerIsAdmin = viewerMember?.isAdmin ?? false;
+  const viewerIsSponsor = viewerMember?.isSponsor ?? false;
+  const sponsorId = allMembers.find((member) => member.isSponsor)?.id ?? null;
+  // Leaving before the group's pass starts gives up your seat on it
+  // (free_pending_plan_seat), which the leave confirmation warns about.
+  const groupPlan = groupAccess?.plan ?? null;
+  const viewerSeatStartsAt =
+    groupPlan &&
+    isNotStartedYet(groupPlan.startsAt) &&
+    groupAccess?.members[session?.user.id ?? ""]?.hasSeat
+      ? groupPlan.startsAt
+      : null;
   // Your own row at the bottom of the Members tab. Name/picture come from
   // your profile rather than the member row, so a not-yet-synced change
   // shows up here straight away.
@@ -2691,7 +2829,7 @@ export default function GroupDetailScreen() {
     setSelectedMember(member);
   };
 
-  // Promote / kick / settle are each confirmed inside MemberDetailOverlay
+  // Promote / demote / kick / settle are each confirmed inside MemberDetailOverlay
   // itself (it morphs into a Cancel / confirm step first), so these act
   // directly. Each closes the popup on success; on failure the popup stays
   // on its confirmation so it can be retried or cancelled.
@@ -2724,6 +2862,17 @@ export default function GroupDetailScreen() {
     const { error } = await promoteToAdmin(group.id, selectedMember.id);
     if (error) {
       Alert.alert("Couldn't promote member", error);
+      return;
+    }
+    await Promise.all([refreshMembers(), refreshEvents()]);
+    setSelectedMember(null);
+  };
+
+  const handleDemote = async () => {
+    if (!selectedMember) return;
+    const { error } = await demoteAdmin(group.id, selectedMember.id);
+    if (error) {
+      Alert.alert("Couldn't demote admin", error);
       return;
     }
     await Promise.all([refreshMembers(), refreshEvents()]);
@@ -2768,12 +2917,22 @@ export default function GroupDetailScreen() {
     });
   };
 
-  // Straight to unlocking when the entry form couldn't be submitted anyway.
+  // Straight to unlocking when the entry form couldn't be submitted anyway —
+  // or, when the group's plan starts later and the viewer has a seat on it or
+  // manages it, to that plan, which says when it starts (and is where its
+  // start can be moved).
   const handleAddEntry = () => {
-    router.push({
-      pathname: viewerNeedsUnlock ? "/unlock" : "/add-entry",
-      params: { groupId: group.id },
-    });
+    if (viewerNeedsUnlock) {
+      const plan = groupAccess?.plan;
+      const viewerHasSeat = !!groupAccess?.members[session?.user.id ?? ""]?.hasSeat;
+      if (plan && isNotStartedYet(plan.startsAt) && (viewerHasSeat || plan.canManage)) {
+        handleOpenPlan();
+        return;
+      }
+      openUnlock({ groupId: group.id });
+      return;
+    }
+    router.push({ pathname: "/add-entry", params: { groupId: group.id } });
   };
 
   const handleOpenPlan = () => {
@@ -2788,7 +2947,7 @@ export default function GroupDetailScreen() {
       handleOpenPlan();
       return;
     }
-    router.push({ pathname: "/unlock", params: { groupId: group.id } });
+    openUnlock({ groupId: group.id });
   };
 
   // Best-effort check for which confirmation copy the menu shows; leave_group
@@ -2827,6 +2986,7 @@ export default function GroupDetailScreen() {
             balances={balances}
             groupAccess={plansVisible ? groupAccess : null}
             needsUnlock={needsUnlock}
+            sponsorId={sponsorId}
             onSelectMember={setSelectedMember}
             onScroll={
               isMembersCollapsible
@@ -2850,7 +3010,7 @@ export default function GroupDetailScreen() {
             viewerName={profile.name}
             viewerAvatarUrl={profile.avatarUrl}
             viewerIsAdmin={viewerIsAdmin}
-            sponsorId={plansVisible ? (groupAccess?.plan?.sponsorId ?? null) : null}
+            sponsorId={sponsorId}
             groupPlan={groupAccess?.plan ?? null}
             groupCurrency={group.currency}
             onSelectMember={handleSelectMemberFromLogs}
@@ -3063,6 +3223,8 @@ export default function GroupDetailScreen() {
         onClosed={handleMenuClosed}
         canEdit={viewerIsAdmin}
         isLastMember={isLastMember}
+        isSponsor={viewerIsSponsor}
+        seatStartsAt={viewerSeatStartsAt}
       />
 
       {/* Rendered here rather than inside MembersPane/LogsPane so a member
@@ -3073,10 +3235,12 @@ export default function GroupDetailScreen() {
         debt={selectedMember ? (balances[selectedMember.id] ?? 0) : 0}
         currency={group.currency}
         viewerIsAdmin={viewerIsAdmin}
-        sponsorId={plansVisible ? (groupAccess?.plan?.sponsorId ?? null) : null}
+        viewerIsSponsor={viewerIsSponsor}
+        sponsorId={sponsorId}
         onClose={() => setSelectedMember(null)}
         onSettle={handleSettle}
         onPromote={handlePromote}
+        onDemote={handleDemote}
         onKick={handleKick}
       />
     </View>
@@ -3403,8 +3567,6 @@ const styles = StyleSheet.create({
     borderColor: Colors.background,
   },
   sponsorBadge: {
-    right: undefined,
-    left: -2,
     backgroundColor: Colors.sponsor,
   },
   avatarText: {
@@ -3427,6 +3589,11 @@ const styles = StyleSheet.create({
   leftLabel: {
     fontSize: 12,
     color: Colors.muted,
+  },
+  memberSubtitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
   },
   memberAccessNote: {
     flexDirection: "row",

@@ -24,7 +24,7 @@ export const MAX_PINNED_GROUPS = 3;
 // members per group. Matches the biggest group plan (GROUP_PLAN_SIZES).
 export const GROUP_MEMBER_LIMIT = 15;
 
-// Mirrors billing_settings.free_entries_per_user's default in
-// supabase/schema.sql. Only shown until the server has answered once — the
-// server's own number is what applies.
-export const FREE_ENTRIES_PER_USER = 5;
+// Mirrors billing_settings.free_entries_per_group's default in
+// supabase/schema.sql: free entries every group shares. Only shown until the
+// server has answered once — the server's own number is what applies.
+export const FREE_ENTRIES_PER_GROUP = 15;
