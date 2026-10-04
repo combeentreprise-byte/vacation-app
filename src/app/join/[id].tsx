@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { PageHeader } from "@/components/page-header";
+import { Skeleton, SkeletonGroup, SkeletonText } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { useGroups } from "@/hooks/use-groups";
 import { supabase } from "@/lib/supabase";
@@ -17,7 +18,7 @@ type GroupPreview = {
 
 export default function JoinGroupScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
-  const { groups, joinGroup } = useGroups();
+  const { groups, isLoaded: isGroupsLoaded, joinGroup } = useGroups();
   const [preview, setPreview] = useState<GroupPreview | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isJoining, setIsJoining] = useState(false);
@@ -75,8 +76,16 @@ export default function JoinGroupScreen() {
       <PageHeader onBack={goBackOrToGroups} />
 
       <View style={styles.body}>
-        {isLoading ? (
-          <Text style={styles.status}>Loading invite…</Text>
+        {/* Waits for your groups too, which decide between "Join group" and
+            "Open group". */}
+        {isLoading || (preview && !isGroupsLoaded) ? (
+          <SkeletonGroup style={styles.skeleton}>
+            <SkeletonText fontSize={13} width="55%" />
+            <SkeletonText fontSize={26} lineHeight={31} width="70%" />
+            <SkeletonText fontSize={15} lineHeight={21} width="90%" />
+            <SkeletonText fontSize={14} width="35%" />
+            <Skeleton height={49} radius={10} style={styles.joinButtonSkeleton} />
+          </SkeletonGroup>
         ) : error ? (
           <Text style={styles.status}>{error}</Text>
         ) : preview ? (
@@ -116,6 +125,12 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 20,
     gap: 8,
+  },
+  skeleton: {
+    gap: 8,
+  },
+  joinButtonSkeleton: {
+    marginTop: 16,
   },
   status: {
     fontSize: 15,

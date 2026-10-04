@@ -72,12 +72,16 @@ export function useGroupMembers(groupId: string | undefined) {
   const userId = session?.user.id ?? null;
   const { profile, isLoaded: isProfileLoaded } = useProfile();
   const [serverMembers, setServerMembers] = useState<GroupMember[]>([]);
-  const [isLoaded, setIsLoaded] = useState(false);
+  // Which group the data above has loaded for, so isLoaded reads false again
+  // while another group's is still loading — including once the group
+  // itself turns up after first being looked up as undefined.
+  const [loadedFor, setLoadedFor] = useState<string | null | undefined>(undefined);
+  const isLoaded = loadedFor === (groupId ?? null);
 
   const refresh = useCallback(async () => {
     if (!groupId || !userId) {
       setServerMembers([]);
-      setIsLoaded(true);
+      setLoadedFor(groupId ?? null);
       return;
     }
 
@@ -93,7 +97,7 @@ export function useGroupMembers(groupId: string | undefined) {
       setServerMembers(next);
       writeUserData(userId, `members:${groupId}`, next);
     }
-    setIsLoaded(true);
+    setLoadedFor(groupId ?? null);
   }, [groupId, userId]);
 
   useEffect(() => {
@@ -108,7 +112,7 @@ export function useGroupMembers(groupId: string | undefined) {
         if (cancelled) return;
         if (stored) {
           setServerMembers(stored);
-          setIsLoaded(true);
+          setLoadedFor(groupId ?? null);
         }
       }
       if (cancelled) return;

@@ -22,6 +22,8 @@ import {
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, { useAnimatedStyle, useSharedValue } from "react-native-reanimated";
 
+import { Skeleton } from "@/components/skeleton";
+
 // iOS's own photo-editing screen can only crop to a square (a real
 // UIImagePickerController limitation, not an expo-image-picker gap — its
 // `aspect` option is Android-only per its own type docs), so on iOS
@@ -217,7 +219,8 @@ export function PhotoCropModal({
               </View>
             </GestureDetector>
           ) : (
-            <ActivityIndicator color="#fff" />
+            // The crop frame's own size, while the photo's size is read.
+            <Skeleton tone="dark" width={viewportWidth} height={viewportHeight} radius={0} />
           )}
         </View>
       </View>

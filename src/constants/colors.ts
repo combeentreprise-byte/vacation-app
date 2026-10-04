@@ -21,4 +21,6 @@ export const Colors = {
   eventSurface: "#EDF6FE",
   eventBorder: "#D2E8FC",
   eventText: "#1A6EBF",
+  // Loading placeholders (components/skeleton.tsx).
+  skeleton: "#E2E7ED",
 };

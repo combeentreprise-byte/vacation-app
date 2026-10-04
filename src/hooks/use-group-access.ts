@@ -129,12 +129,16 @@ export function useGroupAccess(groupId: string | undefined) {
   const { session } = useAuth();
   const userId = session?.user.id ?? null;
   const [access, setAccess] = useState<GroupAccess | null>(null);
-  const [isLoaded, setIsLoaded] = useState(false);
+  // Which group the data above has loaded for, so isLoaded reads false again
+  // while another group's is still loading — including once the group
+  // itself turns up after first being looked up as undefined.
+  const [loadedFor, setLoadedFor] = useState<string | null | undefined>(undefined);
+  const isLoaded = loadedFor === (groupId ?? null);
 
   const refresh = useCallback(async () => {
     if (!groupId || !userId) {
       setAccess(null);
-      setIsLoaded(true);
+      setLoadedFor(groupId ?? null);
       return;
     }
 
@@ -147,7 +151,7 @@ export function useGroupAccess(groupId: string | undefined) {
       setAccess(next);
       writeUserData(userId, `group-access:${groupId}`, next);
     }
-    setIsLoaded(true);
+    setLoadedFor(groupId ?? null);
   }, [groupId, userId]);
 
   useEffect(() => {
@@ -161,7 +165,7 @@ export function useGroupAccess(groupId: string | undefined) {
         if (cancelled) return;
         if (stored) {
           setAccess(stored);
-          setIsLoaded(true);
+          setLoadedFor(groupId ?? null);
         }
       }
       if (cancelled) return;

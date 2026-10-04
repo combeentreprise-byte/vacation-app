@@ -26,25 +26,28 @@ import { GroupHero } from "@/components/hero-motive";
 import { type LeaveGroupRequest, LeaveGroupPopup } from "@/components/leave-group-popup";
 import { PinIcon } from "@/components/pin-icon";
 import { PressableScale } from "@/components/press-feedback";
+import { GroupListSkeleton } from "@/components/screen-skeletons";
 import { Colors } from "@/constants/colors";
+import { GROUP_CARD_HEIGHT_RATIO, GROUP_LIST_PADDING } from "@/constants/layout";
 import { MAX_PINNED_GROUPS } from "@/constants/limits";
 import { useAccess } from "@/hooks/use-access";
 import { type Group, useGroups } from "@/hooks/use-groups";
+import { usePaywallNudge } from "@/hooks/use-paywall-nudge";
 import { supabase } from "@/lib/supabase";
-import { isNotStartedYet } from "@/utils/access";
+import { isNotStartedYet, isViewerLocked } from "@/utils/access";
 
 const LEAVE_SLOT_WIDTH = 44;
-// Every group card is a fixed slice of the screen rather than sized to its
-// own content, so the list reads as evenly spaced rows regardless of how
-// long a name/description runs — useWindowDimensions (not Dimensions.get)
-// so it re-measures on rotation/resize instead of freezing at mount.
-const CARD_HEIGHT_RATIO = 0.2;
-const LIST_PADDING = 20;
+// useWindowDimensions (not Dimensions.get) for the card height, so it
+// re-measures on rotation/resize instead of freezing at mount.
+const CARD_HEIGHT_RATIO = GROUP_CARD_HEIGHT_RATIO;
+const LIST_PADDING = GROUP_LIST_PADDING;
 const MANAGE_ANIMATION = { duration: 280, easing: Easing.out(Easing.cubic) };
 
 export default function GroupScreen() {
   const { groups, isLoaded, removeGroup, setGroupPinned } = useGroups();
   const { access } = useAccess();
+  // Now and then, the paywall for someone still locked.
+  usePaywallNudge();
   const [isManaging, setIsManaging] = useState(false);
   // Driven on the UI thread (Reanimated) so the slide stays smooth even while
   // toggling Manage mode re-renders every row on the JS thread.
@@ -171,7 +174,7 @@ export default function GroupScreen() {
   };
 
   if (!isLoaded) {
-    return <View style={styles.container} />;
+    return <GroupListSkeleton />;
   }
 
   if (groups.length === 0) {
@@ -268,15 +271,16 @@ export default function GroupScreen() {
   );
 }
 
-// Development-only shortcut to the paywall, floating over the group list.
-// The real app will open it on its own at the right moments; until then this
-// keeps it a tap away without it popping up mid-work.
+// A shortcut to the paywall, floating over the group list, for anyone still
+// locked — what usePaywallNudge opens on its own only every few days. In
+// development it's always there, and always with all three pages.
 function PaywallButton() {
-  if (!__DEV__) return null;
+  const { access, isLoaded } = useAccess();
+  if (!__DEV__ && !(isLoaded && access.paywallEnabled && isViewerLocked(access))) return null;
   return (
     <PressableScale
       style={styles.paywallButton}
-      onPress={() => router.push({ pathname: "/paywall", params: { full: "1" } })}
+      onPress={() => router.push({ pathname: "/paywall", params: __DEV__ ? { full: "1" } : {} })}
       accessibilityRole="button"
       accessibilityLabel="Open paywall"
     >

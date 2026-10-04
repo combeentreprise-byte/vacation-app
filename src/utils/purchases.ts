@@ -12,6 +12,14 @@ import { requestErrorMessage } from "@/utils/network";
 
 type PurchaseResult = { error?: string; unavailable?: boolean };
 
+// Whether buying would actually work here, rather than end in the
+// coming-soon notice — so nothing pushes the paywall on someone who can't
+// buy from it. Store purchases will widen this (but never to the web build,
+// which can't use them).
+export function canBuyPlans(params: { canTestPurchase: boolean }) {
+  return params.canTestPurchase;
+}
+
 // A subscription is always "Just me" and starts right away. A Trip Pass of
 // any size is bought not set up yet (no group, no start), and its id comes
 // back so the buyer can go straight on to set it up (/plan-setup).

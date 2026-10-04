@@ -498,6 +498,81 @@ create table if not exists public.free_entry_usage (
 );
 
 -- ---------------------------------------------------------------------------
+-- Notifications
+-- ---------------------------------------------------------------------------
+-- Every notification the app sends, with its wording, is listed in
+-- docs/notifications.md. They're written into `notifications` by the
+-- server itself, in the same transaction as the change they're about (the
+-- RPCs, a trigger on group_events and one on groups), or by the scheduled
+-- send_scheduled_notifications for reminders — never by a client. The
+-- send-notifications Edge Function then pushes them to the person's devices
+-- (push_tokens) through Expo's push service, kicked off every minute by
+-- pg_cron (trigger_notification_sender).
+
+-- One row per person, only once they've changed something (or the app has
+-- recorded their time zone): no row means the defaults. categories maps a
+-- switch in Account → Notifications (NotificationCategory in
+-- src/constants/notifications.ts) to on/off; a missing key is its default
+-- (notification_category_on). time_zone is the device's, so dates in
+-- notifications ("ends on 12 Oct") are the person's own day.
+create table if not exists public.notification_settings (
+  user_id uuid primary key references public.profiles (id) on delete cascade,
+  all_muted boolean not null default false,
+  categories jsonb not null default '{}'::jsonb,
+  time_zone text not null default 'UTC',
+  updated_at timestamptz not null default now()
+);
+
+-- One row per device that can receive pushes: an Expo push token, moved to
+-- whoever signs in on that device last (register_push_token) and removed on
+-- signing out (unregister_push_token) or once Expo says the app was
+-- uninstalled (remove_push_tokens).
+create table if not exists public.push_tokens (
+  token text primary key,
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  platform text not null check (platform in ('ios', 'android')),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists push_tokens_user_id_idx on public.push_tokens (user_id);
+
+-- kind is the notification's id in docs/notifications.md terms (e.g.
+-- 'entry_added'), category the switch it belongs to ('always' for the ones
+-- that can't be turned off). url is the app route a tap opens.
+-- merge_key: notifications of the same kind about the same thing (an
+-- entry payer, a group's joiners) that are still waiting to be sent are
+-- merged into one ("Anna added 3 entries with you…"); merge_data holds what
+-- the merged wording needs (notification_merged_body). Those wait
+-- 2 minutes (send_after) so there's something to merge with.
+-- dedupe_key: a reminder is only ever sent once per person (e.g.
+-- 'plan_ending:<plan>:<end>').
+-- sent_at: when the sender picked it up (whether or not the person had a
+-- device to send it to).
+create table if not exists public.notifications (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  kind text not null,
+  category text not null,
+  group_id uuid references public.groups (id) on delete cascade,
+  title text not null,
+  body text not null,
+  url text,
+  merge_key text,
+  merge_data jsonb,
+  dedupe_key text,
+  send_after timestamptz not null default now(),
+  sent_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create unique index if not exists notifications_dedupe_idx
+  on public.notifications (user_id, dedupe_key) where dedupe_key is not null;
+create index if not exists notifications_unsent_idx
+  on public.notifications (send_after) where sent_at is null;
+create index if not exists notifications_user_id_idx
+  on public.notifications (user_id, created_at desc);
+
+-- ---------------------------------------------------------------------------
 -- Helper functions (security definer so they can check membership without
 -- re-triggering RLS on the tables they read, which would otherwise recurse)
 -- ---------------------------------------------------------------------------
@@ -785,7 +860,14 @@ begin
 
   if used_count < settings.free_entries_per_group then
     update public.free_entry_usage set used = used + 1
-    where group_id = p_group_id;
+    where group_id = p_group_id
+    returning used into used_count;
+    -- Down to the last 3, or all used: tell everyone locked in the group.
+    if used_count in (settings.free_entries_per_group - 3, settings.free_entries_per_group) then
+      perform public.notify_free_entries(
+        p_group_id, settings.free_entries_per_group - used_count, settings.free_entries_per_group
+      );
+    end if;
     return;
   end if;
 
@@ -1002,6 +1084,8 @@ begin
     insert into public.log_members (log_id, user_id) values (new_log.id, member_id);
   end loop;
 
+  perform public.notify_entry_added(new_log.id);
+
   return new_log;
 end;
 $$;
@@ -1040,6 +1124,8 @@ as $$
 declare
   updated_log public.logs;
   member_id uuid;
+  old_members uuid[];
+  old_share numeric;
 begin
   if not exists (
     select 1 from public.logs
@@ -1047,6 +1133,12 @@ begin
   ) then
     raise exception 'You can only edit a log you created';
   end if;
+
+  -- The entry as it was, for notify_entry_changed.
+  old_members := array(
+    select user_id from public.log_members where log_id = p_log_id and user_id is not null
+  );
+  old_share := public.notification_log_share(p_log_id);
 
   perform public.check_entry_access(
     (select group_id from public.logs where id = p_log_id),
@@ -1067,6 +1159,8 @@ begin
   foreach member_id in array p_member_ids loop
     insert into public.log_members (log_id, user_id) values (p_log_id, member_id);
   end loop;
+
+  perform public.notify_entry_changed(p_log_id, old_members, old_share);
 
   return updated_log;
 end;
@@ -1133,6 +1227,8 @@ begin
   returning * into new_log;
 
   insert into public.log_members (log_id, user_id) values (new_log.id, p_other_user_id);
+
+  perform public.notify_settlement(new_log.id);
 
   return new_log;
 end;
@@ -1209,6 +1305,8 @@ begin
   ) then
     raise exception 'You can only delete a log you created';
   end if;
+
+  perform public.notify_entry_deleted(p_log_id);
 
   delete from public.logs where id = p_log_id;
 end;
@@ -1340,6 +1438,22 @@ begin
 
       insert into public.group_events (group_id, kind, actor_id, target_id)
       values (p_group_id, 'sponsor_handed_over', auth.uid(), next_sponsor_id);
+    else
+      -- G9 in docs/notifications.md (every other hand-off is notified from
+      -- its group_events row).
+      for next_admin_id in
+        select user_id from public.group_members
+        where group_id = p_group_id and left_at is null and is_admin and user_id is not null
+      loop
+        perform public.notify(
+          next_admin_id, 'sponsor_none', 'groupChanges', p_group_id,
+          (select name from public.groups where id = p_group_id),
+          public.notification_name(auth.uid())
+            || ' left and the group has no sponsor now — admins manage its pass',
+          '/group/' || p_group_id
+        );
+      end loop;
+      next_admin_id := null;
     end if;
 
     -- On a pass that hasn't started yet, the duty to hold a seat passes on
@@ -1649,6 +1763,9 @@ as $$
 declare
   target_group_id uuid;
 begin
+  -- So leave_group's member_left notification says the account was deleted.
+  perform set_config('app.deleting_account', 'on', true);
+
   for target_group_id in
     select group_id from public.group_members
     where user_id = auth.uid() and left_at is null
@@ -1903,6 +2020,7 @@ declare
   target_plan public.plans;
   plan_start timestamptz;
   group_sponsor_id uuid;
+  seat_holder_id uuid;
 begin
   select * into target_plan from public.plans where id = p_plan_id for update;
 
@@ -1947,6 +2065,23 @@ begin
   set starts_at = plan_start, ends_at = plan_start + duration
   where id = p_plan_id
   returning * into target_plan;
+
+  -- P7 in docs/notifications.md.
+  if target_plan.group_id is not null then
+    for seat_holder_id in
+      select user_id from public.plan_seats
+      where plan_id = p_plan_id and released_at is null and user_id is not null
+    loop
+      perform public.notify(
+        seat_holder_id, 'plan_rescheduled', 'plans', target_plan.group_id,
+        (select name from public.groups where id = target_plan.group_id),
+        public.notification_name(auth.uid()) || ' moved the Trip Pass — it now runs from '
+          || public.notification_date(target_plan.starts_at, seat_holder_id) || ' to '
+          || public.notification_date(target_plan.ends_at, seat_holder_id),
+        '/group-plan?groupId=' || target_plan.group_id
+      );
+    end loop;
+  end if;
 
   return target_plan;
 end;
@@ -2220,6 +2355,11 @@ as $$
 declare
   current_plan public.plans;
   new_ends_at timestamptz;
+  old_plan public.plans;
+  group_name text;
+  upgrader text;
+  recipient uuid;
+  seats_free integer;
 begin
   select * into current_plan from public.plans
   where id = p_plan_id and group_id is not null and ends_at > now()
@@ -2249,11 +2389,53 @@ begin
     raise exception 'That''s the plan you already have';
   end if;
 
+  old_plan := current_plan;
+
   update public.plans
   set seat_count = p_seat_count, ends_at = new_ends_at,
     duration = new_ends_at - current_plan.starts_at
   where id = p_plan_id
   returning * into current_plan;
+
+  -- P8 / P9 in docs/notifications.md. Whoever upgraded it (the sponsor, for
+  -- a store purchase granted without a session).
+  select name into group_name from public.groups where id = current_plan.group_id;
+  upgrader := public.notification_name(coalesce(auth.uid(), current_plan.sponsor_id));
+
+  if current_plan.seat_count > old_plan.seat_count then
+    seats_free := current_plan.seat_count - (
+      select count(*) from public.plan_seats where plan_id = p_plan_id and released_at is null
+    );
+    for recipient in
+      select gm.user_id from public.group_members gm
+      where gm.group_id = current_plan.group_id and gm.left_at is null and gm.user_id is not null
+        and not exists (
+          select 1 from public.plan_seats s
+          where s.plan_id = p_plan_id and s.user_id = gm.user_id and s.released_at is null
+        )
+    loop
+      perform public.notify(
+        recipient, 'plan_more_seats', 'plans', current_plan.group_id, group_name,
+        'The Trip Pass now has ' || current_plan.seat_count || ' seats, ' || seats_free
+          || ' of them free — ask ' || upgrader || ' for one',
+        '/group-plan?groupId=' || current_plan.group_id
+      );
+    end loop;
+  end if;
+
+  if current_plan.ends_at > old_plan.ends_at then
+    for recipient in
+      select user_id from public.plan_seats
+      where plan_id = p_plan_id and released_at is null and user_id is not null
+    loop
+      perform public.notify(
+        recipient, 'plan_extended', 'plans', current_plan.group_id, group_name,
+        upgrader || ' extended the Trip Pass — you''re unlocked until '
+          || public.notification_date(current_plan.ends_at, recipient) || ' now',
+        '/group/' || current_plan.group_id
+      );
+    end loop;
+  end if;
 
   return current_plan;
 end;
@@ -2796,6 +2978,1396 @@ where gm.id in (
 );
 
 -- ---------------------------------------------------------------------------
+-- Notifications (see the tables above and docs/notifications.md)
+-- ---------------------------------------------------------------------------
+
+-- A settings row a client wrote has to be usable by every notify() call
+-- after it: an unknown time zone or a non-boolean switch would otherwise
+-- fail there instead (and lose that person's notifications).
+create or replace function public.check_notification_settings()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+begin
+  if jsonb_typeof(new.categories) <> 'object' or exists (
+    select 1 from jsonb_each(new.categories) where jsonb_typeof(value) <> 'boolean'
+  ) then
+    raise exception 'Notification categories must be on/off switches';
+  end if;
+  perform now() at time zone new.time_zone;
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists notification_settings_check on public.notification_settings;
+create trigger notification_settings_check
+  before insert or update on public.notification_settings
+  for each row execute function public.check_notification_settings();
+
+-- Mirrors DEFAULT_NOTIFICATION_CATEGORIES in src/constants/notifications.ts:
+-- everything is on by default except entries you're not part of. The plan
+-- switches don't apply while plans are hidden from this person
+-- (plansVisible in AccessProvider), so nothing about plans is sent then.
+create or replace function public.notification_category_on(p_user_id uuid, p_category text)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select case
+    when p_category = 'always' then true
+    when p_category in ('plans', 'reminders') and not (
+      coalesce((select paywall_enabled or free_test_purchases from public.billing_settings), false)
+      or exists (select 1 from public.billing_testers where user_id = p_user_id)
+    ) then false
+    else coalesce(
+      (
+        select not s.all_muted
+          and coalesce((s.categories ->> p_category)::boolean, p_category <> 'otherExpenses')
+        from public.notification_settings s
+        where s.user_id = p_user_id
+      ),
+      p_category <> 'otherExpenses'
+    )
+  end;
+$$;
+
+create or replace function public.notification_name(p_user_id uuid)
+returns text
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select coalesce((select name from public.profiles where id = p_user_id), 'Someone');
+$$;
+
+-- "45", "11.25", "34.50" — whole amounts without decimals, like the Logs tab.
+create or replace function public.notification_amount(p_amount numeric)
+returns text
+language sql
+immutable
+as $$
+  select case
+    when round(p_amount, 2) = trunc(p_amount) then trunc(p_amount)::text
+    else to_char(round(p_amount, 2), 'FM999999999990.00')
+  end;
+$$;
+
+-- "Ben", "Ben and Carl", "Ben, Carl and Dana", and past p_max names
+-- "Ben, Carl and 3 others".
+create or replace function public.notification_join_names(p_names text[], p_max integer default 3)
+returns text
+language sql
+immutable
+as $$
+  select case
+    when n = 0 then ''
+    when n = 1 then p_names[1]
+    when n <= p_max then array_to_string(p_names[1:n - 1], ', ') || ' and ' || p_names[n]
+    else array_to_string(p_names[1:p_max - 1], ', ') || ' and ' || (n - p_max + 1) || ' others'
+  end
+  from (select coalesce(cardinality(p_names), 0) as n) counted;
+$$;
+
+create or replace function public.notification_time_zone(p_user_id uuid)
+returns text
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select coalesce(
+    (select time_zone from public.notification_settings where user_id = p_user_id),
+    'UTC'
+  );
+$$;
+
+-- "12 Oct" in the recipient's time zone, with the year only when it isn't
+-- this year — formatAccessDate in src/utils/access.ts.
+create or replace function public.notification_date(p_at timestamptz, p_user_id uuid)
+returns text
+language sql
+stable
+as $$
+  select to_char(local_at, 'FMDD Mon')
+    || case
+      when extract(year from local_at) <> extract(year from now() at time zone tz)
+        then ' ' || to_char(local_at, 'YYYY')
+      else ''
+    end
+  from (
+    select tz, p_at at time zone tz as local_at
+    from (select public.notification_time_zone(p_user_id) as tz) zone
+  ) dated;
+$$;
+
+-- "today", "tomorrow", "in 2 days", counted in calendar days where the
+-- recipient is.
+create or replace function public.notification_days_until(p_at timestamptz, p_user_id uuid)
+returns text
+language sql
+stable
+as $$
+  select case days
+    when 0 then 'today'
+    when 1 then 'tomorrow'
+    else 'in ' || days || ' days'
+  end
+  from (
+    select (p_at at time zone tz)::date - (now() at time zone tz)::date as days
+    from (select public.notification_time_zone(p_user_id) as tz) zone
+  ) counted;
+$$;
+
+-- What a merged notification says (see notifications.merge_key).
+create or replace function public.notification_merged_body(p_kind text, p_data jsonb)
+returns text
+language sql
+immutable
+as $$
+  select case p_kind
+    when 'entry_added' then
+      (p_data ->> 'actor') || ' added ' || (p_data ->> 'count') || ' entries with you — your share is '
+        || public.notification_amount((p_data ->> 'total')::numeric) || ' ' || (p_data ->> 'currency')
+    when 'entry_added_other' then
+      (p_data ->> 'actor') || ' added ' || (p_data ->> 'count') || ' entries ('
+        || public.notification_amount((p_data ->> 'total')::numeric) || ' ' || (p_data ->> 'currency') || ')'
+    when 'member_joined' then
+      public.notification_join_names(array(select jsonb_array_elements_text(p_data -> 'names')))
+        || ' joined the group'
+  end;
+$$;
+
+-- Queues one notification for p_user_id, unless it's about something they
+-- did themselves (anything but an 'always' one), they're no longer active in
+-- p_group_id (unless p_require_member is false — e.g. telling someone they
+-- were removed), or they've turned its category off. See the notifications
+-- table for p_merge_key/p_merge_data and p_dedupe_key. Never fails the
+-- change it's about: anything going wrong here only loses the notification.
+-- Not callable by clients (see the grants section).
+create or replace function public.notify(
+  p_user_id uuid,
+  p_kind text,
+  p_category text,
+  p_group_id uuid,
+  p_title text,
+  p_body text,
+  p_url text,
+  p_merge_key text default null,
+  p_merge_data jsonb default null,
+  p_dedupe_key text default null,
+  p_require_member boolean default true
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  existing public.notifications;
+  merged jsonb;
+begin
+  if p_user_id is null or p_title is null or p_body is null then
+    return;
+  end if;
+
+  if p_user_id = auth.uid() and p_category <> 'always' then
+    return;
+  end if;
+
+  if p_require_member and p_group_id is not null and not exists (
+    select 1 from public.group_members
+    where group_id = p_group_id and user_id = p_user_id and left_at is null
+  ) then
+    return;
+  end if;
+
+  if not public.notification_category_on(p_user_id, p_category) then
+    return;
+  end if;
+
+  if p_merge_key is not null then
+    select * into existing
+    from public.notifications
+    where user_id = p_user_id and merge_key = p_merge_key and sent_at is null
+    order by created_at desc
+    limit 1
+    for update;
+
+    if found then
+      merged := coalesce(existing.merge_data, '{}'::jsonb) || jsonb_build_object(
+        'count',
+        coalesce((existing.merge_data ->> 'count')::integer, 1)
+          + coalesce((p_merge_data ->> 'count')::integer, 1),
+        'total',
+        coalesce((existing.merge_data ->> 'total')::numeric, 0)
+          + coalesce((p_merge_data ->> 'total')::numeric, 0),
+        'names',
+        coalesce(
+          (
+            select jsonb_agg(name order by first_at)
+            from (
+              select name, min(ordinality) as first_at
+              from jsonb_array_elements_text(
+                coalesce(existing.merge_data -> 'names', '[]'::jsonb)
+                  || coalesce(p_merge_data -> 'names', '[]'::jsonb)
+              ) with ordinality as names (name, ordinality)
+              group by name
+            ) distinct_names
+          ),
+          '[]'::jsonb
+        )
+      );
+
+      update public.notifications
+      set merge_data = merged,
+        body = coalesce(public.notification_merged_body(kind, merged), body)
+      where id = existing.id;
+      return;
+    end if;
+  end if;
+
+  insert into public.notifications (
+    user_id, kind, category, group_id, title, body, url, merge_key, merge_data, dedupe_key,
+    send_after
+  )
+  values (
+    p_user_id, p_kind, p_category, p_group_id, p_title, p_body, p_url, p_merge_key,
+    p_merge_data, p_dedupe_key,
+    case when p_merge_key is not null then now() + interval '2 minutes' else now() end
+  )
+  on conflict (user_id, dedupe_key) where dedupe_key is not null do nothing;
+exception when others then
+  raise warning 'notify(%, %) failed: %', p_user_id, p_kind, sqlerrm;
+end;
+$$;
+
+-- Who hands out the seats of p_group_id's pass, to tell them about free
+-- seats: its active sponsor, or its admins if it has none (can_manage_plan).
+create or replace function public.notification_plan_managers(p_group_id uuid)
+returns setof uuid
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select user_id from public.group_members
+  where group_id = p_group_id and left_at is null and user_id is not null
+    and (
+      is_sponsor
+      or (
+        is_admin and not exists (
+          select 1 from public.group_members s
+          where s.group_id = p_group_id and s.is_sponsor and s.left_at is null
+        )
+      )
+    );
+$$;
+
+create or replace function public.notification_seats(p_count integer)
+returns text
+language sql
+immutable
+as $$
+  select p_count || case when p_count = 1 then ' seat' else ' seats' end;
+$$;
+
+-- One share of an entry, the way calculateMemberBalances splits it.
+create or replace function public.notification_log_share(p_log_id uuid)
+returns numeric
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select l.converted_amount / nullif(
+    (select count(*) from public.log_members m where m.log_id = l.id)
+      + case when l.payer_included then 1 else 0 end,
+    0
+  )
+  from public.logs l
+  where l.id = p_log_id;
+$$;
+
+-- What p_other_id owes p_user_id in p_group_id (negative: p_user_id owes
+-- them) — calculateMemberBalances for one pair.
+create or replace function public.notification_pair_balance(
+  p_group_id uuid,
+  p_user_id uuid,
+  p_other_id uuid
+)
+returns numeric
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select coalesce(sum(
+    case
+      when l.paid_by = p_user_id and m.user_id = p_other_id then share.amount
+      when l.paid_by = p_other_id and m.user_id = p_user_id then -share.amount
+      else 0
+    end
+  ), 0)
+  from public.logs l
+  join public.log_members m on m.log_id = l.id
+  cross join lateral (select public.notification_log_share(l.id) as amount) share
+  where l.group_id = p_group_id;
+$$;
+
+-- '"Dinner"', or null for an entry without a description.
+create or replace function public.notification_entry_label(p_details text)
+returns text
+language sql
+immutable
+as $$
+  select case when coalesce(btrim(p_details), '') = '' then null else '"' || p_details || '"' end;
+$$;
+
+-- E1 / O1: a new entry, to everyone in the group but its payer.
+create or replace function public.notify_entry_added(p_log_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  entry public.logs;
+  grp public.groups;
+  payer text;
+  share numeric;
+  label text;
+  split_names text[];
+  recipient uuid;
+begin
+  select * into entry from public.logs where id = p_log_id;
+  select * into grp from public.groups where id = entry.group_id;
+  payer := public.notification_name(entry.paid_by);
+  share := public.notification_log_share(entry.id);
+  label := public.notification_entry_label(entry.details);
+
+  select array_agg(coalesce(pr.name, 'Deleted user') order by pr.name)
+  into split_names
+  from public.log_members m
+  left join public.profiles pr on pr.id = m.user_id
+  where m.log_id = entry.id;
+
+  for recipient in
+    select user_id from public.group_members
+    where group_id = grp.id and left_at is null and user_id is not null
+      and user_id is distinct from entry.paid_by
+  loop
+    if exists (
+      select 1 from public.log_members where log_id = entry.id and user_id = recipient
+    ) then
+      perform public.notify(
+        recipient, 'entry_added', 'myExpenses', grp.id, grp.name,
+        payer || ' paid ' || public.notification_amount(entry.converted_amount) || ' ' || grp.currency
+          || coalesce(' for ' || label, '')
+          || ' — your share is ' || public.notification_amount(share) || ' ' || grp.currency,
+        '/group/' || grp.id,
+        'entry_added:' || grp.id || ':' || entry.paid_by,
+        jsonb_build_object('count', 1, 'total', share, 'currency', grp.currency, 'actor', payer)
+      );
+    else
+      perform public.notify(
+        recipient, 'entry_added_other', 'otherExpenses', grp.id, grp.name,
+        payer || ' paid ' || public.notification_amount(entry.converted_amount) || ' ' || grp.currency
+          || coalesce(' for ' || label, '')
+          || coalesce(', split with ' || nullif(public.notification_join_names(split_names), ''), ''),
+        '/group/' || grp.id,
+        'entry_added_other:' || grp.id || ':' || entry.paid_by,
+        jsonb_build_object(
+          'count', 1, 'total', entry.converted_amount, 'currency', grp.currency, 'actor', payer
+        )
+      );
+    end if;
+  end loop;
+end;
+$$;
+
+-- E2 / E3 / E4: an edited entry, to the people whose share changed, who were
+-- added to it or who were taken off it. p_old_members/p_old_share are the
+-- entry as it was before the edit.
+create or replace function public.notify_entry_changed(
+  p_log_id uuid,
+  p_old_members uuid[],
+  p_old_share numeric
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  entry public.logs;
+  grp public.groups;
+  payer text;
+  share numeric;
+  label text;
+  new_members uuid[];
+  recipient uuid;
+  was_in boolean;
+  is_in boolean;
+begin
+  select * into entry from public.logs where id = p_log_id;
+  select * into grp from public.groups where id = entry.group_id;
+  payer := public.notification_name(entry.paid_by);
+  share := public.notification_log_share(entry.id);
+  label := coalesce(public.notification_entry_label(entry.details), 'an entry');
+  new_members := array(
+    select user_id from public.log_members where log_id = entry.id and user_id is not null
+  );
+
+  for recipient in
+    select distinct u from unnest(coalesce(p_old_members, '{}') || new_members) as u
+    where u is not null and u is distinct from entry.paid_by
+  loop
+    was_in := recipient = any(p_old_members);
+    is_in := recipient = any(new_members);
+
+    if was_in and is_in then
+      if round(p_old_share, 2) is distinct from round(share, 2) then
+        perform public.notify(
+          recipient, 'entry_changed', 'myExpenses', grp.id, grp.name,
+          payer || ' changed ' || label || ' — your share is now '
+            || public.notification_amount(share) || ' ' || grp.currency
+            || ' (was ' || public.notification_amount(p_old_share) || ' ' || grp.currency || ')',
+          '/group/' || grp.id
+        );
+      end if;
+    elsif is_in then
+      perform public.notify(
+        recipient, 'entry_joined', 'myExpenses', grp.id, grp.name,
+        payer || ' added you to ' || label || ' — your share is '
+          || public.notification_amount(share) || ' ' || grp.currency,
+        '/group/' || grp.id
+      );
+    else
+      perform public.notify(
+        recipient, 'entry_left', 'myExpenses', grp.id, grp.name,
+        payer || ' took you off ' || label || ' — you no longer owe a share of it',
+        '/group/' || grp.id
+      );
+    end if;
+  end loop;
+end;
+$$;
+
+-- E5: an entry about to be deleted (called before the delete), to everyone
+-- who was on it. A deleted settle-up goes to the one who was paid back.
+create or replace function public.notify_entry_deleted(p_log_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  entry public.logs;
+  grp public.groups;
+  payer text;
+  share numeric;
+  recipient uuid;
+begin
+  select * into entry from public.logs where id = p_log_id;
+  select * into grp from public.groups where id = entry.group_id;
+  payer := public.notification_name(entry.paid_by);
+  share := public.notification_log_share(entry.id);
+
+  for recipient in
+    select user_id from public.log_members
+    where log_id = entry.id and user_id is not null and user_id is distinct from entry.paid_by
+  loop
+    if entry.is_settlement then
+      perform public.notify(
+        recipient, 'settlement_deleted', 'settlements', grp.id, grp.name,
+        payer || ' deleted their ' || public.notification_amount(entry.converted_amount) || ' '
+          || grp.currency || ' settle-up with you — it''s no longer in your balance',
+        '/group/' || grp.id
+      );
+    else
+      perform public.notify(
+        recipient, 'entry_deleted', 'myExpenses', grp.id, grp.name,
+        payer || ' deleted '
+          || coalesce(public.notification_entry_label(entry.details), 'an entry')
+          || ' (' || public.notification_amount(entry.converted_amount) || ' ' || grp.currency
+          || ') — your ' || public.notification_amount(share) || ' ' || grp.currency
+          || ' share is gone from your balance',
+        '/group/' || grp.id
+      );
+    end if;
+  end loop;
+end;
+$$;
+
+-- S1 / S2 / O2: a settle-up just recorded by settle_debt.
+create or replace function public.notify_settlement(p_log_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  entry public.logs;
+  grp public.groups;
+  debtor uuid;
+  creditor uuid;
+  amount text;
+  square text;
+  recipient uuid;
+begin
+  select * into entry from public.logs where id = p_log_id;
+  select * into grp from public.groups where id = entry.group_id;
+  debtor := entry.paid_by;
+  select user_id into creditor from public.log_members where log_id = entry.id limit 1;
+  amount := public.notification_amount(entry.converted_amount) || ' ' || grp.currency;
+  square := case
+    when abs(public.notification_pair_balance(grp.id, debtor, creditor)) < 0.005
+      then ' — you''re all square'
+    else ''
+  end;
+
+  if auth.uid() = debtor then
+    perform public.notify(
+      creditor, 'settlement_paid', 'settlements', grp.id, grp.name,
+      public.notification_name(debtor) || ' paid you back ' || amount || square,
+      '/group/' || grp.id
+    );
+  else
+    perform public.notify(
+      debtor, 'settlement_marked', 'settlements', grp.id, grp.name,
+      public.notification_name(creditor) || ' marked your ' || amount || ' debt as paid' || square,
+      '/group/' || grp.id
+    );
+  end if;
+
+  for recipient in
+    select user_id from public.group_members
+    where group_id = grp.id and left_at is null and user_id is not null
+      and user_id is distinct from debtor and user_id is distinct from creditor
+  loop
+    perform public.notify(
+      recipient, 'settlement_other', 'otherExpenses', grp.id, grp.name,
+      public.notification_name(debtor) || ' paid ' || public.notification_name(creditor)
+        || ' back ' || amount,
+      '/group/' || grp.id
+    );
+  end loop;
+end;
+$$;
+
+-- G1–G4: an admin editing the group, either directly (name, description,
+-- photo — the columns clients can update) or through change_group_currency.
+create or replace function public.notify_group_changed()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  actor text;
+  change text;
+  recipient uuid;
+begin
+  if auth.uid() is null then
+    return new;
+  end if;
+  actor := public.notification_name(auth.uid());
+
+  for change in
+    select message from (values
+      (1, case when new.name is distinct from old.name
+        then actor || ' renamed "' || old.name || '" to "' || new.name || '"' end),
+      (2, case when new.description is distinct from old.description
+        then actor || ' changed the group''s description' end),
+      (3, case when new.photo_url is distinct from old.photo_url
+        then actor || case when new.photo_url is null
+          then ' removed the group''s photo' else ' changed the group''s photo' end end),
+      (4, case when new.currency is distinct from old.currency
+        then actor || ' changed the group''s currency from ' || old.currency || ' to '
+          || new.currency || ' — all balances are now in ' || new.currency end)
+    ) as changes (position, message)
+    where message is not null
+    order by position
+  loop
+    for recipient in
+      select user_id from public.group_members
+      where group_id = new.id and left_at is null and user_id is not null
+    loop
+      perform public.notify(
+        recipient, 'group_changed', 'groupChanges', new.id, new.name, change, '/group/' || new.id
+      );
+    end loop;
+  end loop;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists groups_notify on public.groups;
+create trigger groups_notify
+  after update on public.groups
+  for each row execute function public.notify_group_changed();
+
+-- Everything recorded in group_events (membership, roles, seats) is
+-- notified from here, so each RPC that records one doesn't need its own
+-- notification code. Runs inside that RPC's transaction, after its event is
+-- inserted — which is why some cases look at state the RPC hasn't changed
+-- yet (a removed member's seat is still there when member_kicked is
+-- recorded) or will change next (leave_group gives a new sponsor a seat
+-- after recording sponsor_handed_over).
+create or replace function public.notify_group_event()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  grp public.groups;
+  actor text := public.notification_name(new.actor_id);
+  target text := public.notification_name(new.target_id);
+  group_url text := '/group/' || new.group_id;
+  plan_url text := '/group-plan?groupId=' || new.group_id;
+  recipient uuid;
+  pass public.plans;
+  holders uuid[];
+  seats_taken integer;
+  seats_free integer;
+  message text;
+  message_url text;
+begin
+  select * into grp from public.groups where id = new.group_id;
+  if not found then
+    return new;
+  end if;
+
+  case new.kind
+  when 'member_joined' then
+    for recipient in
+      select user_id from public.group_members
+      where group_id = grp.id and left_at is null and user_id is not null
+    loop
+      perform public.notify(
+        recipient, 'member_joined', 'members', grp.id, grp.name,
+        -- Rejoining reactivates the old row, which keeps its joined_at.
+        case
+          when exists (
+            select 1 from public.group_members
+            where group_id = grp.id and user_id = new.actor_id and joined_at < now()
+          ) then actor || ' is back in the group'
+          else actor || ' joined the group'
+        end,
+        group_url,
+        'member_joined:' || grp.id,
+        jsonb_build_object('names', jsonb_build_array(actor))
+      );
+    end loop;
+
+    -- P6: someone locked joined while the group's pass has seats to give.
+    select * into pass from public.plans
+    where group_id = grp.id and starts_at is not null and ends_at > now()
+    order by starts_at
+    limit 1;
+    if found then
+      seats_free := pass.seat_count - (
+        select count(*) from public.plan_seats where plan_id = pass.id and released_at is null
+      );
+      perform public.renew_test_subscriptions();
+      if seats_free > 0
+        and not exists (
+          select 1 from public.plan_seats
+          where plan_id = pass.id and user_id = new.actor_id and released_at is null
+        )
+        and not public.unlocked_on(new.actor_id, greatest(now(), pass.starts_at)) then
+        for recipient in select public.notification_plan_managers(grp.id) loop
+          perform public.notify(
+            recipient, 'plan_member_locked', 'plans', grp.id, grp.name,
+            actor || ' joined and isn''t unlocked — you have ' || seats_free || ' free '
+              || case when seats_free = 1 then 'seat' else 'seats' end || ' on the Trip Pass',
+            plan_url
+          );
+        end loop;
+      end if;
+    end if;
+
+  when 'member_left' then
+    message := case
+      when current_setting('app.deleting_account', true) = 'on'
+        then actor || ' deleted their account and left the group. Their past entries stay, as "Deleted user"'
+      else actor || ' left the group'
+    end;
+    for recipient in
+      select user_id from public.group_members
+      where group_id = grp.id and left_at is null and user_id is not null
+    loop
+      perform public.notify(recipient, 'member_left', 'members', grp.id, grp.name, message, group_url);
+    end loop;
+
+  when 'member_kicked' then
+    -- kick_member frees their seat on a pass that hasn't started right after
+    -- recording this, so it's still there.
+    perform public.notify(
+      new.target_id, 'removed_from_group', 'aboutMe', grp.id, 'Removed from ' || grp.name,
+      case
+        when exists (
+          select 1 from public.plan_seats s
+          join public.plans p on p.id = s.plan_id
+          where p.group_id = grp.id and p.starts_at > now()
+            and s.user_id = new.target_id and s.released_at is null
+        ) then actor || ' removed you from the group, and your seat on its pass went back to the group'
+        else actor || ' removed you from the group. Your past entries stay, and an invite link brings you back'
+      end,
+      '/',
+      p_require_member => false
+    );
+    for recipient in
+      select user_id from public.group_members
+      where group_id = grp.id and left_at is null and user_id is not null
+    loop
+      perform public.notify(
+        recipient, 'member_removed', 'members', grp.id, grp.name,
+        actor || ' removed ' || target || ' from the group', group_url
+      );
+    end loop;
+
+  when 'admin_promoted', 'admin_auto_promoted', 'admin_demoted' then
+    perform public.notify(
+      new.target_id, new.kind, 'aboutMe', grp.id, grp.name,
+      case new.kind
+        when 'admin_promoted' then
+          actor || ' made you an admin — you can now edit the group and manage its members'
+        when 'admin_auto_promoted' then
+          actor || ' left, so you''re now an admin — you can edit the group and manage its members'
+        else actor || ' removed you as admin'
+      end,
+      group_url
+    );
+    message := case new.kind
+      when 'admin_promoted' then actor || ' made ' || target || ' an admin'
+      when 'admin_auto_promoted' then target || ' is now an admin, since ' || actor || ' left'
+      else actor || ' removed ' || target || ' as admin'
+    end;
+    for recipient in
+      select user_id from public.group_members
+      where group_id = grp.id and left_at is null and user_id is not null
+        and user_id is distinct from new.target_id
+    loop
+      perform public.notify(recipient, new.kind || '_other', 'groupChanges', grp.id, grp.name, message, group_url);
+    end loop;
+
+  when 'sponsor_handed_over' then
+    message := actor || ' left the group, so you''ve taken over as sponsor — you manage its pass and its seats';
+    message_url := group_url;
+    -- On a pass that hasn't started, leave_group goes on to give the new
+    -- sponsor a seat the same way (or can't, when it's full).
+    select * into pass from public.plans where group_id = grp.id and starts_at > now();
+    if found then
+      perform public.renew_test_subscriptions();
+      if not exists (
+          select 1 from public.plan_seats
+          where plan_id = pass.id and user_id = new.target_id and released_at is null
+        )
+        and not public.unlocked_on(new.target_id, pass.starts_at) then
+        message_url := plan_url;
+        if (
+          select count(*) from public.plan_seats where plan_id = pass.id and released_at is null
+        ) < pass.seat_count then
+          message := actor || ' left the group, so you''ve taken over as sponsor and got their seat on the pass that starts on '
+            || public.notification_date(pass.starts_at, new.target_id);
+        else
+          message := actor || ' left, so you''re the sponsor now. The pass starting on '
+            || public.notification_date(pass.starts_at, new.target_id)
+            || ' is full — take a seat back from someone and give it to yourself before then';
+        end if;
+      end if;
+    end if;
+    perform public.notify(
+      new.target_id, 'became_sponsor', 'aboutMe', grp.id, 'You''re now the sponsor of ' || grp.name,
+      message, message_url
+    );
+    for recipient in
+      select user_id from public.group_members
+      where group_id = grp.id and left_at is null and user_id is not null
+        and user_id is distinct from new.target_id
+    loop
+      perform public.notify(
+        recipient, 'sponsor_handed_over_other', 'groupChanges', grp.id, grp.name,
+        target || ' is now the group''s sponsor, since ' || actor || ' left', group_url
+      );
+    end loop;
+
+  when 'plan_started' then
+    select * into pass from public.plans where id = (new.details ->> 'plan_id')::uuid;
+    if not found then
+      return new;
+    end if;
+    holders := array(
+      select value::uuid from jsonb_array_elements_text(coalesce(new.details -> 'seat_holders', '[]'::jsonb))
+    );
+    seats_free := pass.seat_count - cardinality(holders);
+    for recipient in
+      select user_id from public.group_members
+      where group_id = grp.id and left_at is null and user_id is not null
+    loop
+      if recipient = any(holders) then
+        if pass.starts_at <= now() then
+          perform public.notify(
+            recipient, 'plan_seat_at_setup', 'plans', grp.id, grp.name || ' is unlocked',
+            actor || ' set up a Trip Pass and gave you a seat — you can add entries until '
+              || public.notification_date(pass.ends_at, recipient),
+            group_url
+          );
+        else
+          perform public.notify(
+            recipient, 'plan_seat_at_setup', 'plans', grp.id, grp.name,
+            actor || ' set up a Trip Pass starting on ' || public.notification_date(pass.starts_at, recipient)
+              || ' and gave you a seat — you''ll be unlocked until '
+              || public.notification_date(pass.ends_at, recipient),
+            group_url
+          );
+        end if;
+      elsif seats_free > 0 then
+        perform public.notify(
+          recipient, 'plan_set_up', 'plans', grp.id, grp.name,
+          actor || ' set up a Trip Pass for the group — ' || seats_free || ' of ' || pass.seat_count
+            || ' seats are still free. Ask ' || actor || ' for one',
+          plan_url
+        );
+      else
+        perform public.notify(
+          recipient, 'plan_set_up', 'plans', grp.id, grp.name,
+          actor || ' set up a Trip Pass for the group (all ' || pass.seat_count || ' seats are taken)',
+          group_url
+        );
+      end if;
+    end loop;
+
+  when 'plan_seat_given' then
+    -- Given by leave_group to a new sponsor: their became_sponsor says so.
+    if new.target_id = new.actor_id or not exists (
+      select 1 from public.group_members
+      where group_id = grp.id and user_id = new.actor_id and left_at is null
+    ) then
+      return new;
+    end if;
+    select * into pass from public.plans where id = (new.details ->> 'plan_id')::uuid;
+    if not found then
+      return new;
+    end if;
+    perform public.notify(
+      new.target_id, 'plan_seat_given', 'plans', grp.id, grp.name,
+      actor || ' gave you a seat on the group''s Trip Pass — '
+        || case
+          when pass.starts_at <= now() then
+            'you can add entries until ' || public.notification_date(pass.ends_at, new.target_id)
+          else
+            'you''ll be unlocked from ' || public.notification_date(pass.starts_at, new.target_id)
+              || ' to ' || public.notification_date(pass.ends_at, new.target_id)
+        end,
+      group_url
+    );
+
+  when 'plan_seat_removed' then
+    select * into pass from public.plans where id = (new.details ->> 'plan_id')::uuid;
+    if not found then
+      return new;
+    end if;
+    if new.actor_id is distinct from new.target_id then
+      -- Taken back by whoever manages the pass. (Someone removed from the
+      -- group isn't an active member any more, so only gets
+      -- removed_from_group.)
+      perform public.notify(
+        new.target_id, 'plan_seat_removed', 'plans', grp.id, grp.name,
+        actor || ' took back your seat on the group''s Trip Pass — you won''t be unlocked when it starts on '
+          || public.notification_date(pass.starts_at, new.target_id),
+        plan_url
+      );
+    elsif not exists (
+      -- Their own, by leaving. Not when the sponsor left: whoever takes over
+      -- is told about the pass in became_sponsor.
+      select 1 from public.group_members
+      where group_id = grp.id and user_id = new.actor_id and left_as_sponsor
+    ) or exists (
+      select 1 from public.group_members where group_id = grp.id and is_sponsor and left_at is null
+    ) then
+      seats_taken := coalesce((new.details ->> 'seats_used')::integer, 0);
+      seats_free := pass.seat_count - seats_taken;
+      for recipient in select public.notification_plan_managers(grp.id) loop
+        perform public.notify(
+          recipient, 'plan_seat_freed', 'plans', grp.id, grp.name,
+          actor || ' left, so their seat on the Trip Pass is free again — ' || seats_free || ' of '
+            || pass.seat_count || ' seats free',
+          plan_url
+        );
+      end loop;
+    end if;
+
+  else
+    null;
+  end case;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists group_events_notify on public.group_events;
+create trigger group_events_notify
+  after insert on public.group_events
+  for each row execute function public.notify_group_event();
+
+-- R10 / R11: called by check_entry_access when a group is down to its last
+-- 3 free entries, and when it has used them all, for everyone in it who
+-- isn't unlocked.
+create or replace function public.notify_free_entries(p_group_id uuid, p_left integer, p_total integer)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  grp public.groups;
+  recipient uuid;
+begin
+  select * into grp from public.groups where id = p_group_id;
+  for recipient in
+    select user_id from public.group_members
+    where group_id = p_group_id and left_at is null and user_id is not null
+      and public.unlocked_until(user_id) is null
+  loop
+    perform public.notify(
+      recipient,
+      case when p_left = 0 then 'free_entries_used' else 'free_entries_low' end,
+      'reminders', p_group_id, grp.name,
+      case
+        when p_left = 0 then
+          'All ' || p_total || ' free entries in this group are used. Unlock to keep adding entries'
+        else
+          p_left || ' free ' || case when p_left = 1 then 'entry' else 'entries' end
+            || ' left in this group. Unlock to keep adding entries once they''re used'
+      end,
+      '/paywall',
+      p_dedupe_key => case when p_left = 0 then 'free_entries_used:' else 'free_entries_low:' end
+        || p_group_id
+    );
+  end loop;
+end;
+$$;
+
+-- Mirrors PLAN_PRICES in src/constants/plans.ts for the two subscriptions
+-- (always "Just me"), for the renewal reminder. Placeholders, like those.
+create or replace function public.notification_subscription_price(p_duration interval)
+returns text
+language sql
+immutable
+as $$
+  select case when p_duration >= interval '1 year' then '29.99 EUR' else '3.99 EUR' end;
+$$;
+
+-- The reminders (R1–R9 in docs/notifications.md) and P10 (a pass set up to
+-- start later has started): run every 10 minutes by pg_cron. Each is sent
+-- once per person (dedupe_key), keyed on the date it's about, so a pass
+-- that's moved or lengthened gets a fresh one. None of the "ending" ones go
+-- to someone something else keeps unlocked past that date (unlocked_on).
+create or replace function public.send_scheduled_notifications()
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  pass public.plans;
+  grp public.groups;
+  recipient uuid;
+  member_id uuid;
+  member_until timestamptz;
+  seats_taken integer;
+  started_event_at timestamptz;
+  epoch text;
+begin
+  perform public.renew_test_subscriptions();
+
+  -- R1 / R1b / R2: a Trip Pass ending within 2 days.
+  for pass in
+    select * from public.plans
+    where kind = 'trip_pass' and starts_at <= now()
+      and ends_at > now() and ends_at <= now() + interval '2 days'
+  loop
+    select * into grp from public.groups where id = pass.group_id;
+    epoch := extract(epoch from pass.ends_at)::bigint::text;
+    for recipient in
+      select user_id from public.plan_seats
+      where plan_id = pass.id and released_at is null and user_id is not null
+    loop
+      if public.unlocked_on(recipient, pass.ends_at) then
+        continue;
+      end if;
+      perform public.notify(
+        recipient, 'plan_ending', 'reminders', null,
+        'Your Trip Pass ends ' || public.notification_days_until(pass.ends_at, recipient),
+        case when grp.id is not null then grp.name || '''s pass runs' else 'It runs' end
+          || ' until ' || public.notification_date(pass.ends_at, recipient)
+          || '. After that, adding entries needs a new unlock — settling up always works',
+        case when grp.id is not null then '/group/' || grp.id else '/plans' end,
+        p_dedupe_key => 'plan_ending:' || pass.id || ':' || epoch
+      );
+    end loop;
+
+    if grp.id is not null and pass.sponsor_id is not null and not exists (
+      select 1 from public.plan_seats
+      where plan_id = pass.id and user_id = pass.sponsor_id and released_at is null
+    ) then
+      perform public.notify(
+        pass.sponsor_id, 'plan_ending_sponsor', 'reminders', null,
+        grp.name || '''s Trip Pass ends ' || public.notification_days_until(pass.ends_at, pass.sponsor_id),
+        'It runs until ' || public.notification_date(pass.ends_at, pass.sponsor_id),
+        '/group-plan?groupId=' || grp.id,
+        p_dedupe_key => 'plan_ending:' || pass.id || ':' || epoch
+      );
+    end if;
+  end loop;
+
+  -- R3 / R3b: a Trip Pass that ended in the last day.
+  for pass in
+    select * from public.plans
+    where kind = 'trip_pass' and ends_at <= now() and ends_at > now() - interval '1 day'
+  loop
+    select * into grp from public.groups where id = pass.group_id;
+    for recipient in
+      select user_id from public.plan_seats
+      where plan_id = pass.id and released_at is null and user_id is not null
+      union
+      select pass.sponsor_id where pass.sponsor_id is not null
+    loop
+      if public.unlocked_on(recipient, now()) then
+        continue;
+      end if;
+      perform public.notify(
+        recipient, 'plan_ended', 'reminders', null, 'Your Trip Pass has ended',
+        case when grp.id is not null then grp.name || '''s pass ended. ' else '' end
+          || 'Your entries and balances stay — unlock again to add new ones',
+        '/paywall',
+        p_dedupe_key => 'plan_ended:' || pass.id
+      );
+    end loop;
+  end loop;
+
+  -- R4 / R5: a subscription renewing, or (cancelled) ending, within 2 days.
+  for pass in
+    select * from public.plans
+    where kind = 'subscription' and sponsor_id is not null and starts_at <= now()
+      and ends_at > now() and ends_at <= now() + interval '2 days'
+  loop
+    epoch := extract(epoch from pass.ends_at)::bigint::text;
+    if pass.will_renew then
+      perform public.notify(
+        pass.sponsor_id, 'subscription_renewing', 'reminders', null,
+        'Your subscription renews ' || public.notification_days_until(pass.ends_at, pass.sponsor_id),
+        'Your ' || case when pass.duration >= interval '1 year' then 'yearly' else 'monthly' end
+          || ' subscription renews on ' || public.notification_date(pass.ends_at, pass.sponsor_id)
+          || ' for ' || public.notification_subscription_price(pass.duration)
+          || '. You can cancel it until then',
+        '/subscription?planId=' || pass.id,
+        p_dedupe_key => 'subscription_renewing:' || pass.id || ':' || epoch
+      );
+    elsif not public.unlocked_on(pass.sponsor_id, pass.ends_at) then
+      perform public.notify(
+        pass.sponsor_id, 'subscription_ending', 'reminders', null,
+        'Your subscription ends ' || public.notification_days_until(pass.ends_at, pass.sponsor_id),
+        'You''re unlocked until ' || public.notification_date(pass.ends_at, pass.sponsor_id)
+          || '. Resume it to stay unlocked',
+        '/subscription?planId=' || pass.id,
+        p_dedupe_key => 'subscription_ending:' || pass.id || ':' || epoch
+      );
+    end if;
+  end loop;
+
+  -- R6: a cancelled subscription that ended in the last day. (One upgraded
+  -- to yearly ends too, but the yearly one keeps its holder unlocked.)
+  for pass in
+    select * from public.plans
+    where kind = 'subscription' and sponsor_id is not null and not will_renew
+      and ends_at <= now() and ends_at > now() - interval '1 day'
+  loop
+    if not public.unlocked_on(pass.sponsor_id, now()) then
+      perform public.notify(
+        pass.sponsor_id, 'subscription_ended', 'reminders', null, 'Your subscription has ended',
+        'Your entries and balances stay — unlock again to add new ones',
+        '/paywall',
+        p_dedupe_key => 'subscription_ended:' || pass.id
+      );
+    end if;
+  end loop;
+
+  -- R7: a Trip Pass bought 3 days ago or more and still not set up.
+  for pass in
+    select * from public.plans
+    where kind = 'trip_pass' and starts_at is null and sponsor_id is not null
+      and created_at <= now() - interval '3 days'
+  loop
+    perform public.notify(
+      pass.sponsor_id, 'plan_not_set_up', 'reminders', null, 'Your Trip Pass is ready',
+      'Set it up to choose your group and when it starts — it won''t count down until you do',
+      '/plan-setup?planId=' || pass.id,
+      p_dedupe_key => 'plan_not_set_up:' || pass.id
+    );
+  end loop;
+
+  -- R8: a group pass starting within a day that still has free seats.
+  for pass in
+    select * from public.plans
+    where group_id is not null and starts_at > now() and starts_at <= now() + interval '1 day'
+  loop
+    seats_taken := (
+      select count(*) from public.plan_seats where plan_id = pass.id and released_at is null
+    );
+    if seats_taken >= pass.seat_count then
+      continue;
+    end if;
+    select * into grp from public.groups where id = pass.group_id;
+    epoch := extract(epoch from pass.starts_at)::bigint::text;
+    for recipient in select public.notification_plan_managers(grp.id) loop
+      perform public.notify(
+        recipient, 'plan_starting_free_seats', 'reminders', grp.id,
+        grp.name || '''s Trip Pass starts ' || public.notification_days_until(pass.starts_at, recipient),
+        (pass.seat_count - seats_taken) || ' of ' || pass.seat_count
+          || ' seats are still free — give them out so everyone''s unlocked from the start',
+        '/group-plan?groupId=' || grp.id,
+        p_dedupe_key => 'plan_starting_free_seats:' || pass.id || ':' || epoch
+      );
+    end loop;
+  end loop;
+
+  -- R9: someone in a group whose running pass has free seats, without a seat
+  -- on it, whose unlock ends within 2 days and before the pass does.
+  for pass in
+    select * from public.plans
+    where group_id is not null and starts_at <= now() and ends_at > now()
+  loop
+    seats_taken := (
+      select count(*) from public.plan_seats where plan_id = pass.id and released_at is null
+    );
+    if seats_taken >= pass.seat_count then
+      continue;
+    end if;
+    select * into grp from public.groups where id = pass.group_id;
+    for member_id in
+      select gm.user_id from public.group_members gm
+      where gm.group_id = grp.id and gm.left_at is null and gm.user_id is not null
+        and not exists (
+          select 1 from public.plan_seats s
+          where s.plan_id = pass.id and s.user_id = gm.user_id and s.released_at is null
+        )
+    loop
+      member_until := public.unlocked_until(member_id);
+      if member_until is null or member_until > now() + interval '2 days'
+        or member_until >= pass.ends_at or public.unlocked_on(member_id, member_until) then
+        continue;
+      end if;
+      for recipient in select public.notification_plan_managers(grp.id) loop
+        perform public.notify(
+          recipient, 'member_unlock_ending', 'reminders', grp.id, grp.name,
+          public.notification_name(member_id) || '''s unlock ends on '
+            || public.notification_date(member_until, recipient)
+            || ', before the Trip Pass does — give them a seat to keep them unlocked',
+          '/group-plan?groupId=' || grp.id,
+          p_dedupe_key => 'member_unlock_ending:' || pass.id || ':' || member_id || ':'
+            || extract(epoch from member_until)::bigint
+        );
+      end loop;
+    end loop;
+  end loop;
+
+  -- P10: a group pass set up to start later has started.
+  for pass in
+    select * from public.plans
+    where group_id is not null and starts_at <= now() and starts_at > now() - interval '1 day'
+  loop
+    select max(created_at) into started_event_at
+    from public.group_events
+    where group_id = pass.group_id and kind = 'plan_started'
+      and details ->> 'plan_id' = pass.id::text;
+    if started_event_at is null or started_event_at >= pass.starts_at - interval '1 minute' then
+      continue;
+    end if;
+    select * into grp from public.groups where id = pass.group_id;
+    for recipient in
+      select user_id from public.plan_seats
+      where plan_id = pass.id and released_at is null and user_id is not null
+    loop
+      perform public.notify(
+        recipient, 'plan_started', 'plans', grp.id, grp.name || ' is unlocked',
+        'The Trip Pass has started — you can add entries until '
+          || public.notification_date(pass.ends_at, recipient),
+        '/group/' || grp.id,
+        p_dedupe_key => 'plan_started:' || pass.id || ':' || extract(epoch from pass.starts_at)::bigint
+      );
+    end loop;
+  end loop;
+end;
+$$;
+
+-- X1: always sent, even for a change made from the same phone (it can't
+-- tell which device did it). Not for a first password on an account that
+-- signed up with Google.
+create or replace function public.notify_password_changed()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if coalesce(old.encrypted_password, '') <> ''
+    and new.encrypted_password is distinct from old.encrypted_password then
+    perform public.notify(
+      new.id, 'password_changed', 'always', null, 'Your password was changed',
+      'If this wasn''t you, reset your password right away', '/account'
+    );
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_password_changed on auth.users;
+create trigger on_auth_user_password_changed
+  after update of encrypted_password on auth.users
+  for each row execute function public.notify_password_changed();
+
+-- Called by the app once it has a push token (on every launch, so a token
+-- moves to whoever signed in on that device last).
+create or replace function public.register_push_token(p_token text, p_platform text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is null then
+    raise exception 'Sign in first';
+  end if;
+  if p_token !~ '^Expo(nent)?PushToken\[[^\]]{1,200}\]$' then
+    raise exception 'Not an Expo push token';
+  end if;
+
+  insert into public.push_tokens (token, user_id, platform, updated_at)
+  values (p_token, auth.uid(), p_platform, now())
+  on conflict (token) do update
+    set user_id = excluded.user_id, platform = excluded.platform, updated_at = now();
+end;
+$$;
+
+grant execute on function public.register_push_token(text, text) to authenticated;
+
+-- Called by the app right before signing out, so that device stops getting
+-- this account's notifications.
+create or replace function public.unregister_push_token(p_token text)
+returns void
+language sql
+security definer
+set search_path = public
+as $$
+  delete from public.push_tokens where token = p_token and user_id = auth.uid();
+$$;
+
+grant execute on function public.unregister_push_token(text) to authenticated;
+
+-- The send-notifications Edge Function's two calls (service role only):
+-- takes every notification that's due, marking it sent, with the push
+-- tokens of the person it's for (none: nothing to send it to)…
+create or replace function public.claim_due_notifications(p_limit integer default 500)
+returns table (id uuid, title text, body text, url text, tokens text[])
+language sql
+security definer
+set search_path = public
+as $$
+  with due as (
+    select n.id from public.notifications n
+    where n.sent_at is null and n.send_after <= now()
+    order by n.send_after
+    limit p_limit
+    for update skip locked
+  ),
+  claimed as (
+    update public.notifications n
+    set sent_at = now()
+    from due
+    where n.id = due.id
+    returning n.id, n.user_id, n.title, n.body, n.url
+  )
+  select c.id, c.title, c.body, c.url,
+    coalesce(array_agg(t.token) filter (where t.token is not null), '{}')
+  from claimed c
+  left join public.push_tokens t on t.user_id = c.user_id
+  group by c.id, c.title, c.body, c.url;
+$$;
+
+-- …and forgets tokens Expo says no longer reach a device (the app was
+-- uninstalled).
+create or replace function public.remove_push_tokens(p_tokens text[])
+returns void
+language sql
+security definer
+set search_path = public
+as $$
+  delete from public.push_tokens where token = any(p_tokens);
+$$;
+
+-- Run every minute by pg_cron: calls the send-notifications Edge Function
+-- when anything is due. Its address and shared secret live in Vault
+-- ('project_url', 'notifications_cron_secret' — set by hand, see CLAUDE.md),
+-- not in this file.
+create or replace function public.trigger_notification_sender()
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  project_url text;
+  cron_secret text;
+begin
+  if not exists (
+    select 1 from public.notifications where sent_at is null and send_after <= now()
+  ) then
+    return;
+  end if;
+
+  select decrypted_secret into project_url from vault.decrypted_secrets where name = 'project_url';
+  select decrypted_secret into cron_secret
+  from vault.decrypted_secrets where name = 'notifications_cron_secret';
+  if project_url is null or cron_secret is null then
+    return;
+  end if;
+
+  perform net.http_post(
+    url := project_url || '/functions/v1/send-notifications',
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-cron-secret', cron_secret),
+    body := '{}'::jsonb
+  );
+end;
+$$;
+
+-- Supabase has both extensions; skipped where it doesn't (e.g. a local test
+-- database). cron.schedule replaces a job of the same name.
+do $$
+begin
+  if exists (select 1 from pg_available_extensions where name = 'pg_cron')
+    and exists (select 1 from pg_available_extensions where name = 'pg_net') then
+    create extension if not exists pg_net with schema extensions;
+    create extension if not exists pg_cron;
+    perform cron.schedule(
+      'send-notifications', '* * * * *', 'select public.trigger_notification_sender()'
+    );
+    perform cron.schedule(
+      'notification-reminders', '*/10 * * * *', 'select public.send_scheduled_notifications()'
+    );
+  end if;
+end $$;
+
+-- ---------------------------------------------------------------------------
 -- Grants
 -- ---------------------------------------------------------------------------
 -- RLS policies only take effect once the role already has the underlying SQL
@@ -2846,6 +4418,14 @@ revoke all on public.billing_settings, public.billing_testers, public.plans, pub
   public.free_entry_usage
   from anon, authenticated;
 
+-- Notifications: your own settings are read and written directly
+-- (NotificationsProvider), your own notifications only read, and push
+-- tokens only through register_push_token/unregister_push_token.
+revoke all on public.notification_settings, public.notifications, public.push_tokens
+  from anon, authenticated;
+grant select, insert, update on public.notification_settings to authenticated;
+grant select on public.notifications to authenticated;
+
 -- Internal plan functions, only ever called from inside the security
 -- definer functions above (which run as their owner). unlocked_until and
 -- unlocked_on answer for any user, and create_plan/add_plan_seats/upgrade_plan hand out plans
@@ -2860,6 +4440,36 @@ revoke all on function public.free_pending_plan_seat(uuid, uuid, uuid)
   from public, anon, authenticated;
 revoke all on function public.can_test_purchase() from public, anon, authenticated;
 revoke all on function public.renew_test_subscriptions() from public, anon, authenticated;
+-- Notifications: notify() and its helpers send or answer for anyone, and
+-- the sender's two functions are for the send-notifications Edge Function
+-- (service role) alone.
+revoke all on function public.notify(
+  uuid, text, text, uuid, text, text, text, text, jsonb, text, boolean
+) from public, anon, authenticated;
+revoke all on function public.notification_category_on(uuid, text) from public, anon, authenticated;
+revoke all on function public.notification_name(uuid) from public, anon, authenticated;
+revoke all on function public.notification_time_zone(uuid) from public, anon, authenticated;
+revoke all on function public.notification_date(timestamptz, uuid) from public, anon, authenticated;
+revoke all on function public.notification_days_until(timestamptz, uuid)
+  from public, anon, authenticated;
+revoke all on function public.notification_plan_managers(uuid) from public, anon, authenticated;
+revoke all on function public.notification_log_share(uuid) from public, anon, authenticated;
+revoke all on function public.notification_pair_balance(uuid, uuid, uuid)
+  from public, anon, authenticated;
+revoke all on function public.notify_entry_added(uuid) from public, anon, authenticated;
+revoke all on function public.notify_entry_changed(uuid, uuid[], numeric)
+  from public, anon, authenticated;
+revoke all on function public.notify_entry_deleted(uuid) from public, anon, authenticated;
+revoke all on function public.notify_settlement(uuid) from public, anon, authenticated;
+revoke all on function public.notify_free_entries(uuid, integer, integer)
+  from public, anon, authenticated;
+revoke all on function public.notify_group_changed() from public, anon, authenticated;
+revoke all on function public.notify_group_event() from public, anon, authenticated;
+revoke all on function public.notify_password_changed() from public, anon, authenticated;
+revoke all on function public.send_scheduled_notifications() from public, anon, authenticated;
+revoke all on function public.trigger_notification_sender() from public, anon, authenticated;
+revoke all on function public.claim_due_notifications(integer) from public, anon, authenticated;
+revoke all on function public.remove_push_tokens(text[]) from public, anon, authenticated;
 revoke all on function public.check_entry_access(uuid, uuid[], timestamptz)
   from public, anon, authenticated;
 revoke all on function public.create_plan(
@@ -2886,6 +4496,19 @@ alter table public.billing_testers enable row level security;
 alter table public.free_entry_usage enable row level security;
 alter table public.plans enable row level security;
 alter table public.plan_seats enable row level security;
+alter table public.notification_settings enable row level security;
+alter table public.notifications enable row level security;
+-- No policies: only ever touched through register_push_token,
+-- unregister_push_token and the sender's functions.
+alter table public.push_tokens enable row level security;
+
+drop policy if exists "notification_settings_own" on public.notification_settings;
+create policy "notification_settings_own" on public.notification_settings
+  for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+drop policy if exists "notifications_select_own" on public.notifications;
+create policy "notifications_select_own" on public.notifications
+  for select using (user_id = auth.uid());
 
 -- profiles: see your own profile, or anyone who shares a group with you.
 drop policy if exists "profiles_select" on public.profiles;

@@ -105,12 +105,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const { session } = useAuth();
   const userId = session?.user.id ?? null;
   const [groups, setGroups] = useState<Group[]>([]);
-  const [isLoaded, setIsLoaded] = useState(false);
+  // Which account (null = signed out) the data above has loaded for, so
+  // isLoaded reads false again while a newly signed-in account's is still
+  // loading, rather than carrying over from the signed-out state (same as
+  // use-profile.tsx).
+  const [loadedFor, setLoadedFor] = useState<string | null | undefined>(undefined);
+  const isLoaded = loadedFor === userId;
 
   const refresh = useCallback(async () => {
     if (!userId) {
       setGroups([]);
-      setIsLoaded(true);
+      setLoadedFor(userId);
       return;
     }
 
@@ -129,7 +134,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       writeUserData(userId, "groups", next);
       prefetchRatesForOffline(next.map((group) => group.currency));
     }
-    setIsLoaded(true);
+    setLoadedFor(userId);
   }, [userId]);
 
   useEffect(() => {
@@ -144,7 +149,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         if (cancelled) return;
         if (stored) {
           setGroups(stored);
-          setIsLoaded(true);
+          setLoadedFor(userId);
         }
       }
       if (cancelled) return;

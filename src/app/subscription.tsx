@@ -7,6 +7,7 @@ import { Expandable } from "@/components/expandable";
 import { ConfirmationBody } from "@/components/leave-group-confirmation";
 import { ModalHeader } from "@/components/modal-header";
 import { PressableScale } from "@/components/press-feedback";
+import { Skeleton, SkeletonGroup, SkeletonText } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { formatPrice, planPrice, subscriptionPeriodOf } from "@/constants/plans";
 import { type ActivePlan, useAccess } from "@/hooks/use-access";
@@ -132,6 +133,30 @@ function PromoCard({
   );
 }
 
+// Stand-in for the hero and billing details while your plans load.
+function SubscriptionSkeleton() {
+  return (
+    <SkeletonGroup style={styles.content}>
+      <View style={styles.hero}>
+        <Skeleton width={48} height={48} radius={24} style={styles.heroIconSkeleton} />
+        <SkeletonText fontSize={20} width="55%" style={styles.centered} />
+        <SkeletonText fontSize={14} width="70%" style={styles.centered} />
+        <SkeletonText fontSize={28} width="35%" style={[styles.centered, styles.heroPriceSkeleton]} />
+        <Skeleton width={72} height={26} radius={13} style={styles.heroPriceSkeleton} />
+      </View>
+      <SkeletonText fontSize={14} width={56} style={styles.sectionTitleSkeleton} />
+      <View style={styles.card}>
+        {[0, 1, 2, 3].map((index) => (
+          <View key={index} style={[styles.row, index < 3 && styles.rowDivider]}>
+            <SkeletonText fontSize={15} width="40%" style={styles.flex} />
+            <SkeletonText fontSize={15} width={88} />
+          </View>
+        ))}
+      </View>
+    </SkeletonGroup>
+  );
+}
+
 export default function SubscriptionScreen() {
   const { planId } = useLocalSearchParams<{ planId: string }>();
   const { access, isLoaded, refresh } = useAccess();
@@ -152,11 +177,13 @@ export default function SubscriptionScreen() {
     return (
       <View style={styles.flex}>
         <ModalHeader title="Subscription" onClose={goBackOrToGroups} />
-        <View style={styles.content}>
-          <Text style={styles.empty}>
-            {isLoaded ? "This subscription has ended." : "Loading…"}
-          </Text>
-        </View>
+        {isLoaded ? (
+          <View style={styles.content}>
+            <Text style={styles.empty}>This subscription has ended.</Text>
+          </View>
+        ) : (
+          <SubscriptionSkeleton />
+        )}
       </View>
     );
   }
@@ -436,6 +463,19 @@ const styles = StyleSheet.create({
   empty: {
     fontSize: 15,
     color: Colors.muted,
+  },
+  centered: {
+    width: "100%",
+    alignItems: "center",
+  },
+  heroIconSkeleton: {
+    marginBottom: 6,
+  },
+  heroPriceSkeleton: {
+    marginTop: 8,
+  },
+  sectionTitleSkeleton: {
+    marginTop: 8,
   },
   hero: {
     alignItems: "center",

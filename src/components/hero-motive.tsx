@@ -1,5 +1,5 @@
 import { memo, useEffect, useRef, useState } from "react";
-import { Image, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
+import { StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
 import Animated, {
   Easing,
   useAnimatedStyle,
@@ -9,6 +9,7 @@ import Animated, {
 } from "react-native-reanimated";
 import { scheduleOnRN } from "react-native-worklets";
 
+import { SkeletonImage } from "@/components/skeleton";
 import { resolveHeroMotiveVariant } from "@/utils/hero-motive";
 
 // Motive artwork fills most of its container rather than sitting at a fixed
@@ -193,7 +194,7 @@ export const GroupHero = memo(function GroupHero({
   }
   return (
     <View style={[styles.container, style]}>
-      <Image source={{ uri: photoUrl }} style={styles.photoFill} resizeMode="cover" />
+      <SkeletonImage uri={photoUrl} style={styles.photoFill} />
     </View>
   );
 });

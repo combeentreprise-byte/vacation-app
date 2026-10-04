@@ -3,6 +3,7 @@ import { router, useLocalSearchParams } from "expo-router";
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { ModalHeader } from "@/components/modal-header";
+import { Skeleton, SkeletonGroup, SkeletonText } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { type Group, useGroups } from "@/hooks/use-groups";
 
@@ -10,7 +11,7 @@ import { type Group, useGroups } from "@/hooks/use-groups";
 // amount but no group yet, and Add entry needs a groupId — this just lets
 // the user pick which group the scan belongs to before landing there.
 export default function ScanPickGroupScreen() {
-  const { groups } = useGroups();
+  const { groups, isLoaded } = useGroups();
   const { prefillAmount, prefillCurrency } = useLocalSearchParams<{
     prefillAmount?: string;
     prefillCurrency?: string;
@@ -33,7 +34,16 @@ export default function ScanPickGroupScreen() {
     <View style={styles.flex}>
       <ModalHeader title="Log it in which group?" onClose={() => router.back()} />
 
-      {groups.length === 0 ? (
+      {!isLoaded ? (
+        <SkeletonGroup style={styles.list}>
+          {(["50%", "38%", "60%"] as const).map((width) => (
+            <View key={width} style={styles.row}>
+              <SkeletonText fontSize={16} width={width} style={styles.flex} />
+              <Skeleton width={18} height={18} radius={9} />
+            </View>
+          ))}
+        </SkeletonGroup>
+      ) : groups.length === 0 ? (
         <View style={styles.empty}>
           <Text style={styles.emptyText}>You&apos;re not in any groups yet.</Text>
         </View>

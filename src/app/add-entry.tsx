@@ -29,6 +29,7 @@ import { CrossfadeLabel } from "@/components/crossfade-label";
 import { CurrencyPickerModal } from "@/components/currency-picker";
 import { ModalHeader } from "@/components/modal-header";
 import { FocusTextInput, PressableScale } from "@/components/press-feedback";
+import { Skeleton, SkeletonGroup, SkeletonText } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { CURRENCIES } from "@/constants/currencies";
 import { LOG_DETAILS_MAX_LENGTH, LOG_DETAILS_MAX_LINES } from "@/constants/limits";
@@ -179,6 +180,29 @@ function MemberTile({
   );
 }
 
+// The split picker's tiles while the group's members load, rather than
+// just your own tile with everyone else popping in after.
+function MemberTilesSkeleton() {
+  return (
+    <SkeletonGroup style={styles.memberGrid}>
+      {[0, 1].map((row) => (
+        <View key={row} style={styles.memberRow}>
+          {[0, 1, 2].map((column) => (
+            <View key={column} style={[styles.memberTile, styles.memberTileStandard]}>
+              <Skeleton width={48} height={48} radius={24} />
+              <SkeletonText
+                fontSize={13}
+                width={column === 1 ? "50%" : "65%"}
+                style={styles.memberTileNameSkeleton}
+              />
+            </View>
+          ))}
+        </View>
+      ))}
+    </SkeletonGroup>
+  );
+}
+
 export default function AddEntryScreen() {
   const { groupId, prefillAmount, prefillCurrency, scanId, logId } = useLocalSearchParams<{
     groupId: string;
@@ -201,7 +225,7 @@ export default function AddEntryScreen() {
   const { profile } = useProfile();
   const { groups } = useGroups();
   const { logs, addLog, updateLog } = useLogs();
-  const { members: allMembers } = useGroupMembers(groupId);
+  const { members: allMembers, isLoaded: isMembersLoaded } = useGroupMembers(groupId);
   const group = groups.find((item) => item.id === groupId);
   const existingLog = isEditMode ? logs.find((log) => log.id === logId) : undefined;
   // The checklist is for splitting with other people; your own share is
@@ -597,59 +621,63 @@ export default function AddEntryScreen() {
                 ))}
               </View>
             </View>
-            <View style={[styles.memberGrid, !isGridMeasured && styles.memberGridHidden]}>
-              {chunk(
-                [
-                  <MemberTile
-                    key={SELF_TILE_ID}
-                    name={profile.name}
-                    label="You"
-                    avatarUrl={profile.avatarUrl}
-                    selected={includeMyself}
-                    animationDelay={cascadeDelays[SELF_TILE_ID]}
-                    onToggle={toggleMyself}
-                    style={styles.memberTileStandard}
-                  />,
-                  ...standardMembers.map((member) => (
+            {!isMembersLoaded ? (
+              <MemberTilesSkeleton />
+            ) : (
+              <View style={[styles.memberGrid, !isGridMeasured && styles.memberGridHidden]}>
+                {chunk(
+                  [
                     <MemberTile
-                      key={member.id}
-                      name={member.name}
-                      avatarUrl={member.avatarUrl}
-                      selected={!!selectedIds[member.id]}
-                      locked={isLocked(member.id)}
-                      animationDelay={cascadeDelays[member.id]}
-                      onToggle={() => toggleMember(member.id)}
+                      key={SELF_TILE_ID}
+                      name={profile.name}
+                      label="You"
+                      avatarUrl={profile.avatarUrl}
+                      selected={includeMyself}
+                      animationDelay={cascadeDelays[SELF_TILE_ID]}
+                      onToggle={toggleMyself}
                       style={styles.memberTileStandard}
-                    />
-                  )),
-                ],
-                3
-              ).map((row, index) => (
-                <View key={index} style={styles.memberRow}>
-                  {row}
-                  {/* Fillers keep a short last row's tiles a third wide. */}
-                  {Array.from({ length: 3 - row.length }, (_, i) => (
-                    <View key={`filler-${i}`} style={styles.memberTileStandard} />
-                  ))}
-                </View>
-              ))}
-              {wideRows.map((row) => (
-                <View key={row[0].member.id} style={styles.memberRow}>
-                  {row.map(({ member, width }) => (
-                    <MemberTile
-                      key={member.id}
-                      name={member.name}
-                      avatarUrl={member.avatarUrl}
-                      selected={!!selectedIds[member.id]}
-                      locked={isLocked(member.id)}
-                      animationDelay={cascadeDelays[member.id]}
-                      onToggle={() => toggleMember(member.id)}
-                      style={{ width }}
-                    />
-                  ))}
-                </View>
-              ))}
-            </View>
+                    />,
+                    ...standardMembers.map((member) => (
+                      <MemberTile
+                        key={member.id}
+                        name={member.name}
+                        avatarUrl={member.avatarUrl}
+                        selected={!!selectedIds[member.id]}
+                        locked={isLocked(member.id)}
+                        animationDelay={cascadeDelays[member.id]}
+                        onToggle={() => toggleMember(member.id)}
+                        style={styles.memberTileStandard}
+                      />
+                    )),
+                  ],
+                  3
+                ).map((row, index) => (
+                  <View key={index} style={styles.memberRow}>
+                    {row}
+                    {/* Fillers keep a short last row's tiles a third wide. */}
+                    {Array.from({ length: 3 - row.length }, (_, i) => (
+                      <View key={`filler-${i}`} style={styles.memberTileStandard} />
+                    ))}
+                  </View>
+                ))}
+                {wideRows.map((row) => (
+                  <View key={row[0].member.id} style={styles.memberRow}>
+                    {row.map(({ member, width }) => (
+                      <MemberTile
+                        key={member.id}
+                        name={member.name}
+                        avatarUrl={member.avatarUrl}
+                        selected={!!selectedIds[member.id]}
+                        locked={isLocked(member.id)}
+                        animationDelay={cascadeDelays[member.id]}
+                        onToggle={() => toggleMember(member.id)}
+                        style={{ width }}
+                      />
+                    ))}
+                  </View>
+                ))}
+              </View>
+            )}
           </View>
         </View>
 
@@ -848,6 +876,10 @@ const styles = StyleSheet.create({
     color: Colors.accentText,
     fontSize: 16,
     fontWeight: "700",
+  },
+  memberTileNameSkeleton: {
+    width: "100%",
+    alignItems: "center",
   },
   memberTileName: {
     fontSize: 13,

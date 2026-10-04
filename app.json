@@ -45,6 +45,13 @@
         {
           "cameraPermission": "Allow $(PRODUCT_NAME) to access your camera to scan receipts."
         }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#208AEF",
+          "defaultChannel": "default"
+        }
       ]
     ],
     "experiments": {

@@ -8,6 +8,8 @@ import { DayField, DayPicker, startOfDay } from "@/components/day-picker";
 import { ModalHeader } from "@/components/modal-header";
 import { type PlanMemberStatusTone, PlanMemberRow } from "@/components/plan-member-row";
 import { PressableScale } from "@/components/press-feedback";
+import { PlanRowSkeleton } from "@/components/screen-skeletons";
+import { Skeleton, SkeletonGroup, SkeletonText } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { type UpcomingPlan, useAccess } from "@/hooks/use-access";
 import { useAuth } from "@/hooks/use-auth";
@@ -92,7 +94,7 @@ export default function PlanSetupScreen() {
   const { session } = useAuth();
   const viewerId = session?.user.id ?? "";
   const { access, isLoaded, refresh: refreshAccess } = useAccess();
-  const { groups } = useGroups();
+  const { groups, isLoaded: isGroupsLoaded } = useGroups();
   const { syncPending } = useLogs();
   const plan = access.upcomingPlans.find((item) => item.id === planId);
   const isSetUp = plan?.startsAt != null;
@@ -121,8 +123,8 @@ export default function PlanSetupScreen() {
   // The group being picked, or for a pass already set up, its own (to see
   // whether a new start leaves its sponsor needing a seat).
   const accessGroupId = isGroupPass ? ((isSetUp ? plan?.groupId : groupId) ?? undefined) : undefined;
-  const { access: groupAccess } = useGroupAccess(accessGroupId);
-  const { members: allMembers } = useGroupMembers(accessGroupId);
+  const { access: groupAccess, isLoaded: isGroupAccessLoaded } = useGroupAccess(accessGroupId);
+  const { members: allMembers, isLoaded: isMembersLoaded } = useGroupMembers(accessGroupId);
 
   // "Now", as of opening the screen, for the calendar's range and the
   // dates shown — close enough for a day picker.
@@ -264,7 +266,22 @@ export default function PlanSetupScreen() {
           <View style={styles.notFound}>
             <Text style={styles.muted}>This pass has already started, or couldn&apos;t be found.</Text>
           </View>
-        ) : null}
+        ) : (
+          <SkeletonGroup style={styles.content}>
+            <View style={styles.passCard}>
+              <Skeleton width={22} height={22} radius={11} />
+              <View style={styles.passText}>
+                <SkeletonText fontSize={16} width="55%" />
+                <SkeletonText fontSize={14} lineHeight={20} width="95%" />
+                <SkeletonText fontSize={14} lineHeight={20} width="70%" />
+              </View>
+            </View>
+            <View style={styles.section}>
+              <SkeletonText fontSize={14} width={110} />
+              <Skeleton height={300} radius={12} />
+            </View>
+          </SkeletonGroup>
+        )}
       </View>
     );
   }
@@ -294,7 +311,19 @@ export default function PlanSetupScreen() {
           </Text>
         ) : null}
 
-        {step === "group" ? (
+        {step === "group" && !isGroupsLoaded ? (
+          <SkeletonGroup style={styles.section}>
+            <Text style={styles.sectionTitle}>Which group</Text>
+            {["50%", "38%", "60%"].map((width) => (
+              <View key={width} style={styles.row}>
+                <SkeletonText fontSize={16} width={width as `${number}%`} style={styles.flex} />
+                <Skeleton width={22} height={22} radius={11} />
+              </View>
+            ))}
+          </SkeletonGroup>
+        ) : null}
+
+        {step === "group" && isGroupsLoaded ? (
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Which group</Text>
             {openGroups.length > 0 ? (
@@ -404,7 +433,21 @@ export default function PlanSetupScreen() {
           </View>
         ) : null}
 
-        {step === "members" && group && groupAccess && !groupHasPlan ? (
+        {step === "members" && group && (!isGroupAccessLoaded || !isMembersLoaded) ? (
+          <SkeletonGroup style={styles.section}>
+            <SkeletonText fontSize={14} width={150} />
+            <PlanRowSkeleton titleWidth="45%" filled />
+            <PlanRowSkeleton titleWidth="35%" filled />
+            <PlanRowSkeleton titleWidth="50%" filled />
+          </SkeletonGroup>
+        ) : null}
+
+        {step === "members" &&
+        group &&
+        isGroupAccessLoaded &&
+        isMembersLoaded &&
+        groupAccess &&
+        !groupHasPlan ? (
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>
               Who gets a seat · {pickedList.length} of {seatCount}

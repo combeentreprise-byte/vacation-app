@@ -49,8 +49,15 @@ import { InviteMotiveCard } from "@/components/invite-motive-card";
 import { ConfirmationBody } from "@/components/leave-group-confirmation";
 import type { MenuAnchor } from "@/components/menu-anchor";
 import { PageHeader } from "@/components/page-header";
+import {
+  GroupScreenSkeleton,
+  LogRowsSkeleton,
+  MemberRowsSkeleton,
+} from "@/components/screen-skeletons";
+import { Skeleton, SkeletonGroup, SkeletonText } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { CURRENCIES } from "@/constants/currencies";
+import { GROUP_HERO_HEIGHT_RATIO, GROUP_SUMMARY_BAR_HEIGHT } from "@/constants/layout";
 import { useAccess } from "@/hooks/use-access";
 import { useAuth } from "@/hooks/use-auth";
 import { type GroupAccess, type GroupPlan, useGroupAccess } from "@/hooks/use-group-access";
@@ -64,6 +71,7 @@ import { type GroupMember, useGroupMembers } from "@/hooks/use-group-members";
 import { useGroups } from "@/hooks/use-groups";
 import { type LogEntry, useLogs } from "@/hooks/use-logs";
 import { useOpenUnlock } from "@/hooks/use-open-unlock";
+import { useFreeEntriesNudge } from "@/hooks/use-paywall-nudge";
 import { useProfile } from "@/hooks/use-profile";
 import { useRefreshOnRefocus } from "@/hooks/use-refresh-on-refocus";
 import {
@@ -98,15 +106,8 @@ const TAB_ROUTES: TabRoute[] = [
   { key: "logs", title: "Logs" },
 ];
 
-// The hero photo placeholder's collapsed height (same idea as the group
-// list's fixed-ratio cards, just sized for a full-bleed detail-page hero
-// rather than a small list row).
-const HERO_HEIGHT_RATIO = 0.28;
-
-// The summary bar's own height above insets.bottom (its text is centered
-// within this + the inset) â€” used to lift the FAB clear of it,
-// since the bar itself has no ListFooter/layout the FAB could measure.
-const SUMMARY_BAR_HEIGHT = 50;
+const HERO_HEIGHT_RATIO = GROUP_HERO_HEIGHT_RATIO;
+const SUMMARY_BAR_HEIGHT = GROUP_SUMMARY_BAR_HEIGHT;
 
 // Matches styles.description's lineHeight. Kept as a constant rather than
 // read back from the stylesheet since RN style objects aren't guaranteed to
@@ -1161,6 +1162,7 @@ function MemberDetailOverlay({
 }
 
 function MembersPane({
+  isLoaded,
   currency,
   members,
   viewer,
@@ -1174,6 +1176,9 @@ function MembersPane({
   minListHeight,
   footerHeight,
 }: {
+  // Placeholder rows until the member list has loaded, rather than "No
+  // other members yet" when that may not be true.
+  isLoaded: boolean;
   currency: string;
   members: GroupMember[];
   // Always listed last, after even members who've left.
@@ -1200,6 +1205,8 @@ function MembersPane({
     const sorted = [...members].sort((a, b) => Number(!a.isActive) - Number(!b.isActive));
     return viewer ? [...sorted, viewer] : sorted;
   }, [members, viewer]);
+
+  if (!isLoaded) return <MemberRowsSkeleton />;
 
   if (sortedMembers.length === 0) {
     return (
@@ -1944,6 +1951,7 @@ type LogsPaneItem =
   | { type: "event"; key: string; createdAt: number; event: GroupEvent };
 
 function LogsPane({
+  isLoaded,
   groupId,
   events,
   members,
@@ -1960,6 +1968,9 @@ function LogsPane({
   minListHeight,
   footerHeight,
 }: {
+  // Placeholder cards until both the entries and the group's history have
+  // loaded, rather than "No entries yet" (or half the list).
+  isLoaded: boolean;
   groupId: string;
   events: GroupEvent[];
   members: GroupMember[];
@@ -2034,6 +2045,8 @@ function LogsPane({
     const { error } = await deleteLog(log.id);
     if (error) Alert.alert("Couldn't delete entry", `${error}\n\nPlease try again.`);
   };
+
+  if (!isLoaded) return <LogRowsSkeleton />;
 
   if (items.length === 0) {
     return (
@@ -2304,7 +2317,14 @@ export default function GroupDetailScreen() {
   const navigation = useNavigation<StackScreenNavigation>();
   const { session } = useAuth();
   const { profile } = useProfile();
-  const { groups, removeGroup, promoteToAdmin, kickMember, demoteAdmin } = useGroups();
+  const {
+    groups,
+    isLoaded: isGroupsLoaded,
+    removeGroup,
+    promoteToAdmin,
+    kickMember,
+    demoteAdmin,
+  } = useGroups();
   const group = groups.find((item) => item.id === id);
   const insets = useSafeAreaInsets();
   const { height: windowHeight, width: windowWidth } = useWindowDimensions();
@@ -2598,7 +2618,7 @@ export default function GroupDetailScreen() {
   const isDescriptionTruncatable =
     descriptionNaturalHeight !== null && descriptionNaturalHeight > 1;
   const [selectedMember, setSelectedMember] = useState<GroupMember | null>(null);
-  const { logs, settleDebt, refresh: refreshLogs } = useLogs();
+  const { logs, isLoaded: isLogsLoaded, settleDebt, refresh: refreshLogs } = useLogs();
   // Entries are otherwise only fetched when the app starts, so without this
   // someone who just joined wouldn't see the group's earlier entries, and
   // nobody would see what others added since.
@@ -2607,11 +2627,19 @@ export default function GroupDetailScreen() {
       refreshLogs();
     }, [refreshLogs])
   );
-  const { members: allMembers, refresh: refreshMembers } = useGroupMembers(group?.id);
-  const { events, refresh: refreshEvents } = useGroupEvents(group?.id);
+  const {
+    members: allMembers,
+    isLoaded: isMembersLoaded,
+    refresh: refreshMembers,
+  } = useGroupMembers(group?.id);
+  const { events, isLoaded: isEventsLoaded, refresh: refreshEvents } = useGroupEvents(group?.id);
   const { plansVisible } = useAccess();
   const openUnlock = useOpenUnlock();
-  const { access: groupAccess, refresh: refreshGroupAccess } = useGroupAccess(group?.id);
+  const {
+    access: groupAccess,
+    isLoaded: isGroupAccessLoaded,
+    refresh: refreshGroupAccess,
+  } = useGroupAccess(group?.id);
   // Coming back from the unlock or plan screens (or anywhere) may mean a new
   // plan or seat.
   useRefreshOnRefocus(refreshGroupAccess);
@@ -2634,6 +2662,12 @@ export default function GroupDetailScreen() {
   }, [syncedEntryCount, refreshGroupAccess]);
   const needsUnlock = entriesNeedUnlock(groupAccess, pendingInGroup);
   const viewerNeedsUnlock = needsUnlock && !isMemberUnlocked(groupAccess, session?.user.id ?? "");
+  // The paywall, once as the group's free entries run low and once when
+  // they're gone, for a viewer who's still locked.
+  useFreeEntriesNudge(
+    group?.id,
+    groupAccess?.paywallEnabled ? freeEntriesLeft(groupAccess, pendingInGroup) : null
+  );
   // The list of "other" members is what everything below actually wants;
   // seeing your own name in your own balance list would be meaningless.
   const members = allMembers.filter((member) => member.id !== session?.user.id);
@@ -2805,6 +2839,19 @@ export default function GroupDetailScreen() {
     const { pageX, pageY } = event.nativeEvent;
     setMenuAnchor({ x: pageX, y: pageY });
   };
+
+  if (!group && !isGroupsLoaded) {
+    return (
+      <GroupScreenSkeleton
+        heroAccessory={
+          <HeroBackButton
+            style={[styles.heroBackButton, { top: insets.top + 8 }]}
+            onPress={goBackOrToGroups}
+          />
+        }
+      />
+    );
+  }
 
   if (!group) {
     return (
@@ -2980,6 +3027,7 @@ export default function GroupDetailScreen() {
       case "members":
         return (
           <MembersPane
+            isLoaded={isMembersLoaded}
             currency={group.currency}
             members={members}
             viewer={viewerRow}
@@ -3003,6 +3051,7 @@ export default function GroupDetailScreen() {
       case "logs":
         return (
           <LogsPane
+            isLoaded={isLogsLoaded && isEventsLoaded}
             groupId={group.id}
             events={events}
             members={members}
@@ -3165,7 +3214,12 @@ export default function GroupDetailScreen() {
             <Text style={styles.currencyCode}>{group.currency || "Not set"}</Text>
           </View>
 
-          {plansVisible && groupAccess ? (
+          {plansVisible && !isGroupAccessLoaded ? (
+            <SkeletonGroup style={styles.accessLine}>
+              <Skeleton width={16} height={16} radius={8} />
+              <SkeletonText fontSize={14} width="65%" style={styles.accessLineText} />
+            </SkeletonGroup>
+          ) : plansVisible && groupAccess ? (
             <GroupAccessLine
               groupAccess={groupAccess}
               members={allMembers}
@@ -3191,7 +3245,11 @@ export default function GroupDetailScreen() {
       {/* Moved down here from the tab bar so it reads as a totals footer for
           the whole screen rather than being tied to just one tab. */}
       <View style={[styles.summaryBar, { height: SUMMARY_BAR_HEIGHT + insets.bottom }]}>
-        {totalIsSettled ? (
+        {/* Balances come from the entries, so "Settled up" would be a guess
+            until they've loaded. */}
+        {!isLogsLoaded ? (
+          <SkeletonText fontSize={18} width="45%" style={styles.summarySkeleton} />
+        ) : totalIsSettled ? (
           <Text style={styles.summarySettled}>Settled up</Text>
         ) : (
           <Text
@@ -3500,6 +3558,10 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: Colors.muted,
     includeFontPadding: false,
+  },
+  summarySkeleton: {
+    width: "100%",
+    alignItems: "center",
   },
   pane: {
     flex: 1,

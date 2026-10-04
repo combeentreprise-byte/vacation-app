@@ -1,9 +1,10 @@
 import * as Linking from "expo-linking";
 import { router } from "expo-router";
 import { useEffect } from "react";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { Colors } from "@/constants/colors";
+import { GroupListSkeleton } from "@/components/screen-skeletons";
 import { supabase } from "@/lib/supabase";
 import { extractSessionTokensFromUrl } from "@/utils/oauth";
 
@@ -14,6 +15,7 @@ import { extractSessionTokensFromUrl } from "@/utils/oauth";
 // redirect URL directly in memory, without the app ever unmounting.
 export default function AuthCallbackScreen() {
   const url = Linking.useURL();
+  const insets = useSafeAreaInsets();
 
   useEffect(() => {
     if (!url) return;
@@ -37,23 +39,11 @@ export default function AuthCallbackScreen() {
     };
   }, [url]);
 
+  // The group list is where this lands once signed in.
   return (
-    <View style={styles.container}>
-      <ActivityIndicator color={Colors.accent} />
-      <Text style={styles.text}>Signing you in...</Text>
+    <View style={{ paddingTop: insets.top }}>
+      <GroupListSkeleton />
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 12,
-  },
-  text: {
-    color: Colors.muted,
-    fontSize: 15,
-  },
-});

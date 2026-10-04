@@ -14,6 +14,8 @@ import { ModalHeader } from "@/components/modal-header";
 import { type PlanMemberStatusTone, PlanMemberRow } from "@/components/plan-member-row";
 import { PlanUpgradeCard } from "@/components/plan-upgrade-card";
 import { PressableScale } from "@/components/press-feedback";
+import { PlanRowSkeleton } from "@/components/screen-skeletons";
+import { SkeletonGroup, SkeletonText } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { groupPlanTitle, type PlanPeriod } from "@/constants/plans";
 import { useAccess } from "@/hooks/use-access";
@@ -122,21 +124,42 @@ function SeatButton({
   );
 }
 
+// Stand-in while the group, its plan and its members load — without it, a
+// group that already has a plan would first say "Be the first to sponsor".
+function GroupPlanSkeleton() {
+  return (
+    <SkeletonGroup style={styles.content}>
+      <View style={styles.planCard}>
+        <SkeletonText fontSize={18} width="60%" />
+        <SkeletonText fontSize={14} lineHeight={20} width="85%" />
+        <SkeletonText fontSize={14} lineHeight={20} width="45%" />
+      </View>
+      <View style={styles.section}>
+        <SkeletonText fontSize={14} width={64} />
+        <PlanRowSkeleton titleWidth="45%" filled />
+        <PlanRowSkeleton titleWidth="35%" filled />
+        <PlanRowSkeleton titleWidth="50%" filled />
+      </View>
+    </SkeletonGroup>
+  );
+}
+
 export default function GroupPlanScreen() {
   const { groupId } = useLocalSearchParams<{ groupId: string }>();
   const { session } = useAuth();
   const viewerId = session?.user.id ?? "";
-  const { groups } = useGroups();
+  const { groups, isLoaded: isGroupsLoaded } = useGroups();
   const group = groups.find((item) => item.id === groupId);
   const { access, refresh: refreshAccess } = useAccess();
   const openUnlockFor = useOpenUnlock();
   const {
     access: groupAccess,
+    isLoaded: isGroupAccessLoaded,
     refresh: refreshGroupAccess,
     assignSeats,
     removeSeat,
   } = useGroupAccess(group?.id);
-  const { members: allMembers } = useGroupMembers(group?.id);
+  const { members: allMembers, isLoaded: isMembersLoaded } = useGroupMembers(group?.id);
   const { logs, syncPending } = useLogs();
   // Back from the paywall with a freshly bought plan, this screen's copy of the
   // group's access is stale.
@@ -149,6 +172,15 @@ export default function GroupPlanScreen() {
   const [seatActions, setSeatActions] = useState<Record<string, "give" | "remove">>({});
   const [isBusy, setIsBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  if (!isGroupsLoaded || (group && (!isGroupAccessLoaded || !isMembersLoaded))) {
+    return (
+      <View style={styles.flex}>
+        <ModalHeader title="Group plan" onClose={goBackOrToGroups} />
+        <GroupPlanSkeleton />
+      </View>
+    );
+  }
 
   if (!group) {
     return (

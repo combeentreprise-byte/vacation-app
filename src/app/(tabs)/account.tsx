@@ -15,8 +15,8 @@ import {
   Alert,
   Animated,
   Easing,
-  Image,
   Keyboard,
+  Linking,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -32,12 +32,15 @@ import { CheckmarkIcon } from "@/components/checkmark-icon";
 import { EditIcon } from "@/components/edit-icon";
 import { LogOutIcon } from "@/components/log-out-icon";
 import { PressableScale } from "@/components/press-feedback";
+import { Skeleton, SkeletonImage, SkeletonText } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { PASSWORD_MAX_LENGTH, PROFILE_NAME_MAX_LENGTH } from "@/constants/limits";
+import { NOTIFICATION_SECTIONS } from "@/constants/notifications";
 import { planKindLabel } from "@/constants/plans";
 import { type UpcomingPlan, useAccess } from "@/hooks/use-access";
 import { useAuth } from "@/hooks/use-auth";
 import { useLogs } from "@/hooks/use-logs";
+import { useNotifications } from "@/hooks/use-notifications";
 import { useProfile } from "@/hooks/use-profile";
 import { formatAccessDate, formatPlanEnd } from "@/utils/access";
 
@@ -98,18 +101,6 @@ const EDIT_EFFECTS_FADE_IN_DELAY_MS = 150;
 const EDIT_EFFECTS_FADE_IN_MS = 200;
 const EDIT_EFFECTS_FADE_OUT_MS = 140;
 const IDENTITY_RETURN_DELAY_MS = 60;
-
-type NotificationPrefs = {
-  allMuted: boolean;
-  expenseLogged: boolean;
-  groupActivity: boolean;
-};
-
-const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
-  allMuted: false,
-  expenseLogged: true,
-  groupActivity: true,
-};
 
 // The one-shot motion a settings row's icon plays each time the row opens
 // (see SettingsAccordionRow) — the same idea as the tab bar's TabIcon.
@@ -340,7 +331,7 @@ function SettingsAccordionRow({
 // from someone else's phone.
 function PlanCard() {
   const { session } = useAuth();
-  const { access, refresh } = useAccess();
+  const { access, isLoaded, refresh } = useAccess();
   useFocusEffect(
     useCallback(() => {
       refresh();
@@ -399,20 +390,42 @@ function PlanCard() {
       <View style={styles.planCardIcon}>
         <Ionicons name="ticket-outline" size={22} color={Colors.accent} />
       </View>
-      <View style={styles.planCardText}>
-        <Text style={styles.planCardTitle}>{title}</Text>
-        <Text style={styles.planCardSubtitle}>{subtitle}</Text>
-      </View>
+      {/* Until your plans have loaded, rather than "No plan yet". */}
+      {isLoaded ? (
+        <View style={styles.planCardText}>
+          <Text style={styles.planCardTitle}>{title}</Text>
+          <Text style={styles.planCardSubtitle}>{subtitle}</Text>
+        </View>
+      ) : (
+        <View style={styles.planCardText} accessibilityLabel="Loading">
+          <SkeletonText fontSize={17} width="65%" />
+          <SkeletonText fontSize={13} width="45%" />
+        </View>
+      )}
       <Ionicons name="chevron-forward" size={20} color={Colors.eventText} />
     </PressableScale>
   );
 }
 
+// Saved to the account (NotificationsProvider), so it applies on every
+// device. What each switch covers is in docs/notifications.md.
 function NotificationsDropdown() {
-  const [prefs, setPrefs] = useState<NotificationPrefs>(DEFAULT_NOTIFICATION_PREFS);
+  const { plansVisible } = useAccess();
+  const { settings: prefs, updateSettings, permission } = useNotifications();
+  const sections = NOTIFICATION_SECTIONS.filter((section) => plansVisible || !section.plansOnly);
 
   return (
     <View style={styles.dropdownContent}>
+      {permission === "denied" ? (
+        <Pressable style={styles.permissionRow} onPress={() => Linking.openSettings()}>
+          <Ionicons name="alert-circle-outline" size={16} color={Colors.danger} />
+          <Text style={styles.permissionText}>
+            Notifications are turned off for this app in your phone&apos;s settings.{" "}
+            <Text style={styles.permissionLink}>Open settings</Text>
+          </Text>
+        </Pressable>
+      ) : null}
+
       <View style={styles.muteRow}>
         <View style={styles.muteTextWrap}>
           <Ionicons name="notifications-off-outline" size={16} color={Colors.danger} />
@@ -420,7 +433,7 @@ function NotificationsDropdown() {
         </View>
         <WebSwitch
           value={prefs.allMuted}
-          onValueChange={(value) => setPrefs((current) => ({ ...current, allMuted: value }))}
+          onValueChange={(value) => updateSettings({ ...prefs, allMuted: value })}
           trackColor={{ false: Colors.border, true: Colors.danger }}
           thumbColor={Colors.background}
           activeThumbColor={Colors.background}
@@ -428,41 +441,48 @@ function NotificationsDropdown() {
         />
       </View>
 
-      <View style={[styles.optionRow, prefs.allMuted && styles.optionRowDisabled]}>
-        <View style={styles.optionTextWrap}>
-          <Text style={styles.optionLabel}>New expense logged</Text>
-          <Text style={styles.optionHint}>When someone logs a purchase in a group</Text>
-        </View>
-        <WebSwitch
-          value={prefs.expenseLogged}
-          onValueChange={(value) => setPrefs((current) => ({ ...current, expenseLogged: value }))}
-          disabled={prefs.allMuted}
-          trackColor={{ false: Colors.border, true: Colors.accent }}
-          thumbColor={Colors.background}
-          activeThumbColor={Colors.background}
-          ios_backgroundColor={Colors.border}
-        />
-      </View>
-
-      <View style={styles.optionDivider} />
-
-      <View style={[styles.optionRow, prefs.allMuted && styles.optionRowDisabled]}>
-        <View style={styles.optionTextWrap}>
-          <Text style={styles.optionLabel}>Group activity</Text>
-          <Text style={styles.optionHint}>
-            Description edits, currency changes, or a member leaving
+      {sections.map((section, sectionIndex) => (
+        <View key={section.title}>
+          <Text
+            style={[
+              styles.optionSectionTitle,
+              sectionIndex > 0 && styles.optionSectionTitleSpaced,
+              prefs.allMuted && styles.optionRowDisabled,
+            ]}
+          >
+            {section.title}
           </Text>
+          {section.categories.map((category, index) => (
+            <View key={category.key}>
+              {index > 0 && <View style={styles.optionDivider} />}
+              <View style={[styles.optionRow, prefs.allMuted && styles.optionRowDisabled]}>
+                <View style={styles.optionTextWrap}>
+                  <Text style={styles.optionLabel}>{category.label}</Text>
+                  <Text style={styles.optionHint}>{category.hint}</Text>
+                </View>
+                <WebSwitch
+                  value={prefs.categories[category.key]}
+                  onValueChange={(value) =>
+                    updateSettings({
+                      ...prefs,
+                      categories: { ...prefs.categories, [category.key]: value },
+                    })
+                  }
+                  disabled={prefs.allMuted}
+                  trackColor={{ false: Colors.border, true: Colors.accent }}
+                  thumbColor={Colors.background}
+                  activeThumbColor={Colors.background}
+                  ios_backgroundColor={Colors.border}
+                />
+              </View>
+            </View>
+          ))}
         </View>
-        <WebSwitch
-          value={prefs.groupActivity}
-          onValueChange={(value) => setPrefs((current) => ({ ...current, groupActivity: value }))}
-          disabled={prefs.allMuted}
-          trackColor={{ false: Colors.border, true: Colors.accent }}
-          thumbColor={Colors.background}
-          activeThumbColor={Colors.background}
-          ios_backgroundColor={Colors.border}
-        />
-      </View>
+      ))}
+
+      <Text style={[styles.optionFootnote, prefs.allMuted && styles.optionRowDisabled]}>
+        Security alerts, like a changed password, are always sent.
+      </Text>
     </View>
   );
 }
@@ -691,9 +711,9 @@ function EditButtonLabel() {
 }
 
 export default function AccountSettingsScreen() {
-  const { profile, updateName, updateAvatar } = useProfile();
+  const { profile, isLoaded: isProfileLoaded, updateName, updateAvatar } = useProfile();
   const { session } = useAuth();
-  const { plansVisible } = useAccess();
+  const { plansVisible, isLoaded: isAccessLoaded } = useAccess();
   // Whether the TextInput / avatar overlay are mounted. Flips on at the very
   // start of entering edit mode and off only once the exit animation has
   // fully finished, so neither swap ever lands mid-motion.
@@ -1006,8 +1026,11 @@ export default function AccountSettingsScreen() {
         >
           <Animated.View style={[styles.avatarWrap, avatarGrowStyle]}>
             <View style={styles.avatarLarge}>
-              {profile.avatarUrl ? (
-                <Image source={{ uri: profile.avatarUrl }} style={styles.avatarImage} />
+              {/* Not the default "Your Name" initials while your profile loads. */}
+              {!isProfileLoaded ? (
+                <Skeleton radius={0} style={StyleSheet.absoluteFill} />
+              ) : profile.avatarUrl ? (
+                <SkeletonImage uri={profile.avatarUrl} style={styles.avatarImage} />
               ) : (
                 <Text style={styles.avatarLargeText}>{getInitials(profile.name)}</Text>
               )}
@@ -1034,6 +1057,10 @@ export default function AccountSettingsScreen() {
               maxLength={PROFILE_NAME_MAX_LENGTH}
               style={[styles.nameText, styles.nameBox, nameGrowStyle, nameBorderStyle]}
             />
+          ) : !isProfileLoaded ? (
+            <View style={styles.nameSkeleton} accessibilityLabel="Loading">
+              <Skeleton width={150} height={18} radius={4} />
+            </View>
           ) : (
             <Animated.Text style={[styles.nameText, styles.nameBox, nameGrowStyle]} numberOfLines={1}>
               {profile.name}
@@ -1043,7 +1070,9 @@ export default function AccountSettingsScreen() {
           <Text style={styles.emailText}>{session?.user.email ?? ""}</Text>
         </Animated.View>
 
-        {plansVisible ? <PlanCard /> : null}
+        {/* Shown (as a placeholder) while your plans load too, so the rows
+            below don't jump down when it turns up. */}
+        {plansVisible || !isAccessLoaded ? <PlanCard /> : null}
 
         <View style={styles.rowsList}>
           <SettingsAccordionRow
@@ -1248,6 +1277,14 @@ const styles = StyleSheet.create({
     textAlign: "center",
     minWidth: 160,
   },
+  // Same box as nameBox, holding a placeholder bar.
+  nameSkeleton: {
+    height: NAME_BOX_HEIGHT,
+    marginTop: -NAME_BOX_PADDING_V,
+    minWidth: 160,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   emailText: {
     fontSize: 14,
     color: Colors.muted,
@@ -1391,6 +1428,41 @@ const styles = StyleSheet.create({
   optionDivider: {
     height: StyleSheet.hairlineWidth,
     backgroundColor: Colors.border,
+  },
+  optionSectionTitle: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: Colors.muted,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    marginBottom: 2,
+  },
+  optionSectionTitleSpaced: {
+    marginTop: 14,
+  },
+  permissionRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    backgroundColor: "rgba(229, 72, 77, 0.07)",
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 10,
+  },
+  permissionText: {
+    flex: 1,
+    fontSize: 13,
+    color: Colors.text,
+  },
+  permissionLink: {
+    fontWeight: "700",
+    color: Colors.accent,
+  },
+  optionFootnote: {
+    fontSize: 12,
+    color: Colors.muted,
+    marginTop: 12,
   },
   field: {
     gap: 6,

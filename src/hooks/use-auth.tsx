@@ -12,6 +12,7 @@ import {
 import { SUPABASE_AUTH_STORAGE_KEY, supabase } from "@/lib/supabase";
 import { signInWithOAuthProvider, type OAuthProvider } from "@/utils/oauth";
 import { clearOfflineDataForUser } from "@/utils/offline-storage";
+import { unregisterPushNotifications } from "@/utils/push-notifications";
 
 // getSession() returns no session at all when the stored access token has
 // expired and can't be refreshed because the device is offline — even
@@ -112,6 +113,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // sign-out UI warns about that first.
   const signOut = async () => {
     const userId = session?.user.id;
+    // While still signed in: it's that account's to remove.
+    await unregisterPushNotifications();
     const { error } = await supabase.auth.signOut();
     if (!error && userId) await clearOfflineDataForUser(userId);
   };

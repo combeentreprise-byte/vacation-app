@@ -1,20 +1,38 @@
 import { Stack } from "expo-router";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import * as SplashScreen from "expo-splash-screen";
+import { useEffect } from "react";
+import { StyleSheet, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { GroupListSkeleton, GroupScreenSkeleton } from "@/components/screen-skeletons";
 import { Colors } from "@/constants/colors";
 import { AccessProvider } from "@/hooks/use-access";
 import { AuthProvider, useAuth } from "@/hooks/use-auth";
 import { GroupsProvider } from "@/hooks/use-groups";
 import { LogsProvider } from "@/hooks/use-logs";
+import { NotificationsProvider, useOpenTappedNotifications } from "@/hooks/use-notifications";
 import { OnboardingProvider, useOnboarding } from "@/hooks/use-onboarding";
 import { ProfileProvider } from "@/hooks/use-profile";
 
+// The native splash screen stays up until the stored session and onboarding
+// state have been read (RootNavigator hides it), rather than giving way to
+// a blank screen while they are.
+SplashScreen.preventAutoHideAsync();
+
 function RootNavigator() {
   const { session, isLoading } = useAuth();
-  const { isLoaded: isOnboardingLoaded, hasSignedInOnDevice, isFinishing } = useOnboarding();
+  const { isLoaded: isOnboardingLoaded, hasSignedInOnDevice, isFinishing, draft } =
+    useOnboarding();
+  const insets = useSafeAreaInsets();
+  const isReady = !isLoading && isOnboardingLoaded;
+  useOpenTappedNotifications(isReady && !!session);
 
-  if (isLoading || !isOnboardingLoaded) {
+  useEffect(() => {
+    if (isReady) SplashScreen.hide();
+  }, [isReady]);
+
+  if (!isReady) {
     return <View style={{ flex: 1 }} />;
   }
 
@@ -83,13 +101,19 @@ function RootNavigator() {
       </Stack>
 
       {/* Covers the signed-in app while a just-finished onboarding is saved
-          to the new account, which ends by opening the new group. A plain
-          overlay rather than a screen, so the navigator underneath carries
-          on undisturbed. */}
+          to the new account, which ends by opening the new group (or stays
+          on the group list without one) — so it's a skeleton of where it's
+          going. A plain overlay rather than a screen, so the navigator
+          underneath carries on undisturbed. */}
       {session && isFinishing ? (
         <View style={[StyleSheet.absoluteFill, styles.finishingOverlay]}>
-          <ActivityIndicator color={Colors.accent} />
-          <Text style={styles.finishingText}>Setting up your account…</Text>
+          {draft.group ? (
+            <GroupScreenSkeleton />
+          ) : (
+            <View style={{ paddingTop: insets.top }}>
+              <GroupListSkeleton />
+            </View>
+          )}
         </View>
       ) : null}
     </>
@@ -104,9 +128,11 @@ export default function RootLayout() {
           <GroupsProvider>
             <AccessProvider>
               <LogsProvider>
-                <OnboardingProvider>
-                  <RootNavigator />
-                </OnboardingProvider>
+                <NotificationsProvider>
+                  <OnboardingProvider>
+                    <RootNavigator />
+                  </OnboardingProvider>
+                </NotificationsProvider>
               </LogsProvider>
             </AccessProvider>
           </GroupsProvider>
@@ -118,13 +144,6 @@ export default function RootLayout() {
 
 const styles = StyleSheet.create({
   finishingOverlay: {
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 12,
     backgroundColor: Colors.background,
-  },
-  finishingText: {
-    color: Colors.muted,
-    fontSize: 15,
   },
 });

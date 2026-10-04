@@ -276,6 +276,11 @@ type AccessContextValue = {
   // testers before that, so plans can be tried out without locking anyone.
   plansVisible: boolean;
   isLoaded: boolean;
+  // Whether the last fetch from the server succeeded, as opposed to showing
+  // only the device's copy (offline) — for anything that shouldn't act on a
+  // possibly stale copy, like nudging toward the paywall someone who may
+  // have bought a plan on another device.
+  isFresh: boolean;
   refresh: () => Promise<void>;
 };
 
@@ -285,12 +290,19 @@ export function AccessProvider({ children }: { children: ReactNode }) {
   const { session } = useAuth();
   const userId = session?.user.id ?? null;
   const [access, setAccess] = useState<MyAccess>(INITIAL_ACCESS);
-  const [isLoaded, setIsLoaded] = useState(false);
+  // Which account (null = signed out) the data above has loaded for, so
+  // isLoaded reads false again while a newly signed-in account's is still
+  // loading, rather than carrying over from the signed-out state (same as
+  // use-profile.tsx).
+  const [loadedFor, setLoadedFor] = useState<string | null | undefined>(undefined);
+  const isLoaded = loadedFor === userId;
+  const [freshFor, setFreshFor] = useState<string | null>(null);
+  const isFresh = userId !== null && freshFor === userId;
 
   const refresh = useCallback(async () => {
     if (!userId) {
       setAccess(INITIAL_ACCESS);
-      setIsLoaded(true);
+      setLoadedFor(userId);
       return;
     }
 
@@ -299,12 +311,14 @@ export function AccessProvider({ children }: { children: ReactNode }) {
     if (error) {
       // Offline: keep showing what's there (see use-groups.tsx's refresh).
       console.warn("Failed to load access", error);
+      setFreshFor(null);
     } else {
       const next = mapAccess(data as MyAccessRow);
       setAccess(next);
+      setFreshFor(userId);
       writeUserData(userId, "access", next);
     }
-    setIsLoaded(true);
+    setLoadedFor(userId);
   }, [userId]);
 
   useEffect(() => {
@@ -321,7 +335,7 @@ export function AccessProvider({ children }: { children: ReactNode }) {
           // Over the defaults, so a copy saved by an older build that lacks a
           // newer field still has it.
           setAccess({ ...INITIAL_ACCESS, ...stored });
-          setIsLoaded(true);
+          setLoadedFor(userId);
         }
       } else {
         setAccess(INITIAL_ACCESS);
@@ -343,6 +357,7 @@ export function AccessProvider({ children }: { children: ReactNode }) {
         access,
         plansVisible: access.paywallEnabled || access.canTestPurchase,
         isLoaded,
+        isFresh,
         refresh,
       }}
     >

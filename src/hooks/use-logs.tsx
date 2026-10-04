@@ -17,6 +17,7 @@ import { useSyncTriggers } from "@/hooks/use-sync-triggers";
 import { supabase } from "@/lib/supabase";
 import { isRetryableStatus, requestErrorMessage } from "@/utils/network";
 import { readUserData, writeUserData } from "@/utils/offline-storage";
+import { onDebtSettled, onEntriesSynced } from "@/utils/review-prompt";
 
 export type LogEntry = {
   id: string;
@@ -164,10 +165,16 @@ const LogsContext = createContext<LogsContextValue | undefined>(undefined);
 export function LogsProvider({ children }: { children: ReactNode }) {
   const { session } = useAuth();
   const userId = session?.user.id ?? null;
+  const accountCreatedAt = session?.user.created_at;
   const { groups } = useGroups();
   const [serverLogs, setServerLogs] = useState<LogEntry[]>([]);
   const [pendingLogs, setPendingLogs] = useState<PendingLog[]>([]);
-  const [isLoaded, setIsLoaded] = useState(false);
+  // Which account (null = signed out) the data above has loaded for, so
+  // isLoaded reads false again while a newly signed-in account's is still
+  // loading, rather than carrying over from the signed-out state (same as
+  // use-profile.tsx).
+  const [loadedFor, setLoadedFor] = useState<string | null | undefined>(undefined);
+  const isLoaded = loadedFor === userId;
   // The queue's source of truth between renders: flushPending walks it
   // across several awaits and has to see entries edited, discarded or added
   // in the meantime, not the copy its closure captured.
@@ -195,7 +202,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
   const refresh = useCallback(async () => {
     if (!userId) {
       setServerLogs([]);
-      setIsLoaded(true);
+      setLoadedFor(userId);
       return;
     }
 
@@ -212,7 +219,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
       setServerLogs(next);
       writeUserData(userId, "logs", next);
     }
-    setIsLoaded(true);
+    setLoadedFor(userId);
   }, [userId]);
 
   const flushPending = useCallback(async () => {
@@ -220,7 +227,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
     isFlushingRef.current = true;
     const rejected: { log: PendingLog; message: string }[] = [];
     const newlyHeld: { log: PendingLog; message: string }[] = [];
-    let syncedAny = false;
+    let syncedCount = 0;
 
     try {
       // An access token that expired while offline can't be refreshed until
@@ -283,7 +290,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
           continue;
         }
 
-        syncedAny = true;
+        syncedCount += 1;
         // Stays on screen as a regular entry until the refresh below lands,
         // instead of blinking out between leaving the queue and the refetch.
         setServerLogs((prev) =>
@@ -297,7 +304,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
       isFlushingRef.current = false;
     }
 
-    if (syncedAny) await refresh();
+    if (syncedCount > 0) await refresh();
 
     const describe = ({ log, message }: { log: PendingLog; message: string }) => {
       const groupName = groupsRef.current.find((group) => group.id === log.groupId)?.name;
@@ -324,7 +331,12 @@ export function LogsProvider({ children }: { children: ReactNode }) {
         }`
       );
     }
-  }, [userId, savePending, refresh]);
+
+    // Not on top of an alert about the entries that didn't make it.
+    onEntriesSynced(userId, accountCreatedAt, syncedCount, {
+      canAsk: rejected.length === 0 && newlyHeld.length === 0,
+    });
+  }, [userId, accountCreatedAt, savePending, refresh]);
 
   useEffect(() => {
     let cancelled = false;
@@ -346,7 +358,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
         setPendingLogs(pendingRef.current);
         if (storedLogs) {
           setServerLogs(storedLogs);
-          setIsLoaded(true);
+          setLoadedFor(userId);
         }
       }
       if (cancelled) return;
@@ -477,9 +489,10 @@ export function LogsProvider({ children }: { children: ReactNode }) {
       }
 
       await refresh();
+      if (userId) onDebtSettled(userId, accountCreatedAt);
       return {};
     },
-    [refresh]
+    [userId, accountCreatedAt, refresh]
   );
 
   const deleteLog = useCallback(

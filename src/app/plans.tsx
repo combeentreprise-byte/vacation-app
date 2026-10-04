@@ -7,6 +7,8 @@ import Animated, { useAnimatedStyle, useSharedValue, withTiming } from "react-na
 import { EXPAND_ANIMATION, Expandable } from "@/components/expandable";
 import { ModalHeader } from "@/components/modal-header";
 import { PressableScale } from "@/components/press-feedback";
+import { PlanRowSkeleton } from "@/components/screen-skeletons";
+import { SkeletonGroup } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { type ActivePlan, type PastPlan, type UpcomingPlan, useAccess } from "@/hooks/use-access";
 import { useAuth } from "@/hooks/use-auth";
@@ -139,7 +141,7 @@ export default function PlansScreen() {
   const { session } = useAuth();
   const viewerId = session?.user.id ?? "";
   const { groups } = useGroups();
-  const { access, refresh } = useAccess();
+  const { access, isLoaded, refresh } = useAccess();
   // Former plans stay tucked away until asked for.
   const [showPast, setShowPast] = useState(false);
   useFocusEffect(
@@ -185,96 +187,103 @@ export default function PlansScreen() {
     <View style={styles.flex}>
       <ModalHeader title="Your plans" onClose={goBackOrToGroups} />
 
-      <ScrollView style={styles.flex} contentContainerStyle={styles.content}>
-        {access.activePlans.length === 0 && access.upcomingPlans.length === 0 ? (
-          <Text style={styles.empty}>You don&apos;t have any plans yet.</Text>
-        ) : null}
+      {!isLoaded ? (
+        <SkeletonGroup style={styles.content}>
+          <PlanRowSkeleton lines={3} />
+          <PlanRowSkeleton lines={3} titleWidth="40%" />
+        </SkeletonGroup>
+      ) : (
+        <ScrollView style={styles.flex} contentContainerStyle={styles.content}>
+          {access.activePlans.length === 0 && access.upcomingPlans.length === 0 ? (
+            <Text style={styles.empty}>You don&apos;t have any plans yet.</Text>
+          ) : null}
 
-        {access.upcomingPlans.length > 0 ? (
-          <Text style={styles.sectionTitle}>Not started yet</Text>
-        ) : null}
-        {access.upcomingPlans.map((plan) => {
-          const { title, detail, meta } = describeUpcoming(plan, viewerId);
-          const groupId = plan.groupId;
-          const isMember = !!groupId && groups.some((group) => group.id === groupId);
-          // Not set up, or your own "Just me": set it up / move its start.
-          // A group pass: its plan screen, where its manager can move it too.
-          const onPress =
-            plan.sponsorId === viewerId && (plan.startsAt === null || plan.seatCount === 1)
-              ? () =>
-                  router.push({
-                    pathname: "/plan-setup",
-                    params: groupParam ? { planId: plan.id, groupId: groupParam } : { planId: plan.id },
-                  })
-              : isMember
-                ? () => router.push({ pathname: "/group-plan", params: { groupId } })
-                : null;
-          return (
-            <PlanRow
-              key={plan.id}
-              title={title}
-              detail={detail}
-              meta={meta}
-              icon={plan.startsAt === null ? "ticket-outline" : "calendar-outline"}
-              onPress={onPress}
-            />
-          );
-        })}
+          {access.upcomingPlans.length > 0 ? (
+            <Text style={styles.sectionTitle}>Not started yet</Text>
+          ) : null}
+          {access.upcomingPlans.map((plan) => {
+            const { title, detail, meta } = describeUpcoming(plan, viewerId);
+            const groupId = plan.groupId;
+            const isMember = !!groupId && groups.some((group) => group.id === groupId);
+            // Not set up, or your own "Just me": set it up / move its start.
+            // A group pass: its plan screen, where its manager can move it too.
+            const onPress =
+              plan.sponsorId === viewerId && (plan.startsAt === null || plan.seatCount === 1)
+                ? () =>
+                    router.push({
+                      pathname: "/plan-setup",
+                      params: groupParam ? { planId: plan.id, groupId: groupParam } : { planId: plan.id },
+                    })
+                : isMember
+                  ? () => router.push({ pathname: "/group-plan", params: { groupId } })
+                  : null;
+            return (
+              <PlanRow
+                key={plan.id}
+                title={title}
+                detail={detail}
+                meta={meta}
+                icon={plan.startsAt === null ? "ticket-outline" : "calendar-outline"}
+                onPress={onPress}
+              />
+            );
+          })}
 
-        {runningPasses.length > 0 && showSectionTitles ? (
-          <Text style={styles.sectionTitle}>Running</Text>
-        ) : null}
-        {runningPasses.map(renderActivePlan)}
+          {runningPasses.length > 0 && showSectionTitles ? (
+            <Text style={styles.sectionTitle}>Running</Text>
+          ) : null}
+          {runningPasses.map(renderActivePlan)}
 
-        {subscriptions.length > 0 && showSectionTitles ? (
-          <Text style={styles.sectionTitle}>Subscriptions</Text>
-        ) : null}
-        {subscriptions.map(renderActivePlan)}
+          {subscriptions.length > 0 && showSectionTitles ? (
+            <Text style={styles.sectionTitle}>Subscriptions</Text>
+          ) : null}
+          {subscriptions.map(renderActivePlan)}
 
-        {/* One block with the list, so the list's own spacing grows and
-            shrinks with it instead of snapping in around it. */}
-        {access.pastPlans.length > 0 ? (
-          <View>
-            <Pressable
-              style={styles.pastToggle}
-              onPress={() => setShowPast((current) => !current)}
-              accessibilityRole="button"
-              accessibilityState={{ expanded: showPast }}
-            >
-              <Text style={styles.pastToggleText}>
-                {showPast ? "Hide former plans" : `Show former plans (${access.pastPlans.length})`}
-              </Text>
-              <RotatingChevron open={showPast} />
-            </Pressable>
-            <Expandable open={showPast}>
-              <View style={styles.pastList}>
-                {access.pastPlans.map((plan) => {
-                  const { title, detail, meta } = describePast(plan, viewerId);
-                  return (
-                    <View key={plan.id} style={styles.pastPlan}>
-                      <PlanRow
-                        title={title}
-                        detail={detail}
-                        meta={meta}
-                        icon="time-outline"
-                        onPress={null}
-                      />
-                    </View>
-                  );
-                })}
-              </View>
-            </Expandable>
-          </View>
-        ) : null}
+          {/* One block with the list, so the list's own spacing grows and
+              shrinks with it instead of snapping in around it. */}
+          {access.pastPlans.length > 0 ? (
+            <View>
+              <Pressable
+                style={styles.pastToggle}
+                onPress={() => setShowPast((current) => !current)}
+                accessibilityRole="button"
+                accessibilityState={{ expanded: showPast }}
+              >
+                <Text style={styles.pastToggleText}>
+                  {showPast ? "Hide former plans" : `Show former plans (${access.pastPlans.length})`}
+                </Text>
+                <RotatingChevron open={showPast} />
+              </Pressable>
+              <Expandable open={showPast}>
+                <View style={styles.pastList}>
+                  {access.pastPlans.map((plan) => {
+                    const { title, detail, meta } = describePast(plan, viewerId);
+                    return (
+                      <View key={plan.id} style={styles.pastPlan}>
+                        <PlanRow
+                          title={title}
+                          detail={detail}
+                          meta={meta}
+                          icon="time-outline"
+                          onPress={null}
+                        />
+                      </View>
+                    );
+                  })}
+                </View>
+              </Expandable>
+            </View>
+          ) : null}
 
-        <PressableScale
-          style={styles.buyButton}
-          pressedScale={0.98}
-          onPress={() => router.push({ pathname: "/paywall", params: { pricingOnly: "1" } })}
-        >
-          <Text style={styles.buyButtonText}>Get another plan</Text>
-        </PressableScale>
-      </ScrollView>
+          <PressableScale
+            style={styles.buyButton}
+            pressedScale={0.98}
+            onPress={() => router.push({ pathname: "/paywall", params: { pricingOnly: "1" } })}
+          >
+            <Text style={styles.buyButtonText}>Get another plan</Text>
+          </PressableScale>
+        </ScrollView>
+      )}
     </View>
   );
 }

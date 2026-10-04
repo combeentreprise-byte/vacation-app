@@ -1,5 +1,5 @@
+import { useState } from "react";
 import {
-  Image,
   type StyleProp,
   StyleSheet,
   Text,
@@ -7,6 +7,8 @@ import {
   View,
   type ViewStyle,
 } from "react-native";
+
+import { SkeletonImage } from "@/components/skeleton";
 
 export function getInitials(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -19,7 +21,8 @@ export function getInitials(name: string) {
 // avatar stacks, the add-entry split picker): renders the real photo when the
 // profile has one, falling back to initials otherwise. `style` supplies the
 // circle's own size/background, which needs `overflow: "hidden"` for the
-// image to actually clip to the circle.
+// image to actually clip to the circle. A photo shows a skeleton until it
+// has loaded, and initials if it can't be loaded.
 // A caller that also shows a badge on top (e.g. group/[id].tsx's AdminBadge)
 // wraps this in its own unclipped wrapper rather than passing the badge in
 // here — Avatar's own box clips to the circle, which would clip the badge's
@@ -35,10 +38,15 @@ export function Avatar({
   style: StyleProp<ViewStyle>;
   textStyle: StyleProp<TextStyle>;
 }) {
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
   return (
     <View style={style}>
-      {avatarUrl ? (
-        <Image source={{ uri: avatarUrl }} style={StyleSheet.absoluteFill} />
+      {avatarUrl && avatarUrl !== failedUrl ? (
+        <SkeletonImage
+          uri={avatarUrl}
+          style={StyleSheet.absoluteFill}
+          onError={() => setFailedUrl(avatarUrl)}
+        />
       ) : (
         <Text style={textStyle}>{getInitials(name)}</Text>
       )}

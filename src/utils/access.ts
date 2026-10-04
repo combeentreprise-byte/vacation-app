@@ -1,3 +1,4 @@
+import type { MyAccess } from "@/hooks/use-access";
 import type { GroupAccess, MemberAccess } from "@/hooks/use-group-access";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -27,6 +28,13 @@ export function isUnlockedAt(unlockedUntil: number | null | undefined, at = Date
 export function isCoveredAt(member: MemberAccess | undefined, at = Date.now()) {
   if (!member || !isUnlockedAt(member.unlockedUntil)) return false;
   return member.willRenew || isUnlockedAt(member.unlockedUntil, at);
+}
+
+// Whether the viewer has nothing unlocking them at `now` (a renewing
+// subscription counts, even just past its end, until it's re-fetched).
+export function isViewerLocked(access: MyAccess, now = Date.now()) {
+  const covering = access.coveringPlan;
+  return !covering || !(covering.willRenew || isUnlockedAt(covering.endsAt, now));
 }
 
 export function isMemberUnlocked(access: GroupAccess | null, userId: string, at = Date.now()) {

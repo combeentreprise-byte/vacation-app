@@ -119,10 +119,16 @@ export function useGroupEvents(groupId: string | undefined) {
   const { session } = useAuth();
   const userId = session?.user.id ?? null;
   const [events, setEvents] = useState<GroupEvent[]>([]);
+  // Which group the data above has loaded for, so isLoaded reads false again
+  // while another group's is still loading — including once the group
+  // itself turns up after first being looked up as undefined.
+  const [loadedFor, setLoadedFor] = useState<string | null | undefined>(undefined);
+  const isLoaded = loadedFor === (groupId ?? null);
 
   const refresh = useCallback(async () => {
     if (!groupId || !userId) {
       setEvents([]);
+      setLoadedFor(groupId ?? null);
       return;
     }
 
@@ -144,6 +150,7 @@ export function useGroupEvents(groupId: string | undefined) {
       setEvents(next);
       writeUserData(userId, `events:${groupId}`, next);
     }
+    setLoadedFor(groupId ?? null);
   }, [groupId, userId]);
 
   useEffect(() => {
@@ -155,7 +162,10 @@ export function useGroupEvents(groupId: string | undefined) {
       if (groupId && userId) {
         const stored = await readUserData<GroupEvent[]>(userId, `events:${groupId}`);
         if (cancelled) return;
-        if (stored) setEvents(stored);
+        if (stored) {
+          setEvents(stored);
+          setLoadedFor(groupId ?? null);
+        }
       }
       if (cancelled) return;
       await refresh();
@@ -168,5 +178,5 @@ export function useGroupEvents(groupId: string | undefined) {
     };
   }, [groupId, userId, refresh]);
 
-  return { events, refresh };
+  return { events, isLoaded, refresh };
 }
