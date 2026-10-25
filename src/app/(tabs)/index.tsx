@@ -33,6 +33,7 @@ import { MAX_PINNED_GROUPS } from "@/constants/limits";
 import { useAccess } from "@/hooks/use-access";
 import { type Group, useGroups } from "@/hooks/use-groups";
 import { usePaywallNudge } from "@/hooks/use-paywall-nudge";
+import { posthog } from "@/lib/posthog";
 import { supabase } from "@/lib/supabase";
 import { isNotStartedYet, isViewerLocked } from "@/utils/access";
 
@@ -128,7 +129,11 @@ export default function GroupScreen() {
       return;
     }
     const { error } = await setGroupPinned(group.id, pinned);
-    if (error) Alert.alert("Couldn't pin group", error);
+    if (error) {
+      Alert.alert("Couldn't pin group", error);
+      return;
+    }
+    posthog?.capture(pinned ? "group_pinned" : "group_unpinned");
   };
 
   const handleLeave = async (group: Group, event: GestureResponderEvent) => {
@@ -162,10 +167,12 @@ export default function GroupScreen() {
     });
   };
 
-  const handleConfirmLeave = () => {
+  const handleConfirmLeave = async () => {
     if (!leaveTarget) return;
+    const { group } = leaveTarget;
     setLeaveTarget(null);
-    removeGroup(leaveTarget.group.id);
+    const { error } = await removeGroup(group.id);
+    if (!error) posthog?.capture("group_left");
     if (groups.length === 1) {
       setIsManaging(false);
       cancelAnimation(manageProgress);

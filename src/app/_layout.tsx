@@ -1,5 +1,6 @@
-import { Stack } from "expo-router";
+import { Stack, useSegments } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
+import { PostHogProvider } from "posthog-react-native";
 import { useEffect } from "react";
 import { StyleSheet, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
@@ -14,11 +15,23 @@ import { LogsProvider } from "@/hooks/use-logs";
 import { NotificationsProvider, useOpenTappedNotifications } from "@/hooks/use-notifications";
 import { OnboardingProvider, useOnboarding } from "@/hooks/use-onboarding";
 import { ProfileProvider } from "@/hooks/use-profile";
+import { posthog } from "@/lib/posthog";
 
 // The native splash screen stays up until the stored session and onboarding
 // state have been read (RootNavigator hides it), rather than giving way to
 // a blank screen while they are.
 SplashScreen.preventAutoHideAsync();
+
+// Expo Router screens aren't seen by PostHog's own screen autocapture
+// (that's for React Navigation), so they're reported here. By route pattern
+// ("group/[id]"), not the actual path, so every group counts as one screen.
+function useTrackScreens() {
+  const segments = useSegments();
+  const screen = segments.filter((segment) => !segment.startsWith("(")).join("/") || "index";
+  useEffect(() => {
+    posthog?.screen(screen);
+  }, [screen]);
+}
 
 function RootNavigator() {
   const { session, isLoading } = useAuth();
@@ -27,6 +40,7 @@ function RootNavigator() {
   const insets = useSafeAreaInsets();
   const isReady = !isLoading && isOnboardingLoaded;
   useOpenTappedNotifications(isReady && !!session);
+  useTrackScreens();
 
   useEffect(() => {
     if (isReady) SplashScreen.hide();
@@ -121,23 +135,27 @@ function RootNavigator() {
 }
 
 export default function RootLayout() {
+  const app = (
+    <AuthProvider>
+      <ProfileProvider>
+        <GroupsProvider>
+          <AccessProvider>
+            <LogsProvider>
+              <NotificationsProvider>
+                <OnboardingProvider>
+                  <RootNavigator />
+                </OnboardingProvider>
+              </NotificationsProvider>
+            </LogsProvider>
+          </AccessProvider>
+        </GroupsProvider>
+      </ProfileProvider>
+    </AuthProvider>
+  );
+
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <AuthProvider>
-        <ProfileProvider>
-          <GroupsProvider>
-            <AccessProvider>
-              <LogsProvider>
-                <NotificationsProvider>
-                  <OnboardingProvider>
-                    <RootNavigator />
-                  </OnboardingProvider>
-                </NotificationsProvider>
-              </LogsProvider>
-            </AccessProvider>
-          </GroupsProvider>
-        </ProfileProvider>
-      </AuthProvider>
+      {posthog ? <PostHogProvider client={posthog}>{app}</PostHogProvider> : app}
     </GestureHandlerRootView>
   );
 }

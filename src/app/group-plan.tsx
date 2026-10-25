@@ -26,6 +26,7 @@ import { useGroups } from "@/hooks/use-groups";
 import { useLogs } from "@/hooks/use-logs";
 import { useOpenUnlock } from "@/hooks/use-open-unlock";
 import { useRefreshOnRefocus } from "@/hooks/use-refresh-on-refocus";
+import { posthog } from "@/lib/posthog";
 import {
   entriesNeedUnlock,
   formatAccessDate,
@@ -265,6 +266,7 @@ export default function GroupPlanScreen() {
       return;
     }
     setConfirmingId(null);
+    posthog?.capture("plan_seat_assigned");
     // Your own unlock may have just changed, and a held entry may have been
     // waiting for exactly this seat.
     await refreshAccess();
@@ -282,6 +284,7 @@ export default function GroupPlanScreen() {
       return;
     }
     setConfirmingId(null);
+    posthog?.capture("plan_seat_removed");
     await refreshAccess();
   };
 
@@ -301,6 +304,10 @@ export default function GroupPlanScreen() {
       return;
     }
     if (!result.unavailable) {
+      posthog?.capture("plan_upgraded", {
+        seat_count: seatCount,
+        extended: period !== null,
+      });
       // A longer plan also moves its seat holders' unlocks.
       await Promise.all([refreshGroupAccess(), refreshAccess()]);
     }

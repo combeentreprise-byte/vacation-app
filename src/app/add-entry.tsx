@@ -42,6 +42,7 @@ import { useLogs } from "@/hooks/use-logs";
 import { useOpenUnlock } from "@/hooks/use-open-unlock";
 import { useProfile } from "@/hooks/use-profile";
 import { useRefreshOnRefocus } from "@/hooks/use-refresh-on-refocus";
+import { posthog } from "@/lib/posthog";
 import { entriesNeedUnlock, freeEntriesLeft, isMemberUnlocked, joinNames } from "@/utils/access";
 import { getExchangeRate } from "@/utils/exchange-rates";
 
@@ -508,6 +509,11 @@ export default function AddEntryScreen() {
         Alert.alert("Couldn't save changes", error);
         return;
       }
+      const splitMemberCount = memberIds.length + Number(includeMyself);
+      posthog?.capture("entry_updated", {
+        currency: effectiveCurrency,
+        split_member_count: splitMemberCount,
+      });
       router.back();
       return;
     }
@@ -524,6 +530,12 @@ export default function AddEntryScreen() {
       payerIncluded: includeMyself,
     });
     setIsSubmitting(false);
+    const splitMemberCount = memberIds.length + Number(includeMyself);
+    posthog?.capture("entry_created", {
+      currency: effectiveCurrency,
+      split_member_count: splitMemberCount,
+      receipt_prefilled: isPrefilled,
+    });
     router.back();
   };
 

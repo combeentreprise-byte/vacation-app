@@ -6,6 +6,7 @@ import { ModalHeader } from "@/components/modal-header";
 import { useAuth } from "@/hooks/use-auth";
 import { useGroups } from "@/hooks/use-groups";
 import { useLogs } from "@/hooks/use-logs";
+import { posthog } from "@/lib/posthog";
 import { uploadGroupPhoto } from "@/utils/group-photo";
 
 export default function NewGroupScreen() {
@@ -35,13 +36,17 @@ export default function NewGroupScreen() {
           : values.photo.uri;
 
       if (isEditMode && existingGroup) {
-        await updateGroup(existingGroup.id, {
+        const { error: updateError } = await updateGroup(existingGroup.id, {
           name: values.name,
           description: values.description,
           heroMotive: values.motive,
           heroHue: values.hue,
           photoUrl,
         });
+        if (updateError) {
+          Alert.alert("Couldn't save changes", updateError);
+          return;
+        }
 
         const newCurrency = values.currency || existingGroup.currency;
         if (newCurrency !== existingGroup.currency) {
@@ -61,8 +66,9 @@ export default function NewGroupScreen() {
           // happened to trigger a logs refresh.
           await refreshLogs();
         }
+        posthog?.capture("group_updated");
       } else {
-        await addGroup(
+        const { error: createError } = await addGroup(
           values.name,
           values.description,
           values.currency,
@@ -70,6 +76,11 @@ export default function NewGroupScreen() {
           values.hue,
           photoUrl
         );
+        if (createError) {
+          Alert.alert("Couldn't create group", createError);
+          return;
+        }
+        posthog?.capture("group_created");
       }
       router.back();
     } catch (error) {

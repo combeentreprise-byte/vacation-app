@@ -5,10 +5,12 @@ import {
   createContext,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 
+import { posthog } from "@/lib/posthog";
 import { SUPABASE_AUTH_STORAGE_KEY, supabase } from "@/lib/supabase";
 import { signInWithOAuthProvider, type OAuthProvider } from "@/utils/oauth";
 import { clearOfflineDataForUser } from "@/utils/offline-storage";
@@ -57,13 +59,26 @@ const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const identifiedUserIdRef = useRef<string | null>(null);
 
   useEffect(() => {
+    // Supabase's auth user id is a stable UUID. Identify at the auth boundary
+    // so every later event and captured error inherits this identity.
+    const identifySession = (nextSession: Session | null) => {
+      const userId = nextSession?.user.id;
+      if (!userId || identifiedUserIdRef.current === userId) return;
+
+      // Only the id — no name or email goes to PostHog.
+      posthog?.identify(userId);
+      identifiedUserIdRef.current = userId;
+    };
+
     supabase.auth.getSession().then(async ({ data, error }) => {
       let initialSession = data.session;
       if (!initialSession && isAuthRetryableFetchError(error)) {
         initialSession = await restoreOfflineSession();
       }
+      identifySession(initialSession);
       setSession(initialSession);
       setIsLoading(false);
     });
@@ -73,6 +88,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // offline fallback — letting it through would sign an offline user
       // straight back out.
       if (event === "INITIAL_SESSION") return;
+
+      if (event === "SIGNED_OUT") {
+        posthog?.reset();
+        identifiedUserIdRef.current = null;
+      } else {
+        identifySession(nextSession);
+      }
       setSession(nextSession);
     });
 
@@ -81,6 +103,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signUp = async (email: string, password: string) => {
     const { error } = await supabase.auth.signUp({ email, password });
+    if (!error) posthog?.capture("account_created");
     // Stable error code (not the message string) for the UI to branch on —
     // only reliable because email confirmation is disabled on this project,
     // so signUp fails immediately for a known email instead of the generic
@@ -95,6 +118,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signIn = async (email: string, password: string) => {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (!error) posthog?.capture("signed_in", { method: "password" });
     // Supabase deliberately returns this same generic error whether the
     // email doesn't exist or the password is wrong (anti-enumeration), so
     // the UI can only flag "one of these two is wrong," never which one.

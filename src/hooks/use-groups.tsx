@@ -89,9 +89,9 @@ type GroupsContextValue = {
     hue: number,
     photoUrl: string | null
   ) => Promise<{ id?: string; error?: string }>;
-  updateGroup: (id: string, updates: GroupUpdates) => Promise<void>;
+  updateGroup: (id: string, updates: GroupUpdates) => Promise<{ error?: string }>;
   changeGroupCurrency: (id: string, currentCurrency: string, newCurrency: string) => Promise<{ error?: string }>;
-  removeGroup: (id: string) => Promise<void>;
+  removeGroup: (id: string) => Promise<{ error?: string }>;
   setGroupPinned: (id: string, pinned: boolean) => Promise<{ error?: string }>;
   joinGroup: (groupId: string) => Promise<{ error?: string }>;
   promoteToAdmin: (groupId: string, userId: string) => Promise<{ error?: string }>;
@@ -206,8 +206,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ...(photoUrl !== undefined ? { photo_url: photoUrl } : {}),
       };
       const { error } = await supabase.from("groups").update(row).eq("id", id);
-      if (error) console.warn("Failed to update group", error);
+      if (error) {
+        console.warn("Failed to update group", error);
+        await refresh();
+        return { error: error.message };
+      }
       await refresh();
+      return {};
     },
     [refresh]
   );
@@ -243,13 +248,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
   const removeGroup = useCallback(
     async (id: string) => {
-      if (!userId) return;
+      if (!userId) return { error: "Not signed in" };
       // Soft-leave (marks the row inactive server-side) rather than
       // deleting it, so historical logs/balances involving this group stay
       // intact for the other members. See leave_group in schema.sql.
       const { error } = await supabase.rpc("leave_group", { p_group_id: id });
       if (error) console.warn("Failed to leave group", error);
       await refresh();
+      return error ? { error: error.message } : {};
     },
     [userId, refresh]
   );

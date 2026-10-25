@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { Colors } from "@/constants/colors";
+import { posthog } from "@/lib/posthog";
 import { supabase } from "@/lib/supabase";
 
 export type ScanResult = { amount: number | null; currency: string | null };
@@ -64,6 +65,10 @@ export function ReceiptScanner({ onResult, bottomInset = 0 }: ReceiptScannerProp
         return;
       }
 
+      const currencyDetected = typeof data.currency === "string";
+      posthog?.capture("receipt_scanned", {
+        currency_detected: currencyDetected,
+      });
       onResult(data);
     } catch {
       Alert.alert("Couldn't scan receipt", "Something went wrong. Try again.");

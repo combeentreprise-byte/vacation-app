@@ -6,6 +6,7 @@ import { PageHeader } from "@/components/page-header";
 import { Skeleton, SkeletonGroup, SkeletonText } from "@/components/skeleton";
 import { Colors } from "@/constants/colors";
 import { useGroups } from "@/hooks/use-groups";
+import { posthog } from "@/lib/posthog";
 import { supabase } from "@/lib/supabase";
 import { goBackOrToGroups } from "@/utils/navigation";
 
@@ -64,6 +65,7 @@ export default function JoinGroupScreen() {
       setError(joinError);
       return;
     }
+    posthog?.capture("group_joined");
     router.replace({ pathname: "/group/[id]", params: { id } });
   };
 
